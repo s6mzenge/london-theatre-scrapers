@@ -14,17 +14,22 @@ name: Full scrape
 # "all-scrapers" artifact. A final `dedupe` job then consolidates across
 # sources into a "unified-shows" artifact.
 #
-# About OLT: officiallondontheatre.com blocks requests from cloud IP
-# ranges (Azure / GitHub Actions) with 403 Forbidden across every URL,
-# both HTML and their wp-json API. The scraper itself works fine -- it
-# returns 127 shows locally -- but cannot run from the GitHub runners.
-# The skip_olt input is set to true by default so cloud runs stay green;
-# flip it to false if you ever want to retry (e.g. if the block lifts).
-# Run OLT locally with `python olt_scraper.py` in the meantime.
+# About OLT: officiallondontheatre.com 403s requests from cloud IP
+# ranges (Azure / GitHub Actions) on every URL, HTML and wp-json API
+# alike. We route the scraper through a Cloudflare Worker reverse
+# proxy deployed under the user's CF account -- not in the blocked
+# range -- which rewrites the path onto the OLT origin and forwards
+# the response. Auth is a shared secret (X-Proxy-Auth header).
+# Credentials live in the OLT_PROXY_URL / OLT_PROXY_TOKEN repository
+# secrets and are exposed to the "Run scraper" step below. If the
+# proxy ever goes down or the secrets are missing, flip skip_olt to
+# 'true' to keep cloud runs green and fall back to running OLT
+# locally with `python olt_scraper.py`.
 #
-# Expected runtime: ~7-10 minutes total (parallel scrape, ~30s combine,
-# ~1 min dedupe; ttd is the long pole at ~6 min due to gentle rate
-# limiting on that site).
+# Expected runtime: ~3-6 minutes total (parallel scrape, ~30s combine,
+# ~1 min dedupe). The Playwright-driven scrapers (todaytix,
+# londontheatre) are now the long pole since the ttd async/HTTP2
+# rewrite brought it under 30 seconds.
 
 on:
   workflow_dispatch:
@@ -42,13 +47,13 @@ on:
           - 'false'
           - 'true'
       skip_olt:
-        description: 'Skip OLT (its site blocks cloud IPs -- leave true for cloud runs)'
+        description: 'Skip OLT (set true only if the Cloudflare Worker proxy is down or its secrets are missing)'
         required: false
-        default: 'true'
+        default: 'false'
         type: choice
         options:
-          - 'true'
           - 'false'
+          - 'true'
       drop_ghost_listings:
         description: 'Drop dedupe clusters with 0 performances (stale/announced-only shows)'
         required: false
@@ -114,6 +119,15 @@ jobs:
 
       - name: Run scraper
         if: steps.gate.outputs.run == 'true'
+        # Only olt_scraper.py reads these vars; the other six scrapers
+        # ignore them. We set them at step level rather than guarding
+        # on matrix.name because (a) exposing unused secrets to other
+        # jobs is harmless -- they just sit in the environment -- and
+        # (b) the alternative (per-entry matrix env) would complicate
+        # the matrix definition for zero functional gain.
+        env:
+          OLT_PROXY_URL: ${{ secrets.OLT_PROXY_URL }}
+          OLT_PROXY_TOKEN: ${{ secrets.OLT_PROXY_TOKEN }}
         # Exit code policy (matches smoke_test.py):
         #   0 = clean
         #   2 = scraper wrote output, but flagged warnings (still success)
