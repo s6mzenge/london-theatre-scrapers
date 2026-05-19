@@ -9,12 +9,20 @@ name: Full scrape
 #
 # Strategy: each scraper runs in its own parallel job (matrix). One
 # failure doesn't stop the others. After all jobs finish, a final
-# `combine` job downloads the seven per-scraper artifacts and re-uploads
-# them as a single "all-scrapers" artifact so you only need one click to
-# pull the whole batch.
+# `combine` job downloads the per-scraper artifacts and re-uploads
+# them as a single "all-scrapers" artifact so you only need one click
+# to pull the whole batch.
 #
-# Expected runtime: ~5--10 minutes (parallel; the Playwright scrapers
-# are the long pole at ~5 min each).
+# About OLT: officiallondontheatre.com blocks requests from cloud IP
+# ranges (Azure / GitHub Actions) with 403 Forbidden across every URL,
+# both HTML and their wp-json API. The scraper itself works fine -- it
+# returns 127 shows locally -- but cannot run from the GitHub runners.
+# The skip_olt input is set to true by default so cloud runs stay green;
+# flip it to false if you ever want to retry (e.g. if the block lifts).
+# Run OLT locally with `python olt_scraper.py` in the meantime.
+#
+# Expected runtime: ~7-10 minutes (parallel; ttd is the long pole at
+# ~6 min due to gentle rate limiting on that site).
 
 on:
   workflow_dispatch:
@@ -31,6 +39,14 @@ on:
         options:
           - 'false'
           - 'true'
+      skip_olt:
+        description: 'Skip OLT (its site blocks cloud IPs -- leave true for cloud runs)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 jobs:
   scrape:
@@ -50,40 +66,48 @@ jobs:
           - { name: ttd,                 script: ttd_scraper.py,                 playwright: false }
 
     steps:
-      - name: Skip browser-based scrapers (if requested)
-        # If the user ticked skip_browser, exit early for the two
-        # Playwright scrapers. Other matrix jobs continue normally.
-        if: ${{ inputs.skip_browser == 'true' && matrix.playwright }}
+      # Gate: compute once whether this matrix entry should run at all,
+      # based on the skip_* inputs. Subsequent steps key off the `run`
+      # output to stay readable rather than duplicating the condition.
+      - name: Gate
+        id: gate
         run: |
-          echo "skip_browser=true and this scraper needs a browser -- skipping."
-          exit 0
+          RUN="true"
+          if [ "${{ inputs.skip_browser }}" = "true" ] && [ "${{ matrix.playwright }}" = "true" ]; then
+            echo "skip_browser=true and ${{ matrix.name }} needs a browser -- skipping."
+            RUN="false"
+          fi
+          if [ "${{ inputs.skip_olt }}" = "true" ] && [ "${{ matrix.name }}" = "olt" ]; then
+            echo "skip_olt=true -- skipping olt."
+            RUN="false"
+          fi
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
 
       - name: Check out repo
-        if: ${{ !(inputs.skip_browser == 'true' && matrix.playwright) }}
+        if: steps.gate.outputs.run == 'true'
         uses: actions/checkout@v4
 
       - name: Set up Python
-        if: ${{ !(inputs.skip_browser == 'true' && matrix.playwright) }}
+        if: steps.gate.outputs.run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: pip
 
       - name: Install Python dependencies
-        if: ${{ !(inputs.skip_browser == 'true' && matrix.playwright) }}
+        if: steps.gate.outputs.run == 'true'
         run: pip install -r requirements.txt
 
       - name: Install Playwright Chromium
-        if: ${{ matrix.playwright && !(inputs.skip_browser == 'true') }}
+        if: steps.gate.outputs.run == 'true' && matrix.playwright
         run: playwright install --with-deps chromium
 
       - name: Run scraper
-        if: ${{ !(inputs.skip_browser == 'true' && matrix.playwright) }}
+        if: steps.gate.outputs.run == 'true'
         # Exit code policy (matches smoke_test.py):
         #   0 = clean
         #   2 = scraper wrote output, but flagged warnings (still success)
         #   anything else = hard failure
-        # We let exit 0 or 2 pass; everything else fails the job.
         run: |
           mkdir -p data
           ARGS=""
@@ -101,7 +125,7 @@ jobs:
           fi
 
       - name: Verify output file
-        if: ${{ !(inputs.skip_browser == 'true' && matrix.playwright) }}
+        if: steps.gate.outputs.run == 'true'
         run: |
           if [ ! -f "data/${{ matrix.name }}.json" ]; then
             echo "::error::${{ matrix.name }} did not produce an output file"
@@ -117,7 +141,7 @@ jobs:
           "
 
       - name: Upload per-scraper artifact
-        if: ${{ !(inputs.skip_browser == 'true' && matrix.playwright) }}
+        if: steps.gate.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}-output
