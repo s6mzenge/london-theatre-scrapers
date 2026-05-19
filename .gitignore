@@ -22,11 +22,16 @@ ENV/
 *~
 
 # --- Output data ---
-# Ignore scrape output at any depth under data/, but keep the dir itself.
+# Local scrape outputs are excluded by default so a careless `git add .`
+# during development doesn't commit megabytes of test data. The workflow's
+# publish job commits the canonical run under data/scrapers/ and
+# data/unified/, so we un-ignore those two subtrees explicitly.
 data/**/*.json
 data/**/*.json.tmp
 data/**/*.jsonl
 !data/.gitkeep
+!data/scrapers/*.json
+!data/unified/*.json
 
 # --- OS ---
 .DS_Store
