@@ -1,0 +1,9 @@
+# Shared HTTP stack — all seven scrapers
+requests>=2.31
+
+# HTML parsing — lovetheatre, olt, seatplan, ttd
+beautifulsoup4>=4.12
+
+# Headless browser — todaytix, londontheatre only
+# (After `pip install`, also run: `playwright install chromium`)
+playwright>=1.40

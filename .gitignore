@@ -1,0 +1,41 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- IDE / editors ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Output data ---
+# Ignore scrape output at any depth under data/, but keep the dir itself.
+data/**/*.json
+data/**/*.json.tmp
+data/**/*.jsonl
+!data/.gitkeep
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Playwright ---
+playwright-report/
+test-results/
+
+# --- Logs ---
+*.log
