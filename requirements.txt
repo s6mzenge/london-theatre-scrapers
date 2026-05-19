@@ -11,3 +11,6 @@ lxml>=5.0
 # Headless browser — todaytix, londontheatre only
 # (After `pip install`, also run: `playwright install chromium`)
 playwright>=1.40
+
+rapidfuzz>=3.0
+pyyaml>=6.0
