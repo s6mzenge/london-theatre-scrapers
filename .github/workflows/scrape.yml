@@ -14,12 +14,14 @@ name: Full scrape
 # to pull the whole batch.
 #
 # About OLT: officiallondontheatre.com blocks requests from cloud IP
-# ranges (Azure / GitHub Actions) with 403 Forbidden across every URL,
-# both HTML and their wp-json API. The scraper itself works fine -- it
-# returns 127 shows locally -- but cannot run from the GitHub runners.
-# The skip_olt input is set to true by default so cloud runs stay green;
-# flip it to false if you ever want to retry (e.g. if the block lifts).
-# Run OLT locally with `python olt_scraper.py` in the meantime.
+# ranges (Azure / GitHub Actions) with 403 Forbidden across every URL.
+# To work around this, the OLT scraper routes its requests through a
+# Cloudflare Worker reverse proxy (free tier, ~135 requests/run vs the
+# 100k/day allowance). The worker URL and shared-secret token are
+# supplied via the OLT_PROXY_URL and OLT_PROXY_TOKEN repo secrets.
+# If those secrets are unset, OLT will hit the IP block and the job
+# will hard-fail -- in that case set skip_olt: true at trigger time
+# and run OLT locally with `python olt_scraper.py` instead.
 #
 # Expected runtime: ~7-10 minutes (parallel; ttd is the long pole at
 # ~6 min due to gentle rate limiting on that site).
@@ -40,13 +42,13 @@ on:
           - 'false'
           - 'true'
       skip_olt:
-        description: 'Skip OLT (its site blocks cloud IPs -- leave true for cloud runs)'
+        description: 'Skip OLT (set true only if the proxy is unavailable)'
         required: false
-        default: 'true'
+        default: 'false'
         type: choice
         options:
-          - 'true'
           - 'false'
+          - 'true'
 
 jobs:
   scrape:
@@ -108,6 +110,13 @@ jobs:
         #   0 = clean
         #   2 = scraper wrote output, but flagged warnings (still success)
         #   anything else = hard failure
+        #
+        # OLT_PROXY_URL/OLT_PROXY_TOKEN are exposed to every job for
+        # simplicity; only the olt scraper reads them. The other scrapers
+        # ignore the env vars entirely, so leaking nothing.
+        env:
+          OLT_PROXY_URL: ${{ secrets.OLT_PROXY_URL }}
+          OLT_PROXY_TOKEN: ${{ secrets.OLT_PROXY_TOKEN }}
         run: |
           mkdir -p data
           ARGS=""
