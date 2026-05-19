@@ -4,6 +4,10 @@ requests>=2.31
 # HTML parsing — lovetheatre, olt, seatplan, ttd
 beautifulsoup4>=4.12
 
+# Faster HTTP + parser — ttd only
+httpx[http2]>=0.27
+lxml>=5.0
+
 # Headless browser — todaytix, londontheatre only
 # (After `pip install`, also run: `playwright install chromium`)
 playwright>=1.40
