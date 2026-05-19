@@ -141,13 +141,17 @@ DEFAULT_HEADERS = {
     "Accept-Language": "en-GB,en;q=0.9",
 }
 
-# With HTTP/2 multiplexing, 12 in-flight requests share a single TCP
+# With HTTP/2 multiplexing, in-flight requests share a single TCP
 # connection — the origin's per-connection throttle (which capped the
-# threaded version at 4) no longer applies, but HTTP/2 servers do
-# typically advertise a max concurrent stream limit (TTD's is 100). 12
-# is a safe default that completes a 200-show scrape in roughly a
-# minute on a typical broadband connection without provoking 429s.
-DEFAULT_CONCURRENCY = 12
+# threaded version at 4) no longer applies, but TTD does enforce an
+# origin-level burst limit that kicks in around ~150 requests fired
+# in tight succession (no 429s, but the request rate gets throttled
+# to ~1 req/s for the remainder of the run). 8 keeps the start-of-run
+# rate slightly lower so the limiter doesn't trip and overall wall-
+# clock comes out lower than a faster-then-stalled 12. Bump higher if
+# you've moved to a faster network or the origin has loosened its
+# limits; --no-http2 and --concurrency are both available for tuning.
+DEFAULT_CONCURRENCY = 8
 
 # Per-request HTTP timeout. The site can be slow under load; 60s gives
 # the server room to respond. Connect timeout is separate and short
