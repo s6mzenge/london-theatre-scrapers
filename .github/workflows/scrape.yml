@@ -1,8 +1,10 @@
 name: Full scrape
 
 # Runs every scraper at full size, uploads each scraper's JSON, combines
-# them into one all-scrapers artifact, and then deduplicates across sources
-# into a unified-shows artifact you can consume directly.
+# them into one all-scrapers artifact, deduplicates across sources into
+# a unified-shows artifact, then commits everything back into the repo
+# under data/ so a downstream website can consume the JSON via stable
+# raw.githubusercontent.com URLs (no Actions-API auth needed).
 #
 # Trigger: manual only -- either from the Actions tab ("Run workflow"
 # button) or via the GitHub REST API workflow_dispatch endpoint, which
@@ -11,8 +13,10 @@ name: Full scrape
 # Strategy: each scraper runs in its own parallel job (matrix). One
 # failure doesn't stop the others. After all jobs finish, a `combine` job
 # downloads the per-scraper artifacts and re-uploads them as a single
-# "all-scrapers" artifact. A final `dedupe` job then consolidates across
-# sources into a "unified-shows" artifact.
+# "all-scrapers" artifact. A `dedupe` job then consolidates across
+# sources into a "unified-shows" artifact. Finally, a `publish` job
+# commits both artifact sets into the repo's data/ folder so the
+# website can read them directly.
 #
 # About OLT: officiallondontheatre.com 403s requests from cloud IP
 # ranges (Azure / GitHub Actions) on every URL, HTML and wp-json API
@@ -27,9 +31,16 @@ name: Full scrape
 # locally with `python olt_scraper.py`.
 #
 # Expected runtime: ~3-6 minutes total (parallel scrape, ~30s combine,
-# ~1 min dedupe). The Playwright-driven scrapers (todaytix,
-# londontheatre) are now the long pole since the ttd async/HTTP2
-# rewrite brought it under 30 seconds.
+# ~1 min dedupe, ~30s publish). The Playwright-driven scrapers
+# (todaytix, londontheatre) are now the long pole since the ttd
+# async/HTTP2 rewrite brought it under 30 seconds.
+#
+# Repo size note: each successful run adds ~25-100MB to git history
+# (unified.json is ~23MB; per-scraper files vary). If you run this
+# daily the repo will grow by ~1GB/month. If/when that becomes a
+# problem, switch the publish job to force-push a dedicated `data`
+# branch instead (single commit, no accumulating history) -- the
+# website would then read from raw.githubusercontent.com/.../data/...
 
 on:
   workflow_dispatch:
@@ -56,6 +67,14 @@ on:
           - 'true'
       drop_ghost_listings:
         description: 'Drop dedupe clusters with 0 performances (stale/announced-only shows)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      skip_publish:
+        description: 'Skip committing data/ back to the repo (artifacts still uploaded)'
         required: false
         default: 'false'
         type: choice
@@ -295,3 +314,78 @@ jobs:
           path: dedupe_output/
           if-no-files-found: error
           retention-days: 30
+
+  publish:
+    # Commit the latest scrape data back into the repo under data/, so
+    # the JSON is available at stable raw.githubusercontent.com URLs
+    # for the downstream website (no need to authenticate with the
+    # Actions API or download artifacts).
+    #
+    # Folder layout:
+    #   data/scrapers/<name>.json    -- per-source raw outputs
+    #   data/unified/unified.json    -- canonical consolidated catalogue
+    #   data/unified/report.txt      -- human-readable dedupe summary
+    #   data/unified/review.json     -- borderline merge pairs to inspect
+    #
+    # Permissions: GITHUB_TOKEN gets `contents: write` ONLY on this job
+    # so the previous jobs stay read-only (defense in depth -- a
+    # compromised scraper step can't also push to main).
+    #
+    # If skip_publish was passed, the job exits immediately so the
+    # artifacts still upload but nothing is committed -- useful for
+    # smoke-testing without polluting git history.
+    needs: dedupe
+    if: always() && inputs.skip_publish != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Download per-scraper outputs
+        # `all-scrapers` is the combined artifact -- a flat directory
+        # of <name>.json files matching the matrix entries.
+        uses: actions/download-artifact@v4
+        with:
+          name: all-scrapers
+          path: data/scrapers/
+
+      - name: Download unified output
+        uses: actions/download-artifact@v4
+        with:
+          name: unified-shows
+          path: data/unified/
+
+      - name: List what's going into the commit
+        run: |
+          echo "== data/scrapers =="
+          ls -la data/scrapers/ || true
+          echo "== data/unified =="
+          ls -la data/unified/ || true
+
+      - name: Commit and push
+        # The bot identity is GitHub's standard one. The noreply email
+        # bypasses GH's "verified emails only" requirement for commits.
+        #
+        # `git diff --staged --quiet` exits 0 when there is NO diff; we
+        # use that to skip the commit + push when the run produced
+        # byte-identical files (rare, but avoids piling up empty
+        # commits if you re-run minutes apart with no upstream change).
+        #
+        # We don't retry on a remote-conflict push failure: this
+        # workflow runs serially, and a manual push to main during the
+        # ~5 minutes of scraping is the user's signal that they want
+        # their change to land, not the bot's.
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "data/ is byte-identical to current main -- nothing to commit."
+            exit 0
+          fi
+          git commit -m "data: refresh from full scrape ($(date -u +%Y-%m-%dT%H:%MZ))"
+          git push
