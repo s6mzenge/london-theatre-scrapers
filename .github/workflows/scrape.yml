@@ -1,30 +1,30 @@
 name: Full scrape
 
-# Runs every scraper at full size and uploads the resulting JSON files
-# as a downloadable artifact you can grab from the Actions tab.
+# Runs every scraper at full size, uploads each scraper's JSON, combines
+# them into one all-scrapers artifact, and then deduplicates across sources
+# into a unified-shows artifact you can consume directly.
 #
 # Trigger: manual only -- either from the Actions tab ("Run workflow"
 # button) or via the GitHub REST API workflow_dispatch endpoint, which
 # is what external schedulers like cron-job.org call.
 #
 # Strategy: each scraper runs in its own parallel job (matrix). One
-# failure doesn't stop the others. After all jobs finish, a final
-# `combine` job downloads the per-scraper artifacts and re-uploads
-# them as a single "all-scrapers" artifact so you only need one click
-# to pull the whole batch.
+# failure doesn't stop the others. After all jobs finish, a `combine` job
+# downloads the per-scraper artifacts and re-uploads them as a single
+# "all-scrapers" artifact. A final `dedupe` job then consolidates across
+# sources into a "unified-shows" artifact.
 #
 # About OLT: officiallondontheatre.com blocks requests from cloud IP
-# ranges (Azure / GitHub Actions) with 403 Forbidden across every URL.
-# To work around this, the OLT scraper routes its requests through a
-# Cloudflare Worker reverse proxy (free tier, ~135 requests/run vs the
-# 100k/day allowance). The worker URL and shared-secret token are
-# supplied via the OLT_PROXY_URL and OLT_PROXY_TOKEN repo secrets.
-# If those secrets are unset, OLT will hit the IP block and the job
-# will hard-fail -- in that case set skip_olt: true at trigger time
-# and run OLT locally with `python olt_scraper.py` instead.
+# ranges (Azure / GitHub Actions) with 403 Forbidden across every URL,
+# both HTML and their wp-json API. The scraper itself works fine -- it
+# returns 127 shows locally -- but cannot run from the GitHub runners.
+# The skip_olt input is set to true by default so cloud runs stay green;
+# flip it to false if you ever want to retry (e.g. if the block lifts).
+# Run OLT locally with `python olt_scraper.py` in the meantime.
 #
-# Expected runtime: ~7-10 minutes (parallel; ttd is the long pole at
-# ~6 min due to gentle rate limiting on that site).
+# Expected runtime: ~7-10 minutes total (parallel scrape, ~30s combine,
+# ~1 min dedupe; ttd is the long pole at ~6 min due to gentle rate
+# limiting on that site).
 
 on:
   workflow_dispatch:
@@ -42,7 +42,15 @@ on:
           - 'false'
           - 'true'
       skip_olt:
-        description: 'Skip OLT (set true only if the proxy is unavailable)'
+        description: 'Skip OLT (its site blocks cloud IPs -- leave true for cloud runs)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      drop_ghost_listings:
+        description: 'Drop dedupe clusters with 0 performances (stale/announced-only shows)'
         required: false
         default: 'false'
         type: choice
@@ -110,13 +118,6 @@ jobs:
         #   0 = clean
         #   2 = scraper wrote output, but flagged warnings (still success)
         #   anything else = hard failure
-        #
-        # OLT_PROXY_URL/OLT_PROXY_TOKEN are exposed to every job for
-        # simplicity; only the olt scraper reads them. The other scrapers
-        # ignore the env vars entirely, so leaking nothing.
-        env:
-          OLT_PROXY_URL: ${{ secrets.OLT_PROXY_URL }}
-          OLT_PROXY_TOKEN: ${{ secrets.OLT_PROXY_TOKEN }}
         run: |
           mkdir -p data
           ARGS=""
@@ -182,5 +183,101 @@ jobs:
         with:
           name: all-scrapers
           path: data/
+          if-no-files-found: error
+          retention-days: 30
+
+  dedupe:
+    # Consolidate per-source shows into one canonical list using the
+    # 5-stage pipeline:
+    #   1+2  Normalize titles/venues + apply VENUE_ALIASES registry
+    #   3    Fuzzy match within venues (within-source-dup guard active)
+    #   4    Orphan rescue (title-only attach for records missing venue;
+    #         ambiguity guard refuses multi-match cases)
+    #   5    Manual overrides from analysis/overrides.yaml (if present)
+    #
+    # Independently re-runnable against past scrapes by downloading the
+    # all-scrapers artifact locally and running:
+    #   python analysis/dedupe.py path/to/all-scrapers/ --overrides analysis/overrides.yaml
+    needs: combine
+    if: always()                # dedupe whatever survived earlier failures
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dedupe dependencies
+        # rapidfuzz dramatically improves Stage 3+4 quality and speed (the
+        # stdlib difflib fallback works but is significantly slower);
+        # pyyaml is only used if an overrides file in YAML form exists.
+        run: pip install rapidfuzz pyyaml
+
+      - name: Download combined scrapers artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: all-scrapers
+          path: data/
+
+      - name: Sanity-check inputs
+        run: |
+          ls -la data/
+          n=$(ls data/*.json 2>/dev/null | wc -l)
+          echo "Source JSON files present: $n"
+          if [ "$n" -lt 2 ]; then
+            echo "::warning::only $n source file(s) -- dedupe will produce mostly singletons"
+          fi
+
+      - name: Run dedupe
+        # Picks up analysis/overrides.yaml (or .json fallback) if present.
+        # --min-performances 1 toggled by the drop_ghost_listings input --
+        # drops clusters with 0 performances (stale "ghost" listings like
+        # todaytix's Miss Saigon page that never got delisted after the
+        # run ended, or lovetheatre touring listings without current dates).
+        run: |
+          mkdir -p dedupe_output
+          OVERRIDES=""
+          if [ -f analysis/overrides.yaml ]; then
+            OVERRIDES="--overrides analysis/overrides.yaml"
+          elif [ -f analysis/overrides.json ]; then
+            OVERRIDES="--overrides analysis/overrides.json"
+          fi
+          MIN_PERFS=""
+          if [ "${{ inputs.drop_ghost_listings }}" = "true" ]; then
+            MIN_PERFS="--min-performances 1"
+          fi
+          python analysis/dedupe.py data/ --out dedupe_output $OVERRIDES $MIN_PERFS
+
+      - name: Summarise result
+        # Surface the headline numbers in the run log so you can spot
+        # regressions at a glance without downloading the artifact.
+        run: |
+          python -c "
+          import json
+          with open('dedupe_output/unified.json') as f:
+              u = json.load(f)
+          print(f\"shows={u['show_count']}  performances={u['performance_count']}\")
+          dist = u.get('coverage_distribution', {})
+          for n in sorted(dist.keys(), key=int, reverse=True):
+              print(f'  {n} sources: {dist[n]} shows')
+          stages = u.get('stages', {})
+          rescues = stages.get('stage_4_orphan_rescues', [])
+          attached = sum(1 for r in rescues if r.get('status') == 'attached')
+          print(f\"Stage 3 fuzzy auto-merges:    {len(stages.get('stage_3_fuzzy_merges', []))}\")
+          print(f\"Stage 4 orphans attached:     {attached}\")
+          print(f\"Stage 5 overrides applied:    {len(stages.get('stage_5_overrides_applied', []))}\")
+          "
+
+      - name: Upload unified-shows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unified-shows
+          path: dedupe_output/
           if-no-files-found: error
           retention-days: 30
