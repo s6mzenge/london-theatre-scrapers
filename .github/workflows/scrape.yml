@@ -1,0 +1,153 @@
+name: Full scrape
+
+# Runs every scraper at full size and uploads the resulting JSON files
+# as a downloadable artifact you can grab from the Actions tab.
+#
+# Trigger: manual only -- either from the Actions tab ("Run workflow"
+# button) or via the GitHub REST API workflow_dispatch endpoint, which
+# is what external schedulers like cron-job.org call.
+#
+# Strategy: each scraper runs in its own parallel job (matrix). One
+# failure doesn't stop the others. After all jobs finish, a final
+# `combine` job downloads the seven per-scraper artifacts and re-uploads
+# them as a single "all-scrapers" artifact so you only need one click to
+# pull the whole batch.
+#
+# Expected runtime: ~5--10 minutes (parallel; the Playwright scrapers
+# are the long pole at ~5 min each).
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Per-scraper limit (leave empty for full scrape)'
+        required: false
+        default: ''
+      skip_browser:
+        description: 'Skip the two Playwright scrapers (todaytix, londontheatre)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false   # one scraper failing shouldn't cancel the rest
+      matrix:
+        include:
+          - { name: todaytix,            script: todaytix_scraper.py,            playwright: true }
+          - { name: londontheatre,       script: londontheatre_scraper.py,       playwright: true }
+          - { name: olt,                 script: olt_scraper.py,                 playwright: false }
+          - { name: lovetheatre,         script: lovetheatre_scraper.py,         playwright: false }
+          - { name: seatplan,            script: seatplan_scraper.py,            playwright: false }
+          - { name: londontheatredirect, script: londontheatredirect_scraper.py, playwright: false }
+          - { name: ttd,                 script: ttd_scraper.py,                 playwright: false }
+
+    steps:
+      - name: Skip browser-based scrapers (if requested)
+        # If the user ticked skip_browser, exit early for the two
+        # Playwright scrapers. Other matrix jobs continue normally.
+        if: ${{ inputs.skip_browser == 'true' && matrix.playwright }}
+        run: |
+          echo "skip_browser=true and this scraper needs a browser -- skipping."
+          exit 0
+
+      - name: Check out repo
+        if: ${{ !(inputs.skip_browser == 'true' && matrix.playwright) }}
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: ${{ !(inputs.skip_browser == 'true' && matrix.playwright) }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install Python dependencies
+        if: ${{ !(inputs.skip_browser == 'true' && matrix.playwright) }}
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        if: ${{ matrix.playwright && !(inputs.skip_browser == 'true') }}
+        run: playwright install --with-deps chromium
+
+      - name: Run scraper
+        if: ${{ !(inputs.skip_browser == 'true' && matrix.playwright) }}
+        # Exit code policy (matches smoke_test.py):
+        #   0 = clean
+        #   2 = scraper wrote output, but flagged warnings (still success)
+        #   anything else = hard failure
+        # We let exit 0 or 2 pass; everything else fails the job.
+        run: |
+          mkdir -p data
+          ARGS=""
+          if [ -n "${{ inputs.limit }}" ]; then
+            ARGS="--limit ${{ inputs.limit }}"
+          fi
+          set +e
+          python ${{ matrix.script }} $ARGS --out data/${{ matrix.name }}.json
+          EXIT=$?
+          set -e
+          echo "Scraper exit code: $EXIT"
+          if [ "$EXIT" -ne 0 ] && [ "$EXIT" -ne 2 ]; then
+            echo "::error::${{ matrix.name }} failed with exit code $EXIT"
+            exit "$EXIT"
+          fi
+
+      - name: Verify output file
+        if: ${{ !(inputs.skip_browser == 'true' && matrix.playwright) }}
+        run: |
+          if [ ! -f "data/${{ matrix.name }}.json" ]; then
+            echo "::error::${{ matrix.name }} did not produce an output file"
+            exit 1
+          fi
+          python -c "
+          import json, sys
+          d = json.load(open('data/${{ matrix.name }}.json'))
+          perfs = d.get('performance_count') or d.get('showtime_count') or 0
+          warns = len((d.get('report') or {}).get('warnings') or [])
+          fails = len((d.get('report') or {}).get('failures') or [])
+          print(f'shows={d.get(\"show_count\")} perfs={perfs} warnings={warns} failures={fails}')
+          "
+
+      - name: Upload per-scraper artifact
+        if: ${{ !(inputs.skip_browser == 'true' && matrix.playwright) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-output
+          path: data/${{ matrix.name }}.json
+          if-no-files-found: error
+          retention-days: 30
+
+  combine:
+    # Merge all per-scraper artifacts into one "all-scrapers" artifact
+    # so the user can grab everything with a single download.
+    needs: scrape
+    if: always()                # combine whatever succeeded, even if some failed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Download all per-scraper artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: data/
+          merge-multiple: true   # flatten *-output/file.json into data/file.json
+          pattern: '*-output'
+
+      - name: List what we got
+        run: ls -la data/ || true
+
+      - name: Upload combined artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-scrapers
+          path: data/
+          if-no-files-found: error
+          retention-days: 30
