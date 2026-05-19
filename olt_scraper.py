@@ -313,36 +313,66 @@ class ScrapeReport:
 # HTTP session
 # ---------------------------------------------------------------------------
 
-class _ProxyRewritingSession(requests.Session):
-    """Transparently rewrites HTTP requests to ``real_origin`` so they hit
-    ``proxy_origin`` instead, with an optional shared-secret auth header.
+class _ProxyingSession(requests.Session):
+    """A `requests.Session` that routes every OLT URL through a
+    user-supplied reverse proxy (e.g. a Cloudflare Worker), injecting
+    a shared-secret auth header on the way out.
 
-    The URLs we *store* in our data structures (and write to the output JSON)
-    stay as the real OLT URLs — only the actual HTTP transport is redirected.
-    Used to bypass cloud-IP blocks (Azure / GitHub Actions runners) by routing
-    requests through a Cloudflare Worker reverse proxy.
+    Why: officiallondontheatre.com 403s requests from cloud-CI IPs
+    (Azure-hosted GitHub Actions runners are blocklisted). A
+    Cloudflare Worker deployed under the user's account isn't on
+    that blocklist, so it can fetch OLT successfully and stream the
+    response back. The scraper points at the worker; the worker
+    rewrites the path onto the OLT origin and forwards.
+
+    Hook point: we override `request()` rather than each call site,
+    because the file has five separate `session.get(...)` callers
+    and dropping the rewrite in one shared place avoids drift.
+
+    URL rewrite rule: if the outbound URL starts with the OLT BASE,
+    swap the origin for the proxy URL, keep the path and query
+    unchanged. URLs to anything else (e.g. a redirect target that
+    pointed somewhere else entirely) are left alone — though in
+    practice the worker follows OLT-side redirects upstream and
+    returns the final response, so we don't see Location headers
+    here.
+
+    Auth header: every rewritten request gets `X-Proxy-Auth: <token>`,
+    matching the worker's expectation. We add it to the per-request
+    headers, not the session headers, so the secret only leaves the
+    process on proxy-bound requests — never on a direct call to some
+    third party that happens to share the session.
     """
 
-    def __init__(self, real_origin: str, proxy_origin: str,
-                 auth_token: str | None = None):
+    def __init__(self, proxy_url: str, proxy_token: str | None) -> None:
         super().__init__()
-        self._real = real_origin.rstrip("/")
-        self._proxy = proxy_origin.rstrip("/")
-        if auth_token:
-            self.headers["X-Proxy-Auth"] = auth_token
+        # Strip trailing slash for clean concatenation with paths that
+        # already lead with "/" — both "https://w.dev" and
+        # "https://w.dev/" should produce "https://w.dev/foo" for
+        # input path "/foo".
+        self._proxy_url = proxy_url.rstrip("/")
+        self._proxy_token = proxy_token or ""
 
-    def request(self, method, url, *args, **kwargs):
-        if isinstance(url, str) and url.startswith(self._real):
-            url = self._proxy + url[len(self._real):]
-        return super().request(method, url, *args, **kwargs)
+    def request(self, method, url, **kwargs):
+        if isinstance(url, str) and url.startswith(BASE):
+            # Same path + query, swap origin.
+            url = self._proxy_url + url[len(BASE):]
+            if self._proxy_token:
+                # Merge with caller-supplied headers (if any) without
+                # mutating their dict — callers may reuse it.
+                caller_headers = kwargs.get("headers") or {}
+                kwargs["headers"] = {**caller_headers,
+                                     "X-Proxy-Auth": self._proxy_token}
+        return super().request(method, url, **kwargs)
 
 
-def build_session(pool_size: int, proxy_url: str | None = None,
-                  proxy_token: str | None = None) -> requests.Session:
+def build_session(
+    pool_size: int,
+    proxy_url: str | None = None,
+    proxy_token: str | None = None,
+) -> requests.Session:
     if proxy_url:
-        s: requests.Session = _ProxyRewritingSession(
-            real_origin=BASE, proxy_origin=proxy_url, auth_token=proxy_token,
-        )
+        s: requests.Session = _ProxyingSession(proxy_url, proxy_token)
     else:
         s = requests.Session()
     s.headers.update(DEFAULT_HEADERS)
@@ -1688,15 +1718,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-tag-lists", action="store_true",
                    help="Skip scraping the 7 filter slices (today/offers/musicals/etc.); "
                         "shows will have empty appears_in arrays.")
-    p.add_argument("--proxy-url", default=os.environ.get("OLT_PROXY_URL"),
-                   metavar="URL",
-                   help="Route all OLT requests through this reverse proxy "
-                        "(e.g. a Cloudflare Worker URL). Useful when running "
-                        "from cloud IPs that OLT blocks. Env: OLT_PROXY_URL.")
-    p.add_argument("--proxy-token", default=os.environ.get("OLT_PROXY_TOKEN"),
-                   metavar="TOK",
-                   help="Shared secret sent as the X-Proxy-Auth header when "
-                        "--proxy-url is set. Env: OLT_PROXY_TOKEN.")
     p.add_argument("--max-runtime-seconds", type=int, default=None, metavar="N",
                    help="Soft wall-clock budget. After N seconds, the detail "
                         "fetcher stops queuing new requests; in-flight ones finish. "
@@ -1707,6 +1728,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--rotation-depth", type=int, default=DEFAULT_ROTATION_DEPTH,
                    metavar="N",
                    help=f"How many previous outputs to retain (default: {DEFAULT_ROTATION_DEPTH}).")
+    p.add_argument("--proxy-url", default=os.environ.get("OLT_PROXY_URL"),
+                   metavar="URL",
+                   help="Route every officiallondontheatre.com request through "
+                        "this reverse-proxy URL (e.g. a Cloudflare Worker that "
+                        "fronts OLT). The proxy must accept the same path/query "
+                        "and forward to OLT. Defaults to $OLT_PROXY_URL if set. "
+                        "Required when running from cloud CI; OLT 403s GitHub "
+                        "Actions / Azure runner IPs directly.")
+    p.add_argument("--proxy-token", default=os.environ.get("OLT_PROXY_TOKEN"),
+                   metavar="TOKEN",
+                   help="Shared-secret value sent as X-Proxy-Auth on every "
+                        "request to --proxy-url. Defaults to $OLT_PROXY_TOKEN.")
     p.add_argument("--dry-run", action="store_true",
                    help="Do everything except write the output file. "
                         "Useful for testing parser changes against live data.")
@@ -1717,14 +1750,16 @@ def main(argv: list[str] | None = None) -> int:
     #   1  hard failure (no output written, previous preserved)
     #   2  success but with warnings (output written, but with anomalies)
 
+    if args.proxy_url:
+        log.info("Routing OLT requests via proxy: %s", args.proxy_url)
+        if not args.proxy_token:
+            log.warning("--proxy-url set but --proxy-token is empty — "
+                        "the worker will reject every request with 401")
     session = build_session(
         pool_size=max(args.concurrency, 8),
         proxy_url=args.proxy_url,
         proxy_token=args.proxy_token,
     )
-    if args.proxy_url:
-        log.info("Routing OLT requests via proxy: %s%s",
-                 args.proxy_url, " (with auth)" if args.proxy_token else "")
     t_start = time.monotonic()
     deadline = (t_start + args.max_runtime_seconds
                 if args.max_runtime_seconds is not None else None)
