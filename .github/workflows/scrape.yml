@@ -2,9 +2,9 @@ name: Full scrape
 
 # Runs every scraper at full size, uploads each scraper's JSON, combines
 # them into one all-scrapers artifact, deduplicates across sources into
-# a unified-shows artifact, then commits everything back into the repo
-# under data/ so a downstream website can consume the JSON via stable
-# raw.githubusercontent.com URLs (no Actions-API auth needed).
+# a unified-shows artifact, then force-pushes everything to a dedicated
+# `data` branch as a single commit so the website can consume the JSON
+# via stable raw.githubusercontent.com URLs without bloating main.
 #
 # Trigger: manual only -- either from the Actions tab ("Run workflow"
 # button) or via the GitHub REST API workflow_dispatch endpoint, which
@@ -15,8 +15,7 @@ name: Full scrape
 # downloads the per-scraper artifacts and re-uploads them as a single
 # "all-scrapers" artifact. A `dedupe` job then consolidates across
 # sources into a "unified-shows" artifact. Finally, a `publish` job
-# commits both artifact sets into the repo's data/ folder so the
-# website can read them directly.
+# force-pushes both artifact sets to the `data` branch.
 #
 # About OLT: officiallondontheatre.com 403s requests from cloud IP
 # ranges (Azure / GitHub Actions) on every URL, HTML and wp-json API
@@ -35,12 +34,16 @@ name: Full scrape
 # (todaytix, londontheatre) are now the long pole since the ttd
 # async/HTTP2 rewrite brought it under 30 seconds.
 #
-# Repo size note: each successful run adds ~25-100MB to git history
-# (unified.json is ~23MB; per-scraper files vary). If you run this
-# daily the repo will grow by ~1GB/month. If/when that becomes a
-# problem, switch the publish job to force-push a dedicated `data`
-# branch instead (single commit, no accumulating history) -- the
-# website would then read from raw.githubusercontent.com/.../data/...
+# Why a separate `data` branch (not commits on main):
+#   * Per-scrape payload is ~135MB. Committing to main meant ~135MB of
+#     git history accumulated per run; over months the repo would grow
+#     unboundedly.
+#   * The `data` branch is force-pushed, so it always holds a single
+#     commit. Repo size stays roughly constant regardless of how often
+#     the workflow runs. GitHub eventually GCs the orphaned blobs from
+#     prior runs.
+#   * `main` stays small and readable -- it contains only code, no
+#     scrape artifacts.
 
 on:
   workflow_dispatch:
@@ -74,7 +77,7 @@ on:
           - 'false'
           - 'true'
       skip_publish:
-        description: 'Skip committing data/ back to the repo (artifacts still uploaded)'
+        description: 'Skip force-pushing the data branch (artifacts still uploaded)'
         required: false
         default: 'false'
         type: choice
@@ -316,24 +319,31 @@ jobs:
           retention-days: 30
 
   publish:
-    # Commit the latest scrape data back into the repo under data/, so
-    # the JSON is available at stable raw.githubusercontent.com URLs
-    # for the downstream website (no need to authenticate with the
-    # Actions API or download artifacts).
+    # Force-push the latest scrape data to the `data` branch as a
+    # single commit, replacing whatever was there before. This is the
+    # repo-size-friendly alternative to commit-to-main: history doesn't
+    # accumulate, so the repo stays roughly constant size regardless
+    # of how often the workflow runs.
     #
-    # Folder layout:
-    #   data/scrapers/<name>.json    -- per-source raw outputs
-    #   data/unified/unified.json    -- canonical consolidated catalogue
-    #   data/unified/report.txt      -- human-readable dedupe summary
-    #   data/unified/review.json     -- borderline merge pairs to inspect
+    # The `data` branch is decoupled from main: it contains ONLY the
+    # scrape outputs (no code, no workflows), and main never references
+    # it. The website reads via raw.githubusercontent.com URLs:
     #
-    # Permissions: GITHUB_TOKEN gets `contents: write` ONLY on this job
+    #   https://raw.githubusercontent.com/<owner>/<repo>/data/scrapers/<name>.json
+    #   https://raw.githubusercontent.com/<owner>/<repo>/data/unified/unified.json
+    #
+    # Folder layout on the branch (note: at branch root, no data/ wrapper):
+    #   scrapers/<name>.json    -- per-source raw outputs
+    #   unified/unified.json    -- canonical consolidated catalogue
+    #   unified/report.txt      -- human-readable dedupe summary
+    #   unified/review.json     -- borderline merge pairs to inspect
+    #
+    # Permissions: GITHUB_TOKEN gets `contents: write` ONLY on this job,
     # so the previous jobs stay read-only (defense in depth -- a
-    # compromised scraper step can't also push to main).
+    # compromised scraper step can't also push to the repo).
     #
     # If skip_publish was passed, the job exits immediately so the
-    # artifacts still upload but nothing is committed -- useful for
-    # smoke-testing without polluting git history.
+    # artifacts still upload but nothing is force-pushed.
     needs: dedupe
     if: always() && inputs.skip_publish != 'true'
     runs-on: ubuntu-latest
@@ -342,50 +352,51 @@ jobs:
       contents: write
 
     steps:
-      - name: Check out repo
-        uses: actions/checkout@v4
-
       - name: Download per-scraper outputs
-        # `all-scrapers` is the combined artifact -- a flat directory
+        # The combined artifact uploaded by `combine` is a flat directory
         # of <name>.json files matching the matrix entries.
         uses: actions/download-artifact@v4
         with:
           name: all-scrapers
-          path: data/scrapers/
+          path: payload/scrapers/
 
       - name: Download unified output
         uses: actions/download-artifact@v4
         with:
           name: unified-shows
-          path: data/unified/
+          path: payload/unified/
 
-      - name: List what's going into the commit
+      - name: List what's going to the data branch
         run: |
-          echo "== data/scrapers =="
-          ls -la data/scrapers/ || true
-          echo "== data/unified =="
-          ls -la data/unified/ || true
+          echo "== payload/scrapers =="
+          ls -la payload/scrapers/ || true
+          echo "== payload/unified =="
+          ls -la payload/unified/ || true
 
-      - name: Commit and push
-        # The bot identity is GitHub's standard one. The noreply email
-        # bypasses GH's "verified emails only" requirement for commits.
+      - name: Force-push to data branch
+        # No actions/checkout: we want a brand-new single-commit branch,
+        # not history extending main. We initialize a fresh repo inside
+        # the payload directory, commit the downloaded artifacts as the
+        # branch's sole commit, and force-push.
         #
-        # `git diff --staged --quiet` exits 0 when there is NO diff; we
-        # use that to skip the commit + push when the run produced
-        # byte-identical files (rare, but avoids piling up empty
-        # commits if you re-run minutes apart with no upstream change).
+        # Auth: the remote URL embeds GITHUB_TOKEN as basic-auth via
+        # the standard `x-access-token` username. This is GitHub's
+        # documented pattern for pushing from Actions without having
+        # actions/checkout pre-wire the credentials.
         #
-        # We don't retry on a remote-conflict push failure: this
-        # workflow runs serially, and a manual push to main during the
-        # ~5 minutes of scraping is the user's signal that they want
-        # their change to land, not the bot's.
+        # --force is essential: the previous run's commit is the
+        # current data-branch HEAD; we're replacing it, not appending.
+        # No retry on a push conflict: this workflow runs serially and
+        # is the only writer to the data branch, so a conflict would
+        # mean something genuinely unexpected -- worth failing loudly.
+        working-directory: payload
         run: |
+          git init -b data -q
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/
-          if git diff --staged --quiet; then
-            echo "data/ is byte-identical to current main -- nothing to commit."
-            exit 0
-          fi
-          git commit -m "data: refresh from full scrape ($(date -u +%Y-%m-%dT%H:%MZ))"
-          git push
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git add .
+          git commit -m "data: refresh from full scrape ($(date -u +%Y-%m-%dT%H:%MZ))" -q
+          git push --force origin data
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
