@@ -400,6 +400,27 @@ def build_session(pool_size: int) -> requests.Session:
     return s
 
 
+def _fetch_html(session: requests.Session, url: str) -> requests.Response:
+    """GET with the response forced to UTF-8 decoding.
+
+    LOVEtheatre serves UTF-8 HTML but the response headers don't declare a
+    charset, so `requests` falls back to ISO-8859-1 per RFC 2616. That makes
+    `r.text` produce mojibake on every string containing a smart quote,
+    em-dash, pound sign, NBSP, star symbol, accented vowel, or any other
+    non-ASCII character — turning U+2019 'right single quote' (UTF-8 bytes
+    \\xe2\\x80\\x99) into the three Latin-1 characters 'â\\x80\\x99'.
+
+    Fixed by forcing `r.encoding = 'utf-8'` BEFORE reading `r.text`. This
+    is a one-line correction with no downside: every page on lovetheatre.com
+    is genuinely UTF-8 (verified across all 165 detail pages) and the
+    forced setting overrides only when the header is silent.
+    """
+    r = session.get(url, timeout=REQUEST_TIMEOUT_S)
+    r.raise_for_status()
+    r.encoding = "utf-8"
+    return r
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -413,6 +434,38 @@ def _decode(s: str | None) -> str | None:
     once = html.unescape(s)
     twice = html.unescape(once) if "&amp;" in once or "&#" in once else once
     return twice.strip() or None
+
+
+def _clean_perf_venue_name(raw: str | None) -> str | None:
+    """Tidy a TheaterEvent.location.name string into a bare venue name.
+
+    LOVEtheatre's JSON-LD `location.name` is occasionally a multi-line
+    address blob (the venue name on line 1, followed by street/postcode):
+
+        "Belle Livingstone's 58th Street Country Club\\r\\nBussey Alley
+         \\r\\nBtwn 133 Rye Road & Copeland Road"
+
+    Other times it's the venue name with an area suffix, like
+
+        "The Lost Estate, West Kensington"
+
+    Both forms make dedupe miss the corresponding cluster from other
+    sources (which list the bare venue). We extract just the first line
+    and strip any ", <area>" tail. Conservative — only the FIRST comma is
+    treated as the area-suffix boundary, preserving venues whose canonical
+    name genuinely contains a comma (none observed in our data, but
+    defensive).
+    """
+    if not raw:
+        return None
+    # Normalize line endings, take the first line
+    first_line = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n", 1)[0].strip()
+    if not first_line:
+        return None
+    # Strip ", <area>" suffix (area names are typically short, single-comma
+    # separated; never the full address)
+    name, _, _tail = first_line.partition(",")
+    return name.strip() or None
 
 
 def _to_float(s) -> float | None:
@@ -1214,6 +1267,30 @@ def parse_show(html_text: str) -> dict:
     # TheaterEvent[] JSON-LD → performances
     performances = _extract_performances(blocks)
 
+    # Venue fallback — when the header anchor (`a[href*='/venue/']` inside
+    # `.show-hero-info`) is absent because the show page hasn't been linked
+    # to a venue record in WordPress, `_extract_show_header_meta` returns
+    # `venue_name=None` and we'd ship the record without a venue. Recover
+    # by looking at the JSON-LD TheaterEvent location.name on the first
+    # performance — it's the same physical location and is set even on
+    # pages that lack the header venue link. Observed missing-header cases:
+    # 'Here Comes J. Edgar!' (King's Head Theatre), 'Chat Noir!' (The Lost
+    # Estate), '58th Street' (Belle Livingstone's). The cleanup pass below
+    # strips multi-line address junk and ", <area>" suffixes so the result
+    # matches what other sources use for the same venue.
+    venue_name = header_meta["venue_name"]
+    if venue_name is None and performances:
+        for p in performances:
+            if p.venue_name:
+                venue_name = _clean_perf_venue_name(p.venue_name)
+                if venue_name:
+                    log.debug(
+                        "venue_name fallback: header lookup failed for %s, "
+                        "recovered '%s' from performance JSON-LD",
+                        canonical or "<unknown URL>", venue_name,
+                    )
+                    break
+
     # FAQPage JSON-LD
     faq = _find_faq_entries(blocks)
 
@@ -1243,7 +1320,7 @@ def parse_show(html_text: str) -> dict:
         "hero_image": header_meta["hero_image"],
         "show_thumbnail": header_meta["show_thumbnail"],
         "duration_text": header_meta["duration_text"],
-        "venue_name": header_meta["venue_name"],
+        "venue_name": venue_name,
         "venue_url": header_meta["venue_url"],
         "venue_address": venue_address,
         "sidebar_price_value": sidebar_price_value,
@@ -1271,8 +1348,7 @@ def fetch_listing(session: requests.Session, url: str) -> list[ListingCard]:
     decides whether one listing failure is fatal (it isn't for the
     offer slices; the master `whats_on` failing IS fatal)."""
     log.info("Fetching listing %s", url)
-    r = session.get(url, timeout=REQUEST_TIMEOUT_S)
-    r.raise_for_status()
+    r = _fetch_html(session, url)
     cards = parse_listing(r.text)
     log.info("  → %d cards", len(cards))
     return cards
@@ -1352,8 +1428,7 @@ def fetch_show_detail(
     failure. One application-level retry on parse errors handles
     mid-deploy partial HTML."""
     try:
-        r = session.get(card.url, timeout=REQUEST_TIMEOUT_S)
-        r.raise_for_status()
+        r = _fetch_html(session, card.url)
     except requests.RequestException as e:
         return None, f"http: {e}"
 
@@ -1365,8 +1440,7 @@ def fetch_show_detail(
         log.debug("First parse of %s failed (%s); retrying once", card.url, e)
         time.sleep(DETAIL_PARSE_RETRY_DELAY_S)
         try:
-            r = session.get(card.url, timeout=REQUEST_TIMEOUT_S)
-            r.raise_for_status()
+            r = _fetch_html(session, card.url)
             return parse_show(r.text), None
         except requests.RequestException as e2:
             return None, f"http (retry): {e2}"
