@@ -1,0 +1,60 @@
+# Manual overrides for the London theatre deduper.
+# ---------------------------------------------------
+# Loaded as the final pass after Stage 3 (fuzzy matching). Always wins.
+# Use for cases the algorithm can't handle automatically.
+#
+# Two operations:
+#   force_merge   – the listed records belong in ONE cluster, period
+#   force_split   – this record is its OWN cluster, period
+#
+# Identify records by (source, source_id) — find these in unified.json
+# or review.json (both expose source_id per record).
+#
+# Re-run with:
+#   python dedupe.py "<zip-or-folder>" --overrides overrides.yaml
+
+force_merge:
+  # ---------------------------------------------------------------
+  # Within-source duplicate that the fuzzy guard correctly refuses
+  # to merge automatically. LoveTheatre splits Cursed Child into a
+  # "One Part" listing (a single ticket for one half) AND a "Two
+  # Parts" listing (the full two-part experience). They're the same
+  # production from a dedupe perspective; force the Two Parts entry
+  # into the main cluster.
+  # ---------------------------------------------------------------
+  - reason: "LoveTheatre lists HPCC as two ticket types; both same production"
+    canonical_title: "Harry Potter and the Cursed Child"
+    canonical_venue: "Palace Theatre"
+    records:
+      - source: lovetheatre
+        source_id: "1249"
+
+  # ---------------------------------------------------------------
+  # Southbank Centre sub-room ambiguity. One source uses the parent
+  # complex name ("Southbank Centre") instead of the specific hall.
+  # Can't be aliased generically because Southbank Centre has multiple
+  # halls (RFH, QEH, Purcell Room) that DO host different shows.
+  # Handled as one-off overrides keyed by source+source_id.
+  # ---------------------------------------------------------------
+  - reason: "LoveTheatre lists Cirque Alice as 'Southbank Centre'; show is at RFH"
+    canonical_title: "Cirque Alice"
+    canonical_venue: "Royal Festival Hall"
+    records:
+      - source: lovetheatre
+        source_id: "352320"
+
+  - reason: "OLT lists Dog Man as 'Southbank Centre'; show is at QEH"
+    canonical_title: "Dog Man: The Musical"
+    canonical_venue: "Queen Elizabeth Hall"
+    records:
+      - source: olt
+        source_id: "111467554"
+
+force_split: []
+# Examples for force_split (none active right now — the within-source
+# duplicate guard already prevents most bad merges):
+#
+# - reason: "Six - Singalong is a special audience-participation event"
+#   record:
+#     source: londontheatredirect
+#     source_id: "XXXX"
