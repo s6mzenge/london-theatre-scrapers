@@ -52,6 +52,7 @@ import argparse
 import html
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -312,8 +313,38 @@ class ScrapeReport:
 # HTTP session
 # ---------------------------------------------------------------------------
 
-def build_session(pool_size: int) -> requests.Session:
-    s = requests.Session()
+class _ProxyRewritingSession(requests.Session):
+    """Transparently rewrites HTTP requests to ``real_origin`` so they hit
+    ``proxy_origin`` instead, with an optional shared-secret auth header.
+
+    The URLs we *store* in our data structures (and write to the output JSON)
+    stay as the real OLT URLs — only the actual HTTP transport is redirected.
+    Used to bypass cloud-IP blocks (Azure / GitHub Actions runners) by routing
+    requests through a Cloudflare Worker reverse proxy.
+    """
+
+    def __init__(self, real_origin: str, proxy_origin: str,
+                 auth_token: str | None = None):
+        super().__init__()
+        self._real = real_origin.rstrip("/")
+        self._proxy = proxy_origin.rstrip("/")
+        if auth_token:
+            self.headers["X-Proxy-Auth"] = auth_token
+
+    def request(self, method, url, *args, **kwargs):
+        if isinstance(url, str) and url.startswith(self._real):
+            url = self._proxy + url[len(self._real):]
+        return super().request(method, url, *args, **kwargs)
+
+
+def build_session(pool_size: int, proxy_url: str | None = None,
+                  proxy_token: str | None = None) -> requests.Session:
+    if proxy_url:
+        s: requests.Session = _ProxyRewritingSession(
+            real_origin=BASE, proxy_origin=proxy_url, auth_token=proxy_token,
+        )
+    else:
+        s = requests.Session()
     s.headers.update(DEFAULT_HEADERS)
     retry = Retry(
         total=RETRY_TOTAL,
@@ -1657,6 +1688,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-tag-lists", action="store_true",
                    help="Skip scraping the 7 filter slices (today/offers/musicals/etc.); "
                         "shows will have empty appears_in arrays.")
+    p.add_argument("--proxy-url", default=os.environ.get("OLT_PROXY_URL"),
+                   metavar="URL",
+                   help="Route all OLT requests through this reverse proxy "
+                        "(e.g. a Cloudflare Worker URL). Useful when running "
+                        "from cloud IPs that OLT blocks. Env: OLT_PROXY_URL.")
+    p.add_argument("--proxy-token", default=os.environ.get("OLT_PROXY_TOKEN"),
+                   metavar="TOK",
+                   help="Shared secret sent as the X-Proxy-Auth header when "
+                        "--proxy-url is set. Env: OLT_PROXY_TOKEN.")
     p.add_argument("--max-runtime-seconds", type=int, default=None, metavar="N",
                    help="Soft wall-clock budget. After N seconds, the detail "
                         "fetcher stops queuing new requests; in-flight ones finish. "
@@ -1677,7 +1717,14 @@ def main(argv: list[str] | None = None) -> int:
     #   1  hard failure (no output written, previous preserved)
     #   2  success but with warnings (output written, but with anomalies)
 
-    session = build_session(pool_size=max(args.concurrency, 8))
+    session = build_session(
+        pool_size=max(args.concurrency, 8),
+        proxy_url=args.proxy_url,
+        proxy_token=args.proxy_token,
+    )
+    if args.proxy_url:
+        log.info("Routing OLT requests via proxy: %s%s",
+                 args.proxy_url, " (with auth)" if args.proxy_token else "")
     t_start = time.monotonic()
     deadline = (t_start + args.max_runtime_seconds
                 if args.max_runtime_seconds is not None else None)
