@@ -171,7 +171,13 @@ jobs:
           fails = len((d.get('report') or {}).get('failures') or [])
           print(f'shows={d.get(\"show_count\")} perfs={perfs} warnings={warns} failures={fails}')
           "
+      
+      - name: Verify SeatPlan per-performance prices
+        if: steps.gate.outputs.run == 'true' && matrix.name == 'seatplan'
+        run: |
+          python scraper/seatplan_availability.py --in scraper/data/seatplan.json
 
+    
       - name: Upload per-scraper artifact
         if: steps.gate.outputs.run == 'true'
         uses: actions/upload-artifact@v4
