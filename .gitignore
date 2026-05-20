@@ -27,10 +27,11 @@ ENV/
 # The workflow doesn't commit to main/data/ either -- it force-pushes
 # to a separate `data` branch, which is decoupled from main and not
 # affected by this rule. So we keep the rule strict here.
-data/**/*.json
+# Local-only scrape outputs. Production outputs land in
+# data/scrapers/ and data/unified/ (committed by the scrape workflow).
+data/local/
 data/**/*.json.tmp
 data/**/*.jsonl
-!data/.gitkeep
 
 # --- OS ---
 .DS_Store
