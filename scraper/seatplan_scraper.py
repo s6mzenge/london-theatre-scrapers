@@ -1041,6 +1041,73 @@ def _merge_lastminute(
     return perfs
 
 
+def _merge_global_lastminute_into_perfs(
+    perfs: list[dict],
+    global_lm: list[dict],
+) -> list[dict]:
+    """Fill in book_url / showtime_id / has_deals from the cross-show
+    global Last Minute Tickets table for performances whose per-show
+    `section#last-minute` was missing or didn't cover them.
+
+    The per-show section (merged earlier in `_merge_lastminute`) is the
+    preferred source; the global table — parsed from
+    `/london/whats-on/last-minute/`, which carries the same booking
+    deep-link URLs — is the fallback. We only fill fields that aren't
+    already populated, so per-show data always wins.
+
+    This matters for shows whose detail page omits the per-show widget
+    entirely. Typical cases:
+      * New productions in their first few days (no per-show widget
+        yet, but the show is bookable today/tomorrow via the global
+        table — e.g. Beetlejuice on opening week).
+      * Sold-out shows where the per-show table is empty.
+      * Productions where SeatPlan simply hasn't enabled the widget.
+
+    Without this merge, ~17 currently-bookable shows surface 0 book_urls
+    on their performances even though the global table carries them.
+
+    Returns the (possibly extended) list of performance dicts. Operates
+    on dicts (not Performance instances) because `_parse_detail_page`
+    has already done `asdict(p)` by the time we receive these.
+    """
+    if not global_lm:
+        return perfs
+
+    by_key: dict[tuple, dict] = {
+        (p.get("date"), p.get("time")): p for p in perfs
+    }
+
+    for e in global_lm:
+        key = (e.get("date"), e.get("time_24h"))
+        target = by_key.get(key)
+        if target is not None:
+            # Fill gaps only — don't overwrite per-show data
+            if not target.get("book_url") and e.get("book_url"):
+                target["book_url"] = e["book_url"]
+            if not target.get("showtime_id") and e.get("showtime_id"):
+                target["showtime_id"] = e["showtime_id"]
+            if not target.get("has_deals") and e.get("has_price_drops"):
+                target["has_deals"] = True
+        elif e.get("book_url"):
+            # No JSON-LD performance matches — append as a standalone
+            # entry, mirroring the Performance dataclass shape. Same
+            # fallback strategy `_merge_lastminute` uses for unmatched
+            # per-show entries.
+            perfs.append({
+                "iso": None,
+                "date": e.get("date"),
+                "time": e.get("time_24h"),
+                "low_price": e.get("from_price"),
+                "currency": "GBP",  # SeatPlan London is consistently GBP
+                "availability": None,
+                "showtime_id": e.get("showtime_id"),
+                "book_url": e["book_url"],
+                "has_deals": bool(e.get("has_price_drops")),
+            })
+
+    return perfs
+
+
 def _extract_lastminute_showtime_ids(soup: BeautifulSoup) -> dict[str, str]:
     """Build a map from booking URL → data-id (showtime ID). We attach
     these in a separate pass so the merge step doesn't have to thread the
@@ -1497,6 +1564,15 @@ def fetch_all_details(
                     sku = backfill
                     with lock:
                         sku_backfills[0] += 1
+            # Fill book_url / showtime_id gaps from the cross-show
+            # global last-minute table. Critical for shows whose
+            # detail page has no `section#last-minute` widget — without
+            # this, ~17 currently-bookable shows surface 0 book_urls
+            # on their performances even though the data is available.
+            global_lm = last_minute_by_url.get(card.url, [])
+            performances = _merge_global_lastminute_into_perfs(
+                detail.get("performances") or [], global_lm,
+            )
             results[idx] = Show(
                 url=card.url,
                 slug=card.slug,
@@ -1536,8 +1612,8 @@ def fetch_all_details(
                 weekly_schedule=detail.get("weekly_schedule") or [],
                 cast=detail.get("cast") or [],
                 faq=detail.get("faq") or [],
-                performances=detail.get("performances") or [],
-                last_minute_listing=last_minute_by_url.get(card.url, []),
+                performances=performances,
+                last_minute_listing=global_lm,
                 detail_canonical=detail.get("detail_canonical"),
             )
         else:
