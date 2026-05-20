@@ -1,0 +1,7 @@
+# Tell the browser that the gzipped unified.json file is JSON and is
+# already compressed - the Fetch API decompresses transparently before
+# r.json() parses it. Required because Cloudflare Pages caps individual
+# files at 25 MiB and our raw unified.json is ~33 MiB.
+/data/unified.json.gz
+  Content-Type: application/json
+  Content-Encoding: gzip
