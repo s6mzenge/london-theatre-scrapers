@@ -1,6 +1,6 @@
 # STAGE. — London theatre, for less.
 
-A daily price-comparison aggregator for London West End tickets across six seller sources (TodayTix, Official London Theatre, LOVEtheatre, SeatPlan, LondonTheatreDirect, TheatreTicketsDirect).
+A daily price-comparison aggregator for London West End tickets across five seller sources (TodayTix, Official London Theatre, LOVEtheatre, SeatPlan, TheatreTicketsDirect).
 
 The site shows you the cheapest seat for tonight, this week, and this month — across every seller — with direct booking links and per-source seat-plan metadata.
 
@@ -86,7 +86,6 @@ Or just trigger the GitHub Actions workflow — same thing, in parallel, on clou
 │   ├── olt_scraper.py
 │   ├── lovetheatre_scraper.py
 │   ├── seatplan_scraper.py
-│   ├── londontheatredirect_scraper.py
 │   ├── ttd_scraper.py
 │   └── lovetheatre_calendar.py # Helper, used by lovetheatre_scraper.py
 ├── index.html

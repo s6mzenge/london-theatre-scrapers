@@ -203,8 +203,8 @@ VENUE_ALIASES: dict[str, list[str]] = {
         "Young Vic (Main House)",
     ],
 
-    # National Theatre auditoria — londontheatredirect uses "National Theatre X"
-    # prefix; OLT/others use the bare auditorium name
+    # National Theatre auditoria — some sources prefix with "National Theatre"
+    # (e.g. "National Theatre Lyttelton"); OLT/others use the bare auditorium name
     "Lyttelton Theatre": [
         "National Theatre Lyttelton",
     ],
@@ -271,7 +271,7 @@ VENUE_ALIASES: dict[str, list[str]] = {
     # into two separate clusters at different venue_norms.)
 
     # @sohoplace is the marketing form (with leading '@' and no space) used
-    # by olt, lovetheatre, londontheatredirect, ttd. Other sources spell it
+    # by olt, lovetheatre, ttd. Other sources spell it
     # "Soho Place". Same theatre near Tottenham Court Road. Affects: Boy
     # Who Harnessed the Wind, Tao of Glass — both jump 4→7 sources.
     "Soho Place": [
@@ -316,7 +316,6 @@ STRIPPABLE_TITLE_PREFIXES = [
 SOURCE_PRIORITY = [
     "olt",
     "todaytix",
-    "londontheatredirect",
     "lovetheatre",
     "seatplan",
     "ttd",
@@ -370,14 +369,6 @@ SHOW_SCHEMAS: dict[str, dict[str, Any]] = {
         "url":          lambda s: s.get("url") or s.get("detail_canonical"),
         "performances": lambda s: s.get("performances") or [],
         "description":  lambda s: s.get("description_full") or s.get("description_short"),
-    },
-    "londontheatredirect": {
-        "title":        lambda s: s.get("name"),
-        "venue":        lambda s: _venue_str(s.get("venue")),
-        "id":           lambda s: s.get("event_id") or s.get("slug"),
-        "url":          lambda s: s.get("url"),
-        "performances": lambda s: s.get("performances") or [],
-        "description":  lambda s: s.get("description"),
     },
     "ttd": {
         "title":        lambda s: s.get("name"),
@@ -438,16 +429,6 @@ PERF_SCHEMAS: dict[str, dict[str, Any]] = {
         "book_url":   lambda p: p.get("book_url"),
         "available":  lambda p: ("InStock" in (p.get("availability") or ""))
                                 if p.get("availability") else None,
-    },
-    "londontheatredirect": {
-        "date":       lambda p: p.get("date"),
-        "time":       lambda p: p.get("time"),
-        "price_from": lambda p: p.get("price_from"),
-        "price_to":   lambda p: None,
-        "currency":   lambda p: "GBP",
-        "book_url":   lambda p: p.get("book_url"),
-        "available":  lambda p: (p.get("tickets_availability", 0) > 0)
-                                if isinstance(p.get("tickets_availability"), int) else None,
     },
     "ttd": {
         "date":       lambda p: p.get("date"),
@@ -741,7 +722,7 @@ def _slugify(title: str, venue: str) -> str:
 
 
 def load_sources(path: Path) -> dict[str, dict]:
-    """Load all 7 source JSONs from a directory or all-scrapers.zip."""
+    """Load all source JSONs from a directory or all-scrapers.zip."""
     out: dict[str, dict] = {}
     expected = set(SHOW_SCHEMAS.keys())
 
@@ -1212,7 +1193,7 @@ def rescue_orphans_by_title(
 #     "force_split": [
 #       {
 #         "reason": "Six - Singalong is a different ticketed event from Six",
-#         "record": {"source": "londontheatredirect", "source_id": "..."}
+#         "record": {"source": "lovetheatre", "source_id": "..."}
 #       }
 #     ]
 #   }

@@ -10,7 +10,6 @@ Six independent scrapers for London theatre ticket sites, plus a dedupe step tha
 | `olt_scraper.py` | [officiallondontheatre.com](https://officiallondontheatre.com/) | requests + BeautifulSoup |
 | `lovetheatre_scraper.py` | [lovetheatre.com](https://www.lovetheatre.com/) | requests + BeautifulSoup |
 | `seatplan_scraper.py` | [seatplan.com/london](https://seatplan.com/london/) | requests + BeautifulSoup |
-| `londontheatredirect_scraper.py` | [londontheatredirect.com](https://www.londontheatredirect.com/) | requests + regex |
 | `ttd_scraper.py` | [theatreticketsdirect.co.uk](https://www.theatreticketsdirect.co.uk/) | requests + BeautifulSoup |
 
 ## Setup

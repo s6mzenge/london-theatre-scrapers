@@ -94,7 +94,6 @@ jobs:
           - { name: olt,                 script: scraper/olt_scraper.py,                 playwright: false }
           - { name: lovetheatre,         script: scraper/lovetheatre_scraper.py,         playwright: false }
           - { name: seatplan,            script: scraper/seatplan_scraper.py,            playwright: false }
-          - { name: londontheatredirect, script: scraper/londontheatredirect_scraper.py, playwright: false }
           - { name: ttd,                 script: scraper/ttd_scraper.py,                 playwright: false }
 
     steps:

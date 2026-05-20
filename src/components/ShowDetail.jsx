@@ -9,11 +9,11 @@ import { formatShortDate } from '../lib/dates.js'
 // ---------------------------------------------------------------------------
 // Description cleanup
 // ---------------------------------------------------------------------------
-// Some sources (notably londontheatredirect) ship descriptions as raw
-// markdown with heading markers, inline links, and bold/italic syntax.
-// Rendering that as a plain string leaks `##`, `[text](url "title")`
-// etc. straight into the page. This helper strips the markdown syntax
-// and returns an array of clean paragraphs to render.
+// Some sources ship descriptions as raw markdown with heading markers,
+// inline links, and bold/italic syntax. Rendering that as a plain string
+// leaks `##`, `[text](url "title")` etc. straight into the page. This
+// helper strips the markdown syntax and returns an array of clean
+// paragraphs to render.
 //
 // We deliberately don't try to preserve heading structure: the source
 // markdown is poorly marked up (headings often run inline with body

@@ -29,7 +29,6 @@ const SELLER_LABELS = {
   seatplan: 'SeatPlan',
   todaytix: 'TodayTix',
   lovetheatre: 'LOVEtheatre',
-  londontheatredirect: 'LondonTheatreDirect',
   olt: 'Official London Theatre',
   ttd: 'Theatre Tickets Direct',
 }

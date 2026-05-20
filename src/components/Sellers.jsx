@@ -18,7 +18,6 @@ const KNOWN_SELLERS = [
   'seatplan',
   'todaytix',
   'lovetheatre',
-  'londontheatredirect',
   'olt',
   'ttd',
 ]
