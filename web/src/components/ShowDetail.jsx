@@ -6,6 +6,51 @@ import { formatShortDate } from '../lib/dates.js'
 // Each cell links directly to the seller's booking page for that
 // performance (target=_blank). The cheapest cell per row is highlighted.
 
+// ---------------------------------------------------------------------------
+// Description cleanup
+// ---------------------------------------------------------------------------
+// Some sources (notably londontheatredirect) ship descriptions as raw
+// markdown with heading markers, inline links, and bold/italic syntax.
+// Rendering that as a plain string leaks `##`, `[text](url "title")`
+// etc. straight into the page. This helper strips the markdown syntax
+// and returns an array of clean paragraphs to render.
+//
+// We deliberately don't try to preserve heading structure: the source
+// markdown is poorly marked up (headings often run inline with body
+// text on the same line), so trying to extract real h2/h3 elements
+// produces worse results than just flowing it all as prose.
+
+function cleanDescription(md) {
+  if (!md || typeof md !== 'string') return []
+
+  let text = md.replace(/\r\n/g, '\n').trim()
+
+  // [text](url) and [text](url "title")  ->  text
+  text = text.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+
+  // **bold** and *italic*  ->  bold / italic
+  text = text.replace(/\*\*([^*]+)\*\*/g, '$1')
+  text = text.replace(/\*([^*\n]+)\*/g, '$1')
+
+  // Heading markers at start of any line
+  text = text.replace(/^#{1,6}\s+/gm, '')
+  // Heading markers that appear mid-line (because the source jammed
+  // a heading onto the same line as preceding body text)
+  text = text.replace(/\s+#{1,6}\s+/g, ' ')
+
+  // List bullets — keep the text, drop the bullet
+  text = text.replace(/^\s*[-*]\s+/gm, '')
+
+  // Split into paragraphs on blank lines, fold soft line breaks
+  // inside each paragraph into spaces
+  const paragraphs = text
+    .split(/\n\n+/)
+    .map((p) => p.replace(/\n/g, ' ').replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+
+  return paragraphs
+}
+
 export default function ShowDetail({ show, onBack }) {
   const performances = useMemo(() => {
     return [...(show.performances || [])].sort((a, b) => {
@@ -23,6 +68,11 @@ export default function ShowDetail({ show, onBack }) {
     }
     return Array.from(set).sort()
   }, [performances])
+
+  const descParagraphs = useMemo(
+    () => cleanDescription(show.description),
+    [show.description],
+  )
 
   return (
     <div className="stg-show">
@@ -50,8 +100,12 @@ export default function ShowDetail({ show, onBack }) {
         </div>
       </header>
 
-      {show.description && (
-        <div className="stg-show-desc">{show.description}</div>
+      {descParagraphs.length > 0 && (
+        <div className="stg-show-desc">
+          {descParagraphs.map((p, i) => (
+            <p key={i}>{p}</p>
+          ))}
+        </div>
       )}
 
       {sellers.length === 0 ? (
