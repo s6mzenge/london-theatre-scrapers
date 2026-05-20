@@ -311,12 +311,11 @@ STRIPPABLE_TITLE_PREFIXES = [
 
 # Sources in their preferred order for tie-breaking when reconciling fields.
 # Earlier = preferred. Reasoning: olt has the richest editorial content
-# (descriptions, cast, FAQ); todaytix/londontheatre have the best price data;
+# (descriptions, cast, FAQ); todaytix has the best price data;
 # the rest fill in gaps.
 SOURCE_PRIORITY = [
     "olt",
     "todaytix",
-    "londontheatre",
     "londontheatredirect",
     "lovetheatre",
     "seatplan",
@@ -344,14 +343,6 @@ SHOW_SCHEMAS: dict[str, dict[str, Any]] = {
         "title":        lambda s: s.get("name"),
         "venue":        lambda s: _venue_str(s.get("venue")),
         "id":           lambda s: s.get("id") or s.get("slug"),
-        "url":          lambda s: s.get("url"),
-        "performances": lambda s: s.get("showtimes") or [],
-        "description":  lambda s: s.get("description"),
-    },
-    "londontheatre": {
-        "title":        lambda s: s.get("name"),
-        "venue":        lambda s: _venue_str(s.get("venue")),
-        "id":           lambda s: s.get("show_id") or s.get("id") or s.get("slug"),
         "url":          lambda s: s.get("url"),
         "performances": lambda s: s.get("showtimes") or [],
         "description":  lambda s: s.get("description"),
@@ -405,16 +396,6 @@ SHOW_SCHEMAS: dict[str, dict[str, Any]] = {
 # sources on (date, time).
 PERF_SCHEMAS: dict[str, dict[str, Any]] = {
     "todaytix": {
-        "date":       lambda p: p.get("local_date") or p.get("date"),
-        "time":       lambda p: p.get("local_time") or p.get("time"),
-        "price_from": lambda p: p.get("low_price_value"),
-        "price_to":   lambda p: None,
-        "currency":   lambda p: p.get("currency"),
-        "book_url":   lambda p: p.get("booking_url") or p.get("book_url"),
-        "available":  lambda p: (p.get("seats_available", 0) > 0)
-                                if isinstance(p.get("seats_available"), int) else None,
-    },
-    "londontheatre": {
         "date":       lambda p: p.get("local_date") or p.get("date"),
         "time":       lambda p: p.get("local_time") or p.get("time"),
         "price_from": lambda p: p.get("low_price_value"),

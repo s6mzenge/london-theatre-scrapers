@@ -1,6 +1,6 @@
 # STAGE. — London theatre, for less.
 
-A daily price-comparison aggregator for London West End tickets across seven seller sources (TodayTix, LondonTheatre, Official London Theatre, LOVEtheatre, SeatPlan, LondonTheatreDirect, TheatreTicketsDirect).
+A daily price-comparison aggregator for London West End tickets across six seller sources (TodayTix, Official London Theatre, LOVEtheatre, SeatPlan, LondonTheatreDirect, TheatreTicketsDirect).
 
 The site shows you the cheapest seat for tonight, this week, and this month — across every seller — with direct booking links and per-source seat-plan metadata.
 
@@ -9,7 +9,7 @@ The site shows you the cheapest seat for tonight, this week, and this month — 
 ```
 ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
 │  GitHub Actions  │────▶│  public/data/    │────▶│  Cloudflare      │
-│  (7 scrapers +   │     │  unified.json    │     │  Pages           │
+│  (6 scrapers +   │     │  unified.json    │     │  Pages           │
 │   dedupe)        │     │                  │     │  (React + Vite)  │
 └──────────────────┘     └──────────────────┘     └──────────────────┘
 ```
@@ -35,7 +35,7 @@ The dev server reads `public/data/unified.json` — whatever the last scrape com
 
 ```bash
 pip install -r scraper/requirements.txt
-playwright install chromium   # only needed for todaytix + londontheatre
+playwright install chromium   # only needed for todaytix
 
 # Run any single scraper:
 python scraper/olt_scraper.py --out scraper/data/olt.json --limit 5
@@ -83,7 +83,6 @@ Or just trigger the GitHub Actions workflow — same thing, in parallel, on clou
 │   │   ├── dedupe.py           # Cross-source matching pipeline
 │   │   └── overrides.yaml      # Manual force-merge / force-split rules
 │   ├── todaytix_scraper.py
-│   ├── londontheatre_scraper.py
 │   ├── olt_scraper.py
 │   ├── lovetheatre_scraper.py
 │   ├── seatplan_scraper.py

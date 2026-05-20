@@ -29,8 +29,8 @@ name: Full scrape
 # locally with `python scraper/olt_scraper.py`.
 #
 # Expected runtime: ~3-6 minutes total (parallel scrape, ~30s combine,
-# ~1 min dedupe, ~30s publish). The Playwright-driven scrapers
-# (todaytix, londontheatre) are the long pole.
+# ~1 min dedupe, ~30s publish). The Playwright-driven scraper
+# (todaytix) is the long pole.
 #
 # What's committed vs not:
 #   * public/data/unified.json (~35MB) is committed -- it's what the
@@ -49,7 +49,7 @@ on:
         required: false
         default: ''
       skip_browser:
-        description: 'Skip the two Playwright scrapers (todaytix, londontheatre)'
+        description: 'Skip the Playwright scraper (todaytix)'
         required: false
         default: 'false'
         type: choice
@@ -91,7 +91,6 @@ jobs:
       matrix:
         include:
           - { name: todaytix,            script: scraper/todaytix_scraper.py,            playwright: true }
-          - { name: londontheatre,       script: scraper/londontheatre_scraper.py,       playwright: true }
           - { name: olt,                 script: scraper/olt_scraper.py,                 playwright: false }
           - { name: lovetheatre,         script: scraper/lovetheatre_scraper.py,         playwright: false }
           - { name: seatplan,            script: scraper/seatplan_scraper.py,            playwright: false }
