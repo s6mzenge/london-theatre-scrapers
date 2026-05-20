@@ -536,7 +536,8 @@ class DetailFetcher:
 
     def _build_showtime(self, raw: dict, show_id: int) -> Showtime:
         regular = raw.get("regularTickets") or {}
-        low_price = regular.get("lowPrice") or {}
+        api_low_price = regular.get("lowPrice") or {}
+        showtime_seats = regular.get("numAssignedSeatsAvailable")
 
         bands: list[PriceBand] = []
         for band in regular.get("priceBands") or []:
@@ -551,6 +552,45 @@ class DetailFetcher:
                 max_contiguous_seats=band.get("maxContiguousSeats"),
             ))
 
+        # Compute the from-price from AVAILABLE bands only.
+        #
+        # TodayTix's `regularTickets.lowPrice` is the cheapest band's price
+        # *regardless of availability* — i.e. when the £81 band sells out
+        # and only £150 seats remain, the API still advertises £81. Using
+        # that value would mean our table shows prices users can't actually
+        # buy, which is the whole bug this scraper is supposed to avoid.
+        #
+        # A band is considered available iff numAssignedSeatsAvailable > 0.
+        # Bands with no seat info at all are treated as a schema-drift
+        # signal and we fall back to the API's advertised price so we
+        # don't silently zero out every showtime if TodayTix renames the
+        # field.
+        bands_with_seat_info = [b for b in bands if b.seats_available is not None]
+        if not bands_with_seat_info:
+            # Schema fallback — no per-band availability data anywhere on
+            # this showtime. Trust the advertised price; flag via the
+            # warnings pipeline if this becomes widespread.
+            low_price_value = api_low_price.get("value")
+            low_price_display = api_low_price.get("display")
+            currency = api_low_price.get("currency")
+        else:
+            available = [
+                b for b in bands_with_seat_info
+                if (b.seats_available or 0) > 0 and b.price_value is not None
+            ]
+            if showtime_seats == 0 or not available:
+                # Sold out, either at the showtime level or because every
+                # band reports zero seats. Downstream consumers (dedupe,
+                # display) already filter on `low_price_value is not None`.
+                low_price_value = None
+                low_price_display = None
+                currency = api_low_price.get("currency")
+            else:
+                cheapest = min(available, key=lambda b: b.price_value)
+                low_price_value = cheapest.price_value
+                low_price_display = cheapest.price_display
+                currency = cheapest.currency or api_low_price.get("currency")
+
         showtime_id = raw.get("id")
         local_date = raw.get("localDate")
         local_time = raw.get("localTime")
@@ -563,12 +603,12 @@ class DetailFetcher:
             day_of_week=raw.get("dayOfWeek"),
             daypart=raw.get("daypart"),
             booking_url=self._build_booking_url(show_id, showtime_id, local_date, local_time),
-            low_price_value=low_price.get("value"),
-            low_price_display=low_price.get("display"),
-            currency=low_price.get("currency"),
+            low_price_value=low_price_value,
+            low_price_display=low_price_display,
+            currency=currency,
             has_promotion=bool(regular.get("hasPromotion")),
             promotion_label=regular.get("promotionLabel"),
-            seats_available=regular.get("numAssignedSeatsAvailable"),
+            seats_available=showtime_seats,
             price_bands=bands,
         )
 
