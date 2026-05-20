@@ -436,12 +436,17 @@ PERF_SCHEMAS: dict[str, dict[str, Any]] = {
     "lovetheatre": {
         "date":       lambda p: p.get("date"),
         "time":       lambda p: p.get("time"),
-        "price_from": lambda p: p.get("price"),
+        "price_from": lambda p: p.get("min_combined_price") or p.get("price"),
         "price_to":   lambda p: None,
         "currency":   lambda p: p.get("currency"),
         "book_url":   lambda p: p.get("book_url") or p.get("offer_url"),
-        "available":  lambda p: ("InStock" in (p.get("availability") or ""))
-                                if p.get("availability") else None,
+        "available":  lambda p: (
+            "InStock" in (p.get("availability") or "")
+            if p.get("availability")
+            else (p["max_seats"] > 0
+                  if isinstance(p.get("max_seats"), int)
+                  else None)
+        ),
     },
     "seatplan": {
         "date":       lambda p: p.get("date"),
