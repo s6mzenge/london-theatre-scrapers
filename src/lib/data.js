@@ -6,7 +6,7 @@
 // dedupe.py. None of them require fields beyond Tier 1 (what's already
 // in unified.json today). When Tier 2 fields land (genre, run-status,
 // promotions, etc.), the components read them through `deriveGenre` /
-// `deriveOnOffer` / `deriveRunStatus` helpers below Ã¢â‚¬â€ they degrade
+// `deriveOnOffer` / `deriveRunStatus` helpers below — they degrade
 // gracefully to undefined until plumbing arrives.
 
 import {
@@ -21,7 +21,7 @@ import {
 // unified.json is committed to public/data/ by the scrape workflow,
 // so Vite copies it into dist/data/unified.json at build time and the
 // site serves it from the same origin. No cross-origin fetch, no
-// CORS preflight, no dependency on external caches Ã¢â‚¬â€ the data ships
+// CORS preflight, no dependency on external caches — the data ships
 // with the bundle, and a Pages redeploy after every scrape is what
 // makes it fresh.
 const DATA_URL = `${import.meta.env.BASE_URL || '/'}data/unified.json.gz`
@@ -61,7 +61,7 @@ export function extractMeta(data) {
 // Some scrapers (notably lovetheatre) emit price_from = 0.0 to mean
 // "price unknown" rather than a real free seat. Dedupe propagates this
 // up into perf.min_price = 0, which would otherwise dominate every
-// aggregation ("cheapest tonight: Ã‚£0"). We treat any non-positive
+// aggregation ("cheapest tonight: £0"). We treat any non-positive
 // number as missing data throughout.
 function validPrice(p) {
   return typeof p === 'number' && p > 0 && Number.isFinite(p)
@@ -89,7 +89,7 @@ function effectiveCheapest(perf) {
 function priceRangeLabel(perf, effectiveMin) {
   if (!validPrice(perf.max_price)) return null
   if (effectiveMin == null || perf.max_price === effectiveMin) return null
-  return `Ã‚£${Math.round(effectiveMin)}Ã¢â‚¬â€œÃ‚£${Math.round(perf.max_price)}`
+  return `£${Math.round(effectiveMin)}–£${Math.round(perf.max_price)}`
 }
 
 // =============================================================
@@ -237,7 +237,7 @@ function aggregateWeek(data, today) {
   }
 
   // Absolute week floor
-  let weekFloor = { price: null, dayOfWeek: 'Ã¢â‚¬â€' }
+  let weekFloor = { price: null, dayOfWeek: '—' }
   for (const d of days) {
     if (d.floor != null && (weekFloor.price == null || d.floor < weekFloor.price)) {
       weekFloor = { price: d.floor, dayOfWeek: d.dow }
@@ -279,8 +279,8 @@ function aggregateWeek(data, today) {
         const hi = Math.max(...others)
         otherNightsRange =
           lo === hi
-            ? `Ã‚£${Math.round(lo)}`
-            : `Ã‚£${Math.round(lo)}Ã¢â‚¬â€œÃ‚£${Math.round(hi)}`
+            ? `£${Math.round(lo)}`
+            : `£${Math.round(lo)}–£${Math.round(hi)}`
       }
       return {
         show: { id: show.id, title: show.title, venue: show.venue },
@@ -296,7 +296,7 @@ function aggregateWeek(data, today) {
 
   const startIso = days[0].iso
   const endIso = days[6].iso
-  const label = `${dayOfMonth(startIso)}Ã¢â‚¬â€œ${dayOfMonth(endIso)} ${parseISO(endIso)
+  const label = `${dayOfMonth(startIso)}–${dayOfMonth(endIso)} ${parseISO(endIso)
     .toLocaleDateString('en-GB', { month: 'short' })
     .toUpperCase()}`
 
@@ -324,7 +324,7 @@ function aggregateMonth(data, today) {
   const totalDays = lastOfMonth.getDate()
 
   // Aggregate every performance in this month by date (using effective
-  // cheapest price across valid sources, ignoring Ã‚£0 anomalies)
+  // cheapest price across valid sources, ignoring £0 anomalies)
   const dayFloors = {}
   for (const show of data.shows) {
     for (const perf of show.performances || []) {
@@ -352,7 +352,7 @@ function aggregateMonth(data, today) {
   const percentiles = computePercentiles(monthFloorPrices)
 
   // Absolute month floor
-  let monthFloor = { price: null, dayLabel: 'Ã¢â‚¬â€', iso: null }
+  let monthFloor = { price: null, dayLabel: '—', iso: null }
   for (const [iso, slot] of Object.entries(dayFloors)) {
     if (
       slot.floor !== Infinity &&
@@ -418,7 +418,7 @@ function aggregateMonth(data, today) {
   if (cheapestWeeknight) {
     insights.push({
       label: 'CHEAPEST WEEKNIGHT',
-      value: `${formatShortDate(cheapestWeeknight.iso)} Ã‚· Ã‚£${Math.round(cheapestWeeknight.price)}`,
+      value: `${formatShortDate(cheapestWeeknight.iso)} · £${Math.round(cheapestWeeknight.price)}`,
       sub: cheapestWeeknight.show
         ? `${cheapestWeeknight.show.title}, ${cheapestWeeknight.show.venue}`
         : 'in this month',
@@ -426,7 +426,7 @@ function aggregateMonth(data, today) {
     })
   }
 
-  // 2) Biggest range Ã¢â‚¬â€ show with the widest min-max in this month
+  // 2) Biggest range — show with the widest min-max in this month
   let biggestRange = null
   for (const show of data.shows) {
     if (!validPrice(show.min_price_gbp) || !validPrice(show.max_price_gbp)) continue
@@ -445,12 +445,12 @@ function aggregateMonth(data, today) {
     insights.push({
       label: 'BIGGEST RANGE',
       value: biggestRange.show.title,
-      sub: `Ã‚£${Math.round(biggestRange.show.min_price_gbp)}Ã¢â‚¬â€œÃ‚£${Math.round(biggestRange.show.max_price_gbp)} Ã‚· matinees cheapest`,
+      sub: `£${Math.round(biggestRange.show.min_price_gbp)}–£${Math.round(biggestRange.show.max_price_gbp)} · matinees cheapest`,
       showId: biggestRange.show.id,
     })
   }
 
-  // 3) Activity Ã¢â‚¬â€ how many shows are running in this month
+  // 3) Activity — how many shows are running in this month
   const showsThisMonth = new Set()
   for (const show of data.shows) {
     for (const perf of show.performances || []) {
