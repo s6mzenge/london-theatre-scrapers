@@ -1,0 +1,112 @@
+Deduper v2 report — generated 2026-05-20T13:58:36+00:00
+
+Sources loaded: 7
+  olt                      127 shows   scraped 2026-05-20T13:56:19+00:00
+  todaytix                 199 shows   scraped 2026-05-20T13:56:45+00:00
+  londontheatre            198 shows   scraped 2026-05-20T13:58:04+00:00
+  londontheatredirect      166 shows   scraped 2026-05-20T13:56:16+00:00
+  lovetheatre              168 shows   scraped 2026-05-20T13:56:25+00:00
+  seatplan                 125 shows   scraped 2026-05-20T13:56:19+00:00
+  ttd                      208 shows   scraped 2026-05-20T13:56:22+00:00
+
+Total source records:           1191
+Total unified shows:            284
+Total unified performances:     31922
+
+Stages:
+  1+2 (norm + registry)         318 clusters
+  3 (fuzzy within venues)       31 auto-merges, 53 pairs in review
+  5 (manual overrides)          0 splits, 3 merges
+
+Cluster size distribution:
+  7 sources:    82 shows
+  6 sources:    16 shows
+  5 sources:    25 shows
+  4 sources:    39 shows
+  3 sources:    36 shows
+  2 sources:    42 shows
+  1 sources:    44 shows
+
+Orphans (no venue, dropped):    3
+
+Stage 3 fuzzy auto-merges (31):
+  [100]  'car man'  +  'matthew bournes the car man'  @  'sadlers wells'
+  [100]  'adriana mater'  +  'adriana mater english national opera'  @  'london coliseum'
+  [100]  'breaking the waves'  +  'breaking the waves english national opera'  @  'london coliseum'
+  [100]  'iphigenie en tauride'  +  'iphigenie en tauride english national opera'  @  'london coliseum'
+  [100]  'romeo juliet'  +  'english national ballet romeo and juliet'  @  'london coliseum'
+  [100]  'swan lake'  +  'state ballet of georgia swan lake'  @  'london coliseum'
+  [100]  'to die for'  +  'to die for a comedy english national opera'  @  'london coliseum'
+  [100]  'to die for'  +  'to die for a comedy english national'  @  'london coliseum'
+  [100]  'la traviata'  +  'la traviata english national opera'  @  'london coliseum'
+  [100]  'trial by jury the zoo'  +  'trial by jury the zoo english national opera'  @  'london coliseum'
+  [100]  'austentatious an improvised jane austen novel'  +  'austentatious'  @  'vaudeville'
+  [100]  'million years of minnelli'  +  'trevor ashley a million years of minnelli'  @  'garrick'
+  [100]  'raising gays'  +  'raising gays a concert reading'  @  'garrick'
+  [100]  'romeo juliet'  +  'romeo and juliet'  @  'harold pinter'
+  [100]  'here comes j edgar'  +  'here comes j edgar a comedy musical'  @  'kings head'
+  [100]  'im every woman the chaka khan musical'  +  'im every woman'  @  'troubadour wembley park'
+  [100]  'harry potter and the cursed child'  +  'harry potter and the cursed child one part'  @  'palace'
+  [100]  'harry potter and the cursed child'  +  'harry potter and the cursed child both parts'  @  'palace'
+  [100]  'harry potter and the cursed child'  +  'harry potter and the cursed child part one and two'  @  'palace'
+  [100]  'horrible histories barmy britain the best bits'  +  'horrible histories barmy britain'  @  'apollo'
+  [100]  'my sons a queer'  +  'my sons a queer but what can you do'  @  'apollo'
+  [100]  'onyx productions 360 allstars'  +  '360 allstars'  @  'peacock'
+  [100]  'yamato the drummers of japan hito no chikara the power of human strength'  +  'yamato the drummers of japan hito no chikara'  @  'peacock'
+  [100]  'yamato the drummers of japan hito no chikara the power of human strength'  +  'yamato hito no chikara'  @  'peacock'
+  [100]  'yamato the drummers of japan hito no chikara the power of human strength'  +  'hito no chikara the power of human strength'  @  'peacock'
+  [100]  'dirty dancing'  +  'dirty dancing the classic story on stage'  @  'capital'
+  [100]  'jesus christ superstar'  +  'jesus christ superstar the palladium'  @  'london palladium'
+  [100]  'so are we leon lightfoot'  +  'so we are leon lightfoot'  @  'royal ballet and opera'
+  [100]  'sleeping beauty english national ballet'  +  'sleeping beauty'  @  'royal albert hall'
+  [98]  'darrell smith the soul brothers syndicate'  +  'darrel smith the soul brothers syndicate'  @  'his majestys'
+  [82]  'yamato the drummers of japan hito no chikara the power of human strength'  +  'yamoto drummers of japan'  @  'peacock'
+
+Stage 3 review-queue pairs (53 — see review.json):
+  [100]  'harry potter and the cursed child'  ~  'harry potter and the cursed child two parts'  @  'palace'
+  [95]  'harry potter and the cursed child two parts'  ~  'harry potter and the cursed child both parts'  @  'palace'
+  [94]  'harry potter and the cursed child two parts'  ~  'harry potter and the cursed child part one and two'  @  'palace'
+  [89]  'harry potter and the cursed child one part'  ~  'harry potter and the cursed child two parts'  @  'palace'
+  [88]  'la traviata english national opera'  ~  'tosca english national opera'  @  'london coliseum'
+  [88]  'angel bones english national opera'  ~  'tosca english national opera'  @  'london coliseum'
+  [88]  'trial by jury the zoo english national opera'  ~  'tosca english national opera'  @  'london coliseum'
+  [88]  'tosca english national opera'  ~  'to die for a comedy english national opera'  @  'london coliseum'
+  [88]  'tosca english national opera'  ~  'adriana mater english national opera'  @  'london coliseum'
+  [88]  'tosca english national opera'  ~  'iphigenie en tauride english national opera'  @  'london coliseum'
+  ... and 43 more
+
+Stage 4 orphans attached (2):
+  [100]  [olt] 'Paranormal Activity'
+          → matched cluster 'paranormal activity' @ 'ambassadors'
+  [100]  [lovetheatre] 'Come Alive: The Greatest Showman Circus Spectacular'
+          → matched cluster 'come alive the greatest showman circus spectacular' @ 'empress museum'
+
+Top 20 shows by source count:
+  8× 'Harry Potter and the Cursed Child'           @ 'Palace Theatre'  (144 perfs)
+  7× '1536'                                        @ 'Ambassadors Theatre'  (86 perfs)
+  7× "A Midsummer Night's Dream"                   @ "Shakespeare's Globe"  (69 perfs)
+  7× "A Midsummer Night's Dream"                   @ "Regent's Park Open Air Theatre"  (31 perfs)
+  7× 'Adriana Mater'                               @ 'London Coliseum'  (7 perfs)
+  7× 'An Ideal Husband'                            @ 'Lyric Hammersmith'  (22 perfs)
+  7× 'Arcadia'                                     @ "Duke of York's Theatre"  (96 perfs)
+  7× 'Avenue Q'                                    @ 'Shaftesbury Theatre'  (118 perfs)
+  7× 'Be Like Blippi'                              @ 'The Arts at Marble Arch'  (41 perfs)
+  7× 'Beetlejuice'                                 @ 'Prince Edward Theatre'  (381 perfs)
+  7× 'Bill Bailey: Vaudevillean'                   @ 'Theatre Royal Haymarket'  (51 perfs)
+  7× 'Billy Elliot The Musical'                    @ 'Adelphi Theatre'  (197 perfs)
+  7× 'Brainiac Live'                               @ 'Garrick Theatre'  (47 perfs)
+  7× 'Breaking the Waves - English National Opera' @ 'London Coliseum'  (5 perfs)
+  7× 'Burlesque The Musical'                       @ 'The Arts at Marble Arch'  (162 perfs)
+  7× 'Cabaret'                                     @ 'Kit Kat Club at the Playhouse Theatre'  (294 perfs)
+  7× 'Cats'                                        @ "Regent's Park Open Air Theatre"  (63 perfs)
+  7× 'Come Alive! The Greatest Showman Circus Spectacular' @ 'Empress Museum'  (275 perfs)
+  7× 'Cyrano de Bergerac'                          @ 'Noël Coward Theatre'  (96 perfs)
+  7× 'Dark of the Moon'                            @ 'Charing Cross Theatre'  (92 perfs)
+
+To improve match rate further:
+  - Inspect review.json fuzzy_review_pairs section; promote good ones
+    via an overrides.yaml force_merge entry.
+  - Inspect unified.json stages.stage_3_fuzzy_merges; demote bad ones
+    via an overrides.yaml force_split entry.
+  - Add venue aliases to VENUE_ALIASES in dedupe.py for any
+    singletons that should clearly be in an existing cluster.
