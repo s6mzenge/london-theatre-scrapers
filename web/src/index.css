@@ -1056,15 +1056,22 @@ a {
 }
 
 .stg-show-desc {
-  font-family: var(--font-display);
-  font-style: italic;
+  font-family: var(--font-slab);
   font-size: 14px;
   color: var(--color-text);
-  line-height: 1.55;
+  line-height: 1.65;
   max-width: 720px;
   margin-bottom: 32px;
   padding-bottom: 24px;
   border-bottom: 0.5px solid var(--line-soft);
+}
+
+.stg-show-desc p {
+  margin: 0 0 14px 0;
+}
+
+.stg-show-desc p:last-child {
+  margin-bottom: 0;
 }
 
 .stg-show-grid-wrap {
