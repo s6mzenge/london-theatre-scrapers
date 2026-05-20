@@ -1108,6 +1108,120 @@ def _merge_global_lastminute_into_perfs(
     return perfs
 
 
+# ---------------------------------------------------------------------------
+# Constructed booking URLs (for performances beyond the rolling window)
+# ---------------------------------------------------------------------------
+
+# Lower-case 3-letter month abbreviations, indexed 1..12. SeatPlan's
+# URL slug uses these (e.g. "13-jun-2026"), so we match that exactly.
+_MONTH_ABBR: tuple[str, ...] = (
+    "jan", "feb", "mar", "apr", "may", "jun",
+    "jul", "aug", "sep", "oct", "nov", "dec",
+)
+
+
+def _construct_book_url(
+    show_url: str, date_iso: str | None, time_24h: str | None,
+) -> str | None:
+    """Build a SeatPlan booking deep-link URL from a (date, time) pair.
+
+    SeatPlan only renders deep-link booking URLs inline in the page DOM
+    for the rolling ~5-day "Last Minute" window, but their server
+    validates leaf URLs against the full performance calendar:
+
+      * Valid (date, time) with a real performance → serves a dedicated
+        "Select Seat" page (title "Select Seat | <time> <date> | …").
+      * (date, time) with no performance, or a past date → redirects
+        to the show page.
+
+    Verified empirically across +1 week, +3 weeks, +10 weeks, +20 weeks
+    and end-of-run for Wicked: all returned Select Seat pages. A Monday
+    probe (no performance) and a past-date probe both bounced. The
+    pattern works for the entire published run, not just the window.
+
+    Returns None on malformed inputs (missing date/time, non-numeric
+    components, out-of-range values). Since we feed this from JSON-LD
+    performance dates+times, malformed inputs should be rare; we still
+    guard against them so a single bad row doesn't crash a whole show.
+
+    URL format (matches what the per-show widget emits):
+        {show_url}tickets/{D-mon-YYYY}/{h-mm}{am|pm}/
+
+    Where D is the day of month with no leading zero, mon is the
+    lowercase 3-letter month, h is the 12-hour hour with no leading
+    zero, mm is the 2-digit minute, and am/pm is the meridian. Examples:
+        "2026-06-13" + "14:30" → ".../tickets/13-jun-2026/2-30pm/"
+        "2026-08-01" + "19:30" → ".../tickets/1-aug-2026/7-30pm/"
+        "2026-10-10" + "12:00" → ".../tickets/10-oct-2026/12-00pm/"
+        "2026-10-10" + "00:30" → ".../tickets/10-oct-2026/12-30am/"
+    """
+    if not show_url or not date_iso or not time_24h:
+        return None
+
+    try:
+        y_str, m_str, d_str = date_iso.split("-")
+        year, month, day = int(y_str), int(m_str), int(d_str)
+    except (ValueError, AttributeError):
+        return None
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+
+    try:
+        hh_str, mm_str = time_24h.split(":", 1)
+        hour, minute = int(hh_str), int(mm_str[:2])
+    except (ValueError, AttributeError, IndexError):
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+
+    # 24h → 12h with am/pm
+    if hour == 0:
+        h12, ampm = 12, "am"
+    elif hour < 12:
+        h12, ampm = hour, "am"
+    elif hour == 12:
+        h12, ampm = 12, "pm"
+    else:
+        h12, ampm = hour - 12, "pm"
+
+    base = show_url if show_url.endswith("/") else show_url + "/"
+    return f"{base}tickets/{day}-{_MONTH_ABBR[month - 1]}-{year}/{h12}-{minute:02d}{ampm}/"
+
+
+def _fill_constructed_book_urls(
+    perfs: list[dict], show_url: str,
+) -> int:
+    """Fill `book_url` on any performance dict that's still missing one,
+    using the deterministic SeatPlan deep-link URL pattern.
+
+    Runs after the per-show widget merge (`_merge_lastminute`) and the
+    cross-show global table merge (`_merge_global_lastminute_into_perfs`)
+    have done what they can. Whatever's left is beyond the ~5-day
+    window the page DOM exposes; we construct URLs for those from the
+    JSON-LD date+time directly.
+
+    Mutates perfs in place. Returns the number of URLs constructed —
+    surfaced in the scrape report so anomalies (a sudden drop in
+    constructed count, or a sudden surge in construction failures) are
+    visible run-to-run.
+
+    No HTTP requests are made — this is a pure transform. If SeatPlan
+    ever changes the URL pattern, broken links will be emitted without
+    a runtime signal; the right tripwire is the cross-source
+    consistency check downstream, which would notice book_urls that
+    don't resolve.
+    """
+    constructed = 0
+    for p in perfs:
+        if p.get("book_url"):
+            continue
+        url = _construct_book_url(show_url, p.get("date"), p.get("time"))
+        if url is not None:
+            p["book_url"] = url
+            constructed += 1
+    return constructed
+
+
 def _extract_lastminute_showtime_ids(soup: BeautifulSoup) -> dict[str, str]:
     """Build a map from booking URL → data-id (showtime ID). We attach
     these in a separate pass so the merge step doesn't have to thread the
@@ -1539,6 +1653,7 @@ def fetch_all_details(
     t_start = time.monotonic()
     budget_exceeded = False
     sku_backfills = [0]  # mutable counter for closure; logged at end
+    constructed_urls = [0]  # how many book_urls we built from the URL pattern
 
     results: list[Show | None] = [None] * len(cards)
     errors: list[str | None] = [None] * len(cards)
@@ -1573,6 +1688,17 @@ def fetch_all_details(
             performances = _merge_global_lastminute_into_perfs(
                 detail.get("performances") or [], global_lm,
             )
+            # Final fallback: for performances still missing a book_url
+            # (i.e. anything beyond the rolling ~5-day window SeatPlan
+            # surfaces inline), construct the deep-link URL from the
+            # show URL + JSON-LD date/time. The server validates these
+            # against the real performance calendar — invalid (date,
+            # time) combos bounce to the show page rather than 404, so
+            # the worst-case fallback is graceful.
+            n_built = _fill_constructed_book_urls(performances, card.url)
+            if n_built:
+                with lock:
+                    constructed_urls[0] += n_built
             results[idx] = Show(
                 url=card.url,
                 slug=card.slug,
@@ -1653,6 +1779,12 @@ def fetch_all_details(
             "where the detail page didn't expose Product.sku",
             sku_backfills[0],
         )
+    if constructed_urls[0]:
+        log.info(
+            "  book_url constructed from URL pattern for %d performance(s) "
+            "beyond the rolling ~5-day window SeatPlan surfaces inline",
+            constructed_urls[0],
+        )
     return shows, failures, budget_exceeded
 
 
@@ -1720,12 +1852,16 @@ def run_sanity_checks(
     all_perfs = [(s, p) for s in shows for p in s.performances]
     if all_perfs:
         no_book_url = sum(1 for _, p in all_perfs if not p.get("book_url"))
-        # Many performances legitimately lack book_url (only the next 5
-        # days are in the Last Minute table), so the threshold is loose.
-        if no_book_url / len(all_perfs) > 0.85:
+        # After the URL-construction fallback, every performance with a
+        # valid (date, time) should carry a book_url — the only legitimate
+        # misses are perfs with malformed date/time fields. >10% missing
+        # therefore indicates URL construction is silently failing or the
+        # JSON-LD time format has shifted.
+        if no_book_url / len(all_perfs) > 0.10:
             warnings.append(
                 f"performance: {no_book_url}/{len(all_perfs)} performances "
-                "lack book_url (>85% threshold)"
+                "lack book_url (>10% threshold) — URL construction may be "
+                "failing; check time format in JSON-LD"
             )
         bad_prices = sum(
             1 for _, p in all_perfs
