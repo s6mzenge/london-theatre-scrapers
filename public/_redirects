@@ -1,0 +1,4 @@
+# Cloudflare Pages SPA fallback. Currently the site uses state-based
+# navigation so this is a no-op (every request resolves to /index.html
+# anyway), but it future-proofs the deploy for when react-router lands.
+/*    /index.html   200
