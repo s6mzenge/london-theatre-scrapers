@@ -103,6 +103,11 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# Calendar API enrichment for accurate per-performance pricing.
+# See lovetheatre_calendar.py for the rationale and the diagnostic
+# that established the JSON-LD price problem.
+import lovetheatre_calendar as ltc
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -1432,8 +1437,9 @@ def fetch_show_detail(
     except requests.RequestException as e:
         return None, f"http: {e}"
 
+    detail: dict | None
     try:
-        return parse_show(r.text), None
+        detail = parse_show(r.text)
     except Exception as e:  # noqa: BLE001
         # Retry once after a brief wait — parse errors are usually
         # transient (partial HTML, mid-deploy).
@@ -1441,11 +1447,30 @@ def fetch_show_detail(
         time.sleep(DETAIL_PARSE_RETRY_DELAY_S)
         try:
             r = _fetch_html(session, card.url)
-            return parse_show(r.text), None
+            detail = parse_show(r.text)
         except requests.RequestException as e2:
             return None, f"http (retry): {e2}"
         except Exception as e2:  # noqa: BLE001
             return None, f"parse: {e2}"
+
+    # Calendar API enrichment. Broad except is deliberate — enrichment
+    # is purely additive, so any failure mode (network, JSON shape
+    # change, etc.) should degrade gracefully rather than nuke a
+    # successfully-parsed show.
+    try:
+        counts = ltc.enrich_show(session, detail)
+        if counts is not None:
+            matched, jsonld_only, cal_only = counts
+            log.debug(
+                "Calendar enrichment %s: %d matched, %d jsonld-only, "
+                "%d calendar-only",
+                card.show_id, matched, jsonld_only, cal_only,
+            )
+    except Exception as e:  # noqa: BLE001
+        log.warning("Calendar enrichment failed for %s: %s — continuing",
+                    card.show_id, e)
+
+    return detail, None
 
 
 def fetch_all_details(
@@ -1747,6 +1772,10 @@ def validate_data_ranges(shows: list[Show]) -> list[str]:
             p = perf.get("price")
             if not _price_ok(p):
                 bad_perf_price.append((s.show_id, p))
+            # Also validate the calendar-API enrichment field (added 2026):
+            mcp = perf.get("min_combined_price")
+            if mcp is not None and not _price_ok(mcp):
+                bad_perf_price.append((s.show_id, mcp))
             date = perf.get("date")
             if isinstance(date, str) and len(date) >= 4 and date[:4].isdigit():
                 if not _year_ok(int(date[:4])):
@@ -1882,6 +1911,11 @@ def main(argv: list[str] | None = None) -> int:
         log.info("--dry-run: no output file will be written")
     if deadline is not None:
         log.info("Wall-clock budget: %ds", args.max_runtime_seconds)
+
+    # Warm the secure.lovetheatre.com session so subsequent calendar
+    # API calls have a sessionid cookie. Non-fatal if it fails — every
+    # show's enrichment will then degrade to jsonld_only individually.
+    ltc.warm_session(session)
 
     # Stage 1: listings (master + offer slices), dedupe, build appears_in
     try:
