@@ -527,7 +527,16 @@ class DetailFetcher:
                            date: str | None, time: str | None) -> str | None:
         if showtime_id is None:
             return None
-        params: dict[str, Any] = {"product_id": show_id, "showtime_id": showtime_id}
+        # qt (quantity) is required by TodayTix's seating-plan page —
+        # without it, the page renders an empty "No seats available" state
+        # even when seats *are* available. We default to 2 (the most common
+        # booking size and TodayTix's own UI default); the user can adjust
+        # the quantity on the page itself.
+        params: dict[str, Any] = {
+            "product_id": show_id,
+            "qt": 2,
+            "showtime_id": showtime_id,
+        }
         if date:
             params["date"] = date
         if time:
