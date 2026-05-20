@@ -216,6 +216,68 @@ BOOK_URL_RE = re.compile(
     r"/shows/seats/(\d+)/(\d{4})/(\d{1,2})/(\d{1,2})/\d+/(\d{1,2})-(\d{2})/\d+/?$"
 )
 
+# ---------------------------------------------------------------------------
+# Calendar AJAX endpoint — resolves /0 placeholder URLs to real perf IDs
+# ---------------------------------------------------------------------------
+#
+# TTD's per-performance booking URLs as scraped from the show detail page
+# have the shape
+#     /shows/seats/{show_id}/{Y}/{M}/{D}/{qty}/{HH-MM}/{perf_id}
+# but with `{perf_id}` always set to the literal `0` — a placeholder
+# that only resolves correctly when the user is already navigating
+# inside TTD's own site (their JS detects internal context).
+#
+# External arrivals on a `/0` URL get hit with TTD's marketing-source
+# flag `?m=cmst` and the server then refuses the placeholder, showing
+# "Tickets not available" even when seats are on sale. Real perf IDs
+# (the 6-digit numbers like 767461) make the URL work regardless of
+# whether ?m=cmst is appended.
+#
+# Those real IDs live in TTD's calendar widget, which is populated by
+# an AJAX call when the show detail page loads. We replicate that call
+# below, per (show, year, month) covered by the perf list, and patch
+# the IDs into each booking URL.
+#
+# The endpoint shape was empirically verified with probe_ttd_calendar.py.
+# If TTD changes the endpoint, run the probe again and update these
+# constants — nothing else in the scraper should need to change.
+
+# BINDCAL_METHOD / BINDCAL_URL / BINDCAL_FORM are the variant that
+# probe_ttd_calendar.py reports as working. Update these from the
+# probe's output if the site changes.
+BINDCAL_METHOD = "POST"
+BINDCAL_URL_PATH = "/show/bindcalendar"
+
+def _bindcal_form(show_id: int, year: int, month: int) -> dict:
+    """Form-encoded body sent to the calendar endpoint."""
+    return {"id": str(show_id), "month": str(month), "year": str(year)}
+
+# Per-request timeout for calendar AJAX. Shorter than the page-fetch
+# timeout because the response is small (HTML fragment), and we'd
+# rather skip enrichment than hold up the scrape on a slow endpoint.
+BINDCAL_TIMEOUT_S = 15
+
+# Cap on calendar fetches per show. Almost every show's perf list
+# spans 1–2 months in our scrape; capping at 6 lets us tolerate
+# long-running shows with perfs spread over a longer window without
+# the scrape devolving into N+M calls per show on a misconfigured
+# input.
+BINDCAL_MAX_MONTHS_PER_SHOW = 6
+
+# Regex for extracting (show_id, year, month, day, qty, hour, minute,
+# perf_id) tuples from any text that contains TTD seat-plan URLs. The
+# trailing perf_id capture is what BOOK_URL_RE intentionally drops; we
+# want it here.
+_CAL_PERF_URL_RE = re.compile(
+    r"/shows/seats/(\d+)/(\d{4})/(\d{1,2})/(\d{1,2})/(\d+)/(\d{1,2})-(\d{2})/(\d+)"
+)
+
+# Regex matching a trailing `/0` placeholder on a seat-plan URL, used
+# when patching real perf IDs in. We match `/0` followed by optional
+# trailing slash + end-of-string OR a query string / fragment start, so
+# `/0?m=cmst#x` is still recognised as a placeholder.
+_PLACEHOLDER_RE = re.compile(r"/0(/?)(?=$|[?#])")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
@@ -532,32 +594,191 @@ def _clean_book_url(url: str | None) -> str | None:
     """Strip the query string and fragment from a /shows/seats/... URL.
 
     TTD's JSON-LD `offers.url` carries a tracking parameter (`?m=cmst`)
-    that the visible "Next Performances" tab links do NOT include. The
-    `m=cmst` flag flips TTD's seat-plan handler into a mode that
-    strictly requires a real performance ID in the last path segment —
-    and the same JSON-LD URLs use the literal placeholder `/0` there.
-    Result: the SSR page renders a "Tickets not available" error even
-    when the performance is on sale.
+    that the visible "Next Performances" tab links do NOT include. This
+    is a hygiene measure to keep the URLs we record canonical and
+    consistent across both extraction sources (JSON-LD and visible
+    links) — the tracking flag isn't load-bearing in the URL we store.
 
-    Without the query string, TTD's handler resolves `/0` to the right
-    performance from the date+time path components and the seat plan
-    loads. So we strip the query/fragment defensively from every TTD
-    booking URL we extract — JSON-LD source or visible-link source.
+    Note: stripping this does NOT make the booking flow work for
+    external arrivals on a /0 placeholder URL. TTD's JS on the
+    seat-plan page re-adds ?m=cmst on page load whenever it can't
+    detect an internal-navigation session, and then refuses /0. The
+    actual fix for the broken booking link is to substitute a real
+    performance ID via the bindcalendar AJAX resolver below; this
+    helper just removes upstream noise from the stored URL.
 
     Only operates on TTD seat-plan URLs (path contains /shows/seats/);
-    other URLs (the rare cases where `block.url` points at a marketing
-    page, etc.) are returned unchanged."""
+    other URLs are returned unchanged."""
     if not url:
         return url
     if "/shows/seats/" not in url:
         return url
-    # Split once on '?' or '#', whichever comes first. urlparse would
-    # work too but is overkill for a single trim.
+    # Split once on '?' or '#', whichever comes first.
     for sep in ("?", "#"):
         i = url.find(sep)
         if i != -1:
             url = url[:i]
     return url
+
+
+def _year_months_from_perfs(perfs: list[dict]) -> list[tuple[int, int]]:
+    """Return the unique (year, month) pairs covered by a performance
+    list, in first-occurrence order. Used to decide which calendar
+    months we need to fetch for a show.
+
+    Performances without a parseable date are skipped (they don't
+    contribute a month we could fetch anyway). The result is capped at
+    BINDCAL_MAX_MONTHS_PER_SHOW so a malformed input can't make us
+    fan out unbounded calendar calls.
+    """
+    seen: set[tuple[int, int]] = set()
+    out: list[tuple[int, int]] = []
+    for p in perfs:
+        date = p.get("date")
+        if not isinstance(date, str) or len(date) < 7:
+            continue
+        try:
+            y = int(date[:4])
+            m = int(date[5:7])
+        except ValueError:
+            continue
+        key = (y, m)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+        if len(out) >= BINDCAL_MAX_MONTHS_PER_SHOW:
+            break
+    return out
+
+
+def _extract_perf_ids_from_calendar(text: str, show_id: int) -> dict:
+    """Walk a calendar response body (HTML fragment or JSON, doesn't
+    matter — we regex over the raw text) and build a lookup mapping
+
+        (date_iso, time_str) -> perf_id (int)
+
+    for every seat-plan URL that carries a non-zero performance ID and
+    matches our show. Multiple URLs with the same (date, time) but
+    different perf IDs (shouldn't happen) are resolved last-write-wins.
+    """
+    out: dict[tuple[str, str], int] = {}
+    for m in _CAL_PERF_URL_RE.finditer(text):
+        sid, y, mo, d, _qty, hh, mm, pid_str = m.groups()
+        try:
+            if int(sid) != show_id:
+                continue
+            pid = int(pid_str)
+            if pid == 0:
+                # Calendar can include /0 entries too (e.g. for the
+                # "current day" cell which mirrors the show page).
+                # They tell us nothing new; skip.
+                continue
+            date = f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+            time = f"{int(hh):02d}:{mm}"
+        except ValueError:
+            continue
+        out[(date, time)] = pid
+    return out
+
+
+def _patch_booking_urls(perfs: list[dict], perf_id_map: dict) -> int:
+    """Replace `/0` placeholder perf IDs in each performance dict's
+    book_url with the real ID from perf_id_map. Mutates `perfs` in
+    place. Returns the number of URLs patched.
+
+    No-op for performances whose book_url doesn't have the placeholder
+    (e.g. the rare case where TTD has already given us a real ID).
+    Performances whose (date, time) isn't covered by the calendar
+    response are left untouched — downstream code falls back to the
+    show URL via the dedupe-layer guard added alongside this resolver.
+    """
+    if not perf_id_map:
+        return 0
+    patched = 0
+    for p in perfs:
+        url = p.get("book_url")
+        if not url or "/shows/seats/" not in url:
+            continue
+        if not _PLACEHOLDER_RE.search(url):
+            continue
+        key = (p.get("date"), p.get("time"))
+        pid = perf_id_map.get(key)
+        if pid is None:
+            continue
+        new_url = _PLACEHOLDER_RE.sub(f"/{pid}\\1", url)
+        if new_url != url:
+            p["book_url"] = new_url
+            patched += 1
+    return patched
+
+
+async def _fetch_calendar_month(
+    client: "httpx.AsyncClient", show_id: int, year: int, month: int, referer: str,
+) -> dict:
+    """Fetch one calendar month for one show and return the per-perf
+    ID map. Returns an empty dict on any failure — calendar enrichment
+    is best-effort and must never break the scrape.
+    """
+    headers = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": referer,
+        "Accept": "text/html, */*; q=0.01",
+    }
+    url = f"{BASE}{BINDCAL_URL_PATH}"
+    try:
+        if BINDCAL_METHOD == "POST":
+            resp = await client.post(
+                url,
+                data=_bindcal_form(show_id, year, month),
+                headers=headers,
+                timeout=BINDCAL_TIMEOUT_S,
+            )
+        else:
+            resp = await client.get(
+                url,
+                params=_bindcal_form(show_id, year, month),
+                headers=headers,
+                timeout=BINDCAL_TIMEOUT_S,
+            )
+    except httpx.HTTPError as e:
+        log.warning("bindcalendar %s %d/%d: %s: %s",
+                    show_id, year, month, type(e).__name__, e)
+        return {}
+    if resp.status_code >= 400:
+        log.warning("bindcalendar %s %d/%d: HTTP %d",
+                    show_id, year, month, resp.status_code)
+        return {}
+    return _extract_perf_ids_from_calendar(resp.text, show_id)
+
+
+async def _resolve_perf_ids(
+    client: "httpx.AsyncClient", show_id: int, referer: str, perfs: list[dict],
+) -> int:
+    """Top-level orchestrator: figures out which calendar months are
+    needed, fetches them concurrently, builds a unified perf-ID map,
+    and patches each performance's book_url in place. Returns the
+    number of URLs patched (for logging).
+
+    Errors and partial coverage are silent and logged at warning level
+    — the scraper produces useful output either way; downstream code
+    falls back to the show URL when book_url still has /0.
+    """
+    ym_pairs = _year_months_from_perfs(perfs)
+    if not ym_pairs:
+        return 0
+    tasks = [
+        _fetch_calendar_month(client, show_id, y, m, referer)
+        for (y, m) in ym_pairs
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    perf_id_map: dict[tuple[str, str], int] = {}
+    for res in results:
+        if isinstance(res, dict):
+            perf_id_map.update(res)
+        # Exceptions: already logged inside _fetch_calendar_month; the
+        # `return_exceptions=True` here is belt-and-braces.
+    return _patch_booking_urls(perfs, perf_id_map)
 
 
 def _to_float(s) -> float | None:
@@ -1382,7 +1603,6 @@ def parse_show(html_text: str) -> dict:
 
     # Future-month nav (advisory only — no performance data)
     future_months = _extract_future_months(soup)
-
     # Basic info widgets
     basic_info = _extract_basic_info_box(soup)
 
@@ -1410,6 +1630,29 @@ def parse_show(html_text: str) -> dict:
     header_image = _extract_header_image(soup)
     detail_image = _extract_show_logo(soup) or _decode(product.get("image"))
     canonical = _extract_canonical(soup)
+
+    # Override per-performance booking URLs with the show's canonical URL.
+    #
+    # Each performance's `book_url` came from TTD's JSON-LD (`offers.url`)
+    # or the "Next Performances" tab — both of which use `/0` as the
+    # placeholder for the performance ID. TTD never emits the real ID in
+    # HTML/JSON-LD; it's loaded by client-side JS. When such a `/0` URL
+    # is opened from an external referrer, TTD's page-level JS appends
+    # `?m=cmst` (their external-traffic flag) and the server then enters
+    # a strict mode that requires a real perf ID — and renders "Tickets
+    # not available" instead of the seat plan. Stripping `?m=cmst` from
+    # our outgoing link doesn't help: the JS adds it back at load time.
+    #
+    # The clean fix would be to harvest real performance IDs from TTD's
+    # JS-loaded calendar endpoint (POST /show/bindcalendar) and embed
+    # them in the URL. That's a meaningful chunk of work and adds a new
+    # request-per-show to the scrape pipeline. As a pragmatic fallback,
+    # we point at the show's canonical page: it loads cleanly, shows the
+    # next performances as clickable links, and TTD's own internal
+    # navigation resolves the real perf ID when the user picks their date.
+    if canonical:
+        for p in merged_perfs:
+            p.book_url = canonical
 
     # Theatre / venue address + access info + seating plan image
     venue_full_address, access_info, seating_plan_image = _extract_access_info(soup)
@@ -1544,12 +1787,19 @@ async def fetch_all_listings(
 
 async def fetch_show_detail(
     client: httpx.AsyncClient, card: ListingCard,
+    resolve_perf_ids: bool = True,
 ) -> tuple[dict | None, str | None]:
     """Fetch and parse one show's detail page. Layered retry: _http_get
     handles 5xx/429/connection errors at the transport+status level;
     this application-level retry handles transient parse errors and
     404/410 edge cases (which we explicitly don't retry — those are
-    permanent)."""
+    permanent).
+
+    If `resolve_perf_ids` is True (default), each show triggers one or
+    more follow-up calls to TTD's calendar AJAX endpoint to replace the
+    `/0` placeholder in each performance's booking URL with the real
+    performance ID. Set False to skip — useful when the endpoint
+    contract has changed and the resolver is spamming warnings."""
     last_err: str | None = None
     for attempt in (1, 2):
         try:
@@ -1579,13 +1829,34 @@ async def fetch_show_detail(
             # (~50µs) isn't a concern but long enough that blocking
             # the event loop would noticeably stall concurrent fetches.
             detail = await asyncio.to_thread(parse_show, resp.text)
-            return detail, None
         except Exception as e:
             last_err = f"parse: {type(e).__name__}: {e}"
             if attempt == 1:
                 await asyncio.sleep(DETAIL_PARSE_RETRY_DELAY_S)
                 continue
             return None, last_err
+
+        # Resolve real performance IDs via the calendar AJAX endpoint
+        # and patch them into the booking URLs in `detail["performances"]`.
+        # Best-effort: any failure is logged and we ship the show with
+        # the /0 placeholders intact (the dedupe layer falls back to
+        # the show URL for those, which is better than a broken link).
+        if resolve_perf_ids:
+            try:
+                patched = await _resolve_perf_ids(
+                    client, card.id, card.url, detail.get("performances") or [],
+                )
+                if patched:
+                    log.debug("perf-id resolver: %s patched %d url(s)",
+                              card.id, patched)
+            except Exception as e:
+                # Defensive — _resolve_perf_ids should never raise (it
+                # swallows HTTP errors internally) but if it does, don't
+                # take the show down with it.
+                log.warning("perf-id resolver crashed on %s: %s: %s",
+                            card.id, type(e).__name__, e)
+
+        return detail, None
 
     return None, last_err or "unknown"
 
@@ -1596,6 +1867,7 @@ async def fetch_all_details(
     appears_in_map: dict[int, list[str]],
     concurrency: int,
     deadline: float | None = None,
+    resolve_perf_ids: bool = True,
 ) -> tuple[list[Show], list[ShowFailure], bool]:
     """Fetch each show's detail in parallel. Returns (shows, failures,
     budget_exceeded). Preserves the listing order of input cards.
@@ -1653,7 +1925,9 @@ async def fetch_all_details(
                 _note_budget_skip(idx)
                 return
 
-            detail, err = await fetch_show_detail(client, card)
+            detail, err = await fetch_show_detail(
+                client, card, resolve_perf_ids=resolve_perf_ids,
+            )
             if detail is not None:
                 # Detail-page name wins when present and non-empty; some
                 # detail pages have cleaner names than the listing cards
@@ -2084,6 +2358,7 @@ async def run(args: argparse.Namespace) -> int:
         shows, failures, budget_exceeded = await fetch_all_details(
             client, cards_to_fetch, appears_in_map,
             concurrency=args.concurrency, deadline=deadline,
+            resolve_perf_ids=not args.no_resolve_perf_ids,
         )
 
     # Client is closed at this point. Stage 3 onwards is pure CPU.
@@ -2168,6 +2443,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--rotation-depth", type=int, default=DEFAULT_ROTATION_DEPTH,
                    metavar="N",
                    help=f"How many previous outputs to retain (default: {DEFAULT_ROTATION_DEPTH}).")
+    p.add_argument("--no-resolve-perf-ids", action="store_true",
+                   help="Skip the bindcalendar AJAX call that resolves each "
+                        "performance's real ID. Without resolution the "
+                        "scraped booking URLs use the /0 placeholder, and "
+                        "the dedupe layer's fallback (linking to the show "
+                        "page instead) kicks in. Use this flag if TTD has "
+                        "changed the calendar endpoint and the resolver is "
+                        "spamming warnings while you re-probe.")
     p.add_argument("--dry-run", action="store_true",
                    help="Do everything except write the output file.")
     args = p.parse_args(argv)
