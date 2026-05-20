@@ -36,7 +36,7 @@ import {
 // first hit; raw.githubusercontent.com sends
 // `access-control-allow-origin: *` so this works without server changes.
 const DEFAULT_PROD_URL =
-  'https://raw.githubusercontent.com/s6mzenge/london-theatre-scrapers/data/unified/unified.json'
+  'https://raw.githubusercontent.com/s6mzenge/london-theatre-scrapers/main/data/unified/unified.json'
 
 const DATA_URL =
   import.meta.env.VITE_DATA_URL ||
