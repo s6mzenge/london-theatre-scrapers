@@ -61,7 +61,7 @@ export function extractMeta(data) {
 // Some scrapers (notably lovetheatre) emit price_from = 0.0 to mean
 // "price unknown" rather than a real free seat. Dedupe propagates this
 // up into perf.min_price = 0, which would otherwise dominate every
-// aggregation ("cheapest tonight: Ã‚Â£0"). We treat any non-positive
+// aggregation ("cheapest tonight: Ã‚£0"). We treat any non-positive
 // number as missing data throughout.
 function validPrice(p) {
   return typeof p === 'number' && p > 0 && Number.isFinite(p)
@@ -89,7 +89,7 @@ function effectiveCheapest(perf) {
 function priceRangeLabel(perf, effectiveMin) {
   if (!validPrice(perf.max_price)) return null
   if (effectiveMin == null || perf.max_price === effectiveMin) return null
-  return `Ã‚Â£${Math.round(effectiveMin)}Ã¢â‚¬â€œÃ‚Â£${Math.round(perf.max_price)}`
+  return `Ã‚£${Math.round(effectiveMin)}Ã¢â‚¬â€œÃ‚£${Math.round(perf.max_price)}`
 }
 
 // =============================================================
@@ -279,8 +279,8 @@ function aggregateWeek(data, today) {
         const hi = Math.max(...others)
         otherNightsRange =
           lo === hi
-            ? `Ã‚Â£${Math.round(lo)}`
-            : `Ã‚Â£${Math.round(lo)}Ã¢â‚¬â€œÃ‚Â£${Math.round(hi)}`
+            ? `Ã‚£${Math.round(lo)}`
+            : `Ã‚£${Math.round(lo)}Ã¢â‚¬â€œÃ‚£${Math.round(hi)}`
       }
       return {
         show: { id: show.id, title: show.title, venue: show.venue },
@@ -324,7 +324,7 @@ function aggregateMonth(data, today) {
   const totalDays = lastOfMonth.getDate()
 
   // Aggregate every performance in this month by date (using effective
-  // cheapest price across valid sources, ignoring Ã‚Â£0 anomalies)
+  // cheapest price across valid sources, ignoring Ã‚£0 anomalies)
   const dayFloors = {}
   for (const show of data.shows) {
     for (const perf of show.performances || []) {
@@ -418,7 +418,7 @@ function aggregateMonth(data, today) {
   if (cheapestWeeknight) {
     insights.push({
       label: 'CHEAPEST WEEKNIGHT',
-      value: `${formatShortDate(cheapestWeeknight.iso)} Ã‚Â· Ã‚Â£${Math.round(cheapestWeeknight.price)}`,
+      value: `${formatShortDate(cheapestWeeknight.iso)} Ã‚· Ã‚£${Math.round(cheapestWeeknight.price)}`,
       sub: cheapestWeeknight.show
         ? `${cheapestWeeknight.show.title}, ${cheapestWeeknight.show.venue}`
         : 'in this month',
@@ -445,7 +445,7 @@ function aggregateMonth(data, today) {
     insights.push({
       label: 'BIGGEST RANGE',
       value: biggestRange.show.title,
-      sub: `Ã‚Â£${Math.round(biggestRange.show.min_price_gbp)}Ã¢â‚¬â€œÃ‚Â£${Math.round(biggestRange.show.max_price_gbp)} Ã‚Â· matinees cheapest`,
+      sub: `Ã‚£${Math.round(biggestRange.show.min_price_gbp)}Ã¢â‚¬â€œÃ‚£${Math.round(biggestRange.show.max_price_gbp)} Ã‚· matinees cheapest`,
       showId: biggestRange.show.id,
     })
   }

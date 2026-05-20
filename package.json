@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "STAGE. â€” London theatre, for less. A daily price-comparison aggregator across seven seller sources.",
+  "description": "STAGE. — London theatre, for less. A daily price-comparison aggregator across seven seller sources.",
   "scripts": {
     "dev": "vite",
     "build": "vite build && node scripts/gzip-data.mjs",
