@@ -528,6 +528,38 @@ def _decode(s: str | None) -> str | None:
     return twice.strip() or None
 
 
+def _clean_book_url(url: str | None) -> str | None:
+    """Strip the query string and fragment from a /shows/seats/... URL.
+
+    TTD's JSON-LD `offers.url` carries a tracking parameter (`?m=cmst`)
+    that the visible "Next Performances" tab links do NOT include. The
+    `m=cmst` flag flips TTD's seat-plan handler into a mode that
+    strictly requires a real performance ID in the last path segment —
+    and the same JSON-LD URLs use the literal placeholder `/0` there.
+    Result: the SSR page renders a "Tickets not available" error even
+    when the performance is on sale.
+
+    Without the query string, TTD's handler resolves `/0` to the right
+    performance from the date+time path components and the seat plan
+    loads. So we strip the query/fragment defensively from every TTD
+    booking URL we extract — JSON-LD source or visible-link source.
+
+    Only operates on TTD seat-plan URLs (path contains /shows/seats/);
+    other URLs (the rare cases where `block.url` points at a marketing
+    page, etc.) are returned unchanged."""
+    if not url:
+        return url
+    if "/shows/seats/" not in url:
+        return url
+    # Split once on '?' or '#', whichever comes first. urlparse would
+    # work too but is overkill for a single trim.
+    for sep in ("?", "#"):
+        i = url.find(sep)
+        if i != -1:
+            url = url[:i]
+    return url
+
+
 def _to_float(s) -> float | None:
     """Coerce to float; treat empty string as None. The site's
     AggregateOffer.highPrice is consistently '' rather than missing."""
@@ -906,7 +938,9 @@ def _extract_theater_events(jsonld_blocks: list[dict]) -> list[Performance]:
         offers = block.get("offers") or {}
         if not isinstance(offers, dict):
             offers = {}
-        book_url = _decode(offers.get("url")) or _decode(block.get("url"))
+        book_url = _clean_book_url(
+            _decode(offers.get("url")) or _decode(block.get("url"))
+        )
 
         out.append(Performance(
             iso=iso,
@@ -969,7 +1003,7 @@ def _extract_next_perf_links(soup: BeautifulSoup) -> list[Performance]:
             price=None,
             currency=None,
             availability=None,
-            book_url=href,
+            book_url=_clean_book_url(href),
             source="next_perf_link",
         ))
     return out
