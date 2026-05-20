@@ -382,6 +382,52 @@ SHOW_SCHEMAS: dict[str, dict[str, Any]] = {
     },
 }
 
+
+# SeatPlan's detail-page JSON-LD repeats the *show-wide* lowPrice on every
+# performance (Globe yard-standing at £6 leaks onto matinees where the
+# yard isn't on sale). When seatplan_availability.py has run, each
+# performance carries the verified per-perf min/max scraped from the
+# ticketing page's inline fireCrmEvent payload — that's the real
+# currently-available range and we prefer it whenever it's present.
+#
+# verified_price_source semantics (set by seatplan_availability.py):
+#   "ticketing_page" — verified successfully; trust verified_min_price
+#   "no_seats"       — page loaded but no fireCrmEvent → not on sale
+#                      → drop SeatPlan's price from the cross-source min
+#                        (don't drag it down to a fake show-wide £6)
+#   "fetch_failed"   — network/HTTP failure → fall back to low_price
+#   "skipped"        — perf wasn't checked → fall back to low_price
+#   (missing field)  — availability pass never ran → fall back to low_price
+def _seatplan_price_from(p: dict) -> float | None:
+    source = p.get("verified_price_source")
+    if source == "no_seats":
+        return None
+    verified = p.get("verified_min_price")
+    if verified is not None:
+        return verified
+    return p.get("low_price")
+
+
+def _seatplan_price_to(p: dict) -> float | None:
+    if p.get("verified_price_source") == "no_seats":
+        return None
+    return p.get("verified_max_price")
+
+
+def _seatplan_available(p: dict) -> bool | None:
+    source = p.get("verified_price_source")
+    if source == "no_seats":
+        return False
+    if source == "ticketing_page" and p.get("verified_min_price") is not None:
+        return True
+    # No verified data (or fetch failed) — fall back to the JSON-LD
+    # availability hint from the detail page.
+    availability = p.get("availability")
+    if availability:
+        return "InStock" in availability
+    return None
+
+
 # Per-performance field extractors. Each source phrases dates/times/prices
 # differently; this normalizes to a canonical shape so we can join across
 # sources on (date, time).
@@ -423,12 +469,15 @@ PERF_SCHEMAS: dict[str, dict[str, Any]] = {
     "seatplan": {
         "date":       lambda p: p.get("date"),
         "time":       lambda p: p.get("time"),
-        "price_from": lambda p: p.get("low_price"),
-        "price_to":   lambda p: None,
+        # Prefer the ticketing-page-verified min/max (set by
+        # seatplan_availability.py) over the detail-page JSON-LD, which
+        # is the show-wide minimum and misleads for performances where
+        # the cheapest tier isn't actually on sale.
+        "price_from": _seatplan_price_from,
+        "price_to":   _seatplan_price_to,
         "currency":   lambda p: p.get("currency"),
         "book_url":   lambda p: p.get("book_url"),
-        "available":  lambda p: ("InStock" in (p.get("availability") or ""))
-                                if p.get("availability") else None,
+        "available":  _seatplan_available,
     },
     "ttd": {
         "date":       lambda p: p.get("date"),
