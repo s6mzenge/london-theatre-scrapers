@@ -1,5 +1,6 @@
 import { formatPrice } from '../lib/format.js'
 import { formatShortDate } from '../lib/dates.js'
+import { ShowLink } from '../lib/router.jsx'
 
 // Per-day drill-down panel. Sits flush below the week strip OR the
 // month calendar — same component for both surfaces, so the page
@@ -9,7 +10,7 @@ import { formatShortDate } from '../lib/dates.js'
 // vs-context · price) so the drill-down doesn't introduce a new
 // component vocabulary; it's "the same row, sliced by date".
 
-export default function DayDrill({ day, onSelectShow }) {
+export default function DayDrill({ day }) {
   const dateLabel = formatShortDate(day.iso).toUpperCase()
   const shows = day.cheapestShows || []
 
@@ -30,18 +31,10 @@ export default function DayDrill({ day, onSelectShow }) {
         </div>
       ) : (
         shows.map((entry, idx) => (
-          <div
+          <ShowLink
             key={entry.show.id}
+            id={entry.show.id}
             className="stg-day-drill-row"
-            onClick={() => onSelectShow(entry.show.id)}
-            role="button"
-            tabIndex={0}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault()
-                onSelectShow(entry.show.id)
-              }
-            }}
           >
             <div className="stg-day-drill-rank">
               {String(idx + 1).padStart(2, '0')}
@@ -66,7 +59,7 @@ export default function DayDrill({ day, onSelectShow }) {
             <div className="stg-day-drill-price">
               {formatPrice(entry.perf.minPrice)}
             </div>
-          </div>
+          </ShowLink>
         ))
       )}
     </div>
