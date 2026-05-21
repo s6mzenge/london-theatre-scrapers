@@ -1256,6 +1256,182 @@ def _extract_lastminute_showtime_ids(soup: BeautifulSoup) -> dict[str, str]:
             out[absurl] = data_id
     return out
 
+# ---------------------------------------------------------------------------
+# Availability enrichment — actual bookable prices, not marketing headlines
+# ---------------------------------------------------------------------------
+#
+# The JSON-LD lowPrice carried on each TheaterEvent block is the show's
+# headline "from £X" price (e.g. £12 for A Midsummer Night's Dream),
+# repeated identically across every performance. It's the marketing-tier
+# anchor price, not the actually-bookable cheapest. SeatPlan's own
+# new-quotes endpoint logs a `sp_ticketing_calendar_error` event whenever
+# the JSON-LD "from" diverges from the real quote, e.g.:
+#
+#     {"errorDescription": "From Price Too Low",
+#      "state": "Performance: 12.00; Quote: 30.00"}
+#
+# We work around it by calling two undocumented but stable endpoints:
+#
+#   1. GET /ajax/tickets/performances/{productionId}/{date}/
+#      Returns [{id, date, weekDay, time, link}, ...] for every upcoming
+#      performance from `date` onward. One call per show.
+#
+#   2. GET /api/performance/normal-prices/{performanceId}
+#      Returns [{seatId, normalMinPrice, normalMaxPrice}, ...] — one
+#      record per currently-available seat. min(normalMinPrice) is the
+#      real cheapest price; len() is the count of bookable seats;
+#      empty array means sold out.
+#
+# Both endpoints require only a browser-shaped User-Agent (already on
+# the session) and a Referer pointing at a seatplan booking page.
+# Responses are server-side cached (~2h per new-quotes'
+# quoteSearchRemainingLife) so load is mild.
+
+PERFORMANCES_URL = "/ajax/tickets/performances/{production_id}/{date}/"
+NORMAL_PRICES_URL = "/api/performance/normal-prices/{performance_id}"
+
+# Don't enrich more than this many performances per show — the discovery
+# endpoint typically returns ~15-20 future perfs and we don't need
+# accurate prices for the ones 3+ months out (price column on a
+# comparison table is about near-term decisions). Far-future perfs keep
+# their JSON-LD low_price as a fallback, clearly tagged via
+# price_source=None so consumers can tell they weren't verified.
+AVAILABILITY_PERF_CAP = 30
+
+# Lowercase month abbreviations for the performances endpoint, which
+# wants e.g. "21-may-2026". %b is locale-dependent so we format manually.
+_MONTH_ABBR_LC = ["jan", "feb", "mar", "apr", "may", "jun",
+                  "jul", "aug", "sep", "oct", "nov", "dec"]
+
+
+def _format_date_for_performances_endpoint(d) -> str:
+    """date(2026, 5, 21) -> '21-may-2026'."""
+    return f"{d.day}-{_MONTH_ABBR_LC[d.month - 1]}-{d.year}"
+
+
+def _parse_performances_endpoint_date(s: str) -> str | None:
+    """'21-May-2026' -> '2026-05-21'. None if unparseable."""
+    if not s:
+        return None
+    parts = s.split("-")
+    if len(parts) != 3:
+        return None
+    try:
+        day = int(parts[0])
+        mon = _MONTH_MAP.get(parts[1].title())
+        year = int(parts[2])
+        if mon is None:
+            return None
+        return f"{year:04d}-{mon:02d}-{day:02d}"
+    except (ValueError, TypeError):
+        return None
+
+
+def _fetch_performance_ids(
+    session: requests.Session, sku: str, slug: str, scraped_at: datetime,
+) -> dict[tuple[str, str], int]:
+    """Map (date_iso, time_24h) -> performance_id for every future
+    performance of this show. Empty dict on any error — caller falls
+    back to JSON-LD prices for all perfs."""
+    date_str = _format_date_for_performances_endpoint(scraped_at.date())
+    url = BASE + PERFORMANCES_URL.format(production_id=sku, date=date_str)
+    referer = f"{BASE}/london/{slug}/"
+    try:
+        resp = session.get(
+            url,
+            headers={"Referer": referer,
+                     "Accept": "application/json, text/plain, */*"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        log.debug("performances endpoint failed for sku=%s: %s", sku, e)
+        return {}
+    if not isinstance(data, list):
+        return {}
+    out: dict[tuple[str, str], int] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        date_iso = _parse_performances_endpoint_date(item.get("date") or "")
+        time_24h = _parse_time_label_to_24h(item.get("time") or "")
+        pid = item.get("id")
+        if date_iso and time_24h and isinstance(pid, int):
+            out[(date_iso, time_24h)] = pid
+    return out
+
+
+def _fetch_normal_prices(
+    session: requests.Session, performance_id: int, slug: str,
+) -> list[dict] | None:
+    """Raw list from /api/performance/normal-prices/{id}. None on error;
+    empty list means genuinely sold out."""
+    url = BASE + NORMAL_PRICES_URL.format(performance_id=performance_id)
+    referer = f"{BASE}/london/{slug}/"
+    try:
+        resp = session.get(
+            url,
+            headers={"Referer": referer,
+                     "Accept": "application/json, text/plain, */*"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        log.debug("normal-prices failed for perf=%s: %s", performance_id, e)
+        return None
+    return data if isinstance(data, list) else None
+
+
+def _enrich_with_availability(
+    session: requests.Session, sku: str | None, slug: str,
+    performances: list[dict], scraped_at: datetime,
+) -> int:
+    """Populate performance_id / available_seats / available_from /
+    available_to / price_source on each perf dict in place.
+
+    Returns the number of performances that got `price_source =
+    "normal_prices"` (i.e. genuinely enriched with a verified bookable
+    price). No-op if sku is missing or the discovery call fails — perfs
+    keep their JSON-LD `low_price` as fallback and `price_source` stays
+    None to signal "unverified"."""
+    if not sku or not performances:
+        return 0
+    id_map = _fetch_performance_ids(session, sku, slug, scraped_at)
+    if not id_map:
+        return 0
+
+    enriched = 0
+    for p in performances[:AVAILABILITY_PERF_CAP]:
+        key = (p.get("date"), p.get("time"))
+        pid = id_map.get(key)
+        if pid is None:
+            continue
+        p["performance_id"] = pid
+        prices = _fetch_normal_prices(session, pid, slug)
+        if prices is None:
+            # network/parse error — keep low_price, leave new fields None
+            continue
+        if not prices:
+            # endpoint returned [] -- genuinely sold out
+            p["available_seats"] = 0
+            p["price_source"] = "sold_out"
+            continue
+        mins = [_to_float(r.get("normalMinPrice")) for r in prices
+                if isinstance(r, dict)]
+        maxs = [_to_float(r.get("normalMaxPrice")) for r in prices
+                if isinstance(r, dict)]
+        mins = [m for m in mins if m is not None]
+        maxs = [m for m in maxs if m is not None]
+        if mins:
+            p["available_from"] = min(mins)
+            p["available_to"] = max(maxs) if maxs else min(mins)
+            p["available_seats"] = len(prices)
+            p["price_source"] = "normal_prices"
+            enriched += 1
+    return enriched
+
 
 def _extract_weekly_schedule(soup: BeautifulSoup) -> tuple[list[dict], str | None, str | None, str | None]:
     """Extract:
