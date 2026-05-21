@@ -499,15 +499,24 @@ PERF_SCHEMAS: dict[str, dict[str, Any]] = {
     "seatplan": {
         "date":       lambda p: p.get("date"),
         "time":       lambda p: p.get("time"),
-        # Prefer the ticketing-page-verified min/max (set by
-        # seatplan_availability.py) over the detail-page JSON-LD, which
-        # is the show-wide minimum and misleads for performances where
-        # the cheapest tier isn't actually on sale.
-        "price_from": _seatplan_price_from,
-        "price_to":   _seatplan_price_to,
+        # Prefer the verified bookable price from the normal-prices
+        # endpoint over the JSON-LD lowPrice, which SeatPlan themselves
+        # consider unreliable (see _enrich_with_availability in
+        # seatplan_scraper.py). Fall back to JSON-LD when enrichment
+        # didn't run for this perf.
+        "price_from": lambda p: p.get("available_from") or p.get("low_price"),
+        "price_to":   lambda p: p.get("available_to"),
         "currency":   lambda p: p.get("currency"),
         "book_url":   lambda p: p.get("book_url"),
-        "available":  _seatplan_available,
+        # Use the explicit sold_out signal when present, otherwise fall
+        # back to the schema.org InStock string from JSON-LD.
+        "available":  lambda p: (
+            False if p.get("price_source") == "sold_out"
+            else (p.get("available_seats", 0) > 0)
+            if isinstance(p.get("available_seats"), int)
+            else (("InStock" in (p.get("availability") or ""))
+                  if p.get("availability") else None)
+        ),
     },
     "ttd": {
         "date":       lambda p: p.get("date"),
