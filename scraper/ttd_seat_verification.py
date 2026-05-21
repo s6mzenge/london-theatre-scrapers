@@ -1,89 +1,105 @@
 """
-TTD seat-plan verifier (third pass)
-====================================
+TTD seat-plan verifier (third pass) — BindSeatPlan AJAX edition.
 
-Third pass for the TTD pipeline. Where ``ttd_availability.py`` confirms
-what TTD's calendar widget *displays*, this script confirms what the
-actual seat-plan page *offers* — the ground truth of bookable price
-tiers, as a buyer would see them.
+What this is
+============
+Third pass for the TTD pipeline. Calls ``POST /Show/BindSeatPlan`` —
+the AJAX endpoint TTD's own front-end JS fires to populate the seat
+plan on page load — and reads the ground-truth ``PriceBands`` array
+from the JSON response. That array is the legend the buyer actually
+sees in their browser: the currently-bookable price tiers for the
+specific performance.
 
-Why this exists
----------------
-TTD's listing card, detail-page JSON-LD, and ``/show/bindcalendar`` AJAX
-response all share the same database-driven "from £X" minimum. When
-that minimum includes a tier that isn't actually configured in the
-seat-plan engine — observed pattern: every King's Head Theatre show
-advertises "from £13" on all three of those surfaces, but the actual
-seat-plan page only has £25 / £31 / £40 tiers — the three upstream
-surfaces lie consistently. ``ttd_availability.py`` parses the calendar
-widget's ``<span class="price-from">`` and so faithfully reports the
-same £13. It cannot catch the disagreement because it never sees the
-seat plan.
+History (worth knowing if this file breaks again)
+-------------------------------------------------
+The first cut of this script (21 May 2026) fetched the *static* seat-
+plan HTML page and tried to regex out a legend using three fallback
+strategies (inline JSON / legend-container HTML / head-of-page sweep).
+That was the wrong approach: the static page is an empty shell for
+every venue except the London Coliseum (which inlines all 983 seat
+tooltips). For Churchill's Urinal, Beetlejuice, the Globe, etc. the
+shipped HTML carries zero price data — JS populates everything client-
+side via ``BindSeatPlan``. The first cut therefore returned no_legend
+on 321/332 perfs and false-positive Coliseum hits on the other 11
+(every one returning the same bogus tier set [110, 134.5, 150, 182.5]).
 
-The seat-plan page at::
+Diagnosis came from two local recon scripts (ttd_recon.py /
+ttd_recon2.py) that drained the static page, found the inline
+``loadUrl = "/Show/BindSeatPlan"`` script tag, and confirmed that POSTing
+the inline ``params = {…}`` block to that endpoint returns clean JSON
+with a ``PriceBands`` array. This file is the result: a four-line
+parser around that AJAX call.
 
-    /shows/seats/{sid}/{Y}/{M}/{D}/{qty}/{HH-MM}/{pid}
+Why we hit BindSeatPlan directly (no static-page fetch)
+-------------------------------------------------------
+All seven parameters BindSeatPlan needs can be constructed from data
+already in ttd.json:
 
-renders the actual price-tier legend the buyer chooses from. Parsing
-that legend is the only place we can verify whether the "from £X"
-claim is real or phantom.
+    performanceId    → perf["verified_perf_id"]    (set by ttd_availability.py)
+    showId           → show["id"]
+    VenueId          → parse "/venue/{N}/" from show["venue_url"]
+    tickets          → constant "2"
+    PDate            → convert perf["date"] (YYYY-MM-DD) to DD/MM/YYYY
+    Time             → convert perf["time"] (HH:MM) to HH-MM
+    PerformancesFor  → constant "SeatPlan"
 
-This pass runs AFTER ``ttd_availability.py``. It needs the real perf_id
-that bindcalendar resolves; without it the ``/0`` placeholder URLs from
-the base scraper don't address a real seat plan from outside TTD's own
-internal navigation. Perfs with ``verified_price_source`` other than
-``"ttd_calendar"`` are therefore skipped.
+So we skip the static-page GET entirely and go straight to the AJAX
+POST. Halves the HTTP calls and removes the dependency on the inline
+``params`` script block (which would silently break if TTD's template
+ever drops it).
 
 Fields written
 --------------
 Each performance dict gets the following keys (mutated in place):
 
-    seat_min_price          float | None   minimum price-tier in the legend
-    seat_max_price          float | None   maximum price-tier in the legend
+    seat_min_price          float | None   minimum buyer-facing tier
+                                           (PriceBands[i].Price, the
+                                           selling price not face)
+    seat_max_price          float | None   maximum buyer-facing tier
     seat_price_tiers        list[float]    sorted, deduped tier values
+    seat_face_min_price     float | None   minimum face value (no fees)
+    seat_face_max_price     float | None   maximum face value
+    seat_seats_available    int | None     number of seats in Performances
     seat_price_source       str            one of:
-        "seat_plan"        — legend parsed; trust seat_min_price
-        "no_legend"        — page fetched but no legend extractable
-                             (off-sale / unusual layout — drop price downstream)
-        "fetch_failed"     — HTTP error
-        "skipped"          — no perf_id, no resolvable URL, or past date
-    seat_status             int | str | None  HTTP status of the fetch
-    seat_url                str | None        the seat-plan URL we queried
+        "bind_seat_plan"   — JSON parsed, PriceBands non-empty
+        "no_legend"        — ResultCode=0 but PriceBands empty
+                             (= off-sale / no inventory)
+        "fetch_failed"     — HTTP error, redirect, or ResultCode != 0
+        "skipped"          — no verified_perf_id, no VenueId, or past
+    seat_status             int | str | None  HTTP status (or error tag)
+    seat_url                str               the BindSeatPlan URL queried
     seat_checked_at         str               UTC ISO timestamp
-    seat_parse_strategy     str | None        which fallback strategy hit
-                                              ("a_json", "b_legend", "c_sweep")
-    seat_agrees_with_calendar  bool | None    True if min(tiers) matches
-                                              verified_min_price within
-                                              £0.50; False when calendar
-                                              over-reports or under-reports;
-                                              None on parse failure /
-                                              skipped perf
+    seat_agrees_with_calendar  bool | None    True if seat_min_price
+                                              matches verified_min_price
+                                              within £0.50, False if not,
+                                              None if we couldn't check
 
-The existing ``verified_*`` fields on the performance are NOT modified.
-The dedupe layer's TTD schema should be updated separately to prefer
-``seat_min_price`` over ``verified_min_price`` when present — see the
-companion patch notes alongside this script.
+The existing ``verified_*`` fields (from ttd_availability.py) are NOT
+modified. The dedupe layer prefers seat_min_price over verified_min_price
+when both are present — see ``_ttd_price_from`` in
+scraper/analysis/dedupe.py.
 
 Usage
 -----
-    python ttd_seat_verification.py                  # in-place on ttd.json
-    python ttd_seat_verification.py --in ttd.json    # different input
-    python ttd_seat_verification.py --concurrency 4  # tune parallelism
-    python ttd_seat_verification.py --limit 5        # smoke-test on N shows
-    python ttd_seat_verification.py --include-past   # also check past dates
-    python ttd_seat_verification.py --dry-run        # don't write
+    python ttd_seat_verification.py
+    python ttd_seat_verification.py --in ttd.json
+    python ttd_seat_verification.py --concurrency 6
+    python ttd_seat_verification.py --limit 5
+    python ttd_seat_verification.py --include-past
+    python ttd_seat_verification.py --dry-run
 
-Single-perf debug (run once per parser change to confirm it still hits):
+Single-perf debug (prints the parsed JSON, useful when the
+shape changes):
 
     python ttd_seat_verification.py \\
-        --smoke-show 7219 --save-html /tmp/urinal-seat.html
+        --smoke-show 7219 --save-html /tmp/urinal-bsp.json
 
 Exit codes
 ----------
     0  success (some or all perfs verified, partial fails are normal)
-    1  bad input (file missing, malformed JSON, unresolved smoke-show)
-    2  zero successes despite >0 attempts — likely the page structure
-       has changed; rerun with --smoke-show to inspect what we got
+    1  bad input (file missing, malformed JSON, unknown smoke-show)
+    2  zero successes despite >0 attempts — likely the endpoint
+       changed; rerun with --smoke-show to inspect what it returned
 """
 
 from __future__ import annotations
@@ -109,23 +125,15 @@ from urllib3.util.retry import Retry
 # URL helpers
 # ---------------------------------------------------------------------------
 
-def _ascii_safe_url(url: str | None) -> str | None:
-    """Re-encode URL path/query to be ASCII-safe for HTTP transmission.
-
-    Show URLs and seat-plan URLs alike can contain U+2019 (right single
-    quotation mark) and U+2013 (en-dash) — e.g. *Churchill's Urinal*'s
-    slug includes the curly apostrophe. ``requests`` raises
-    ``UnicodeEncodeError: 'latin-1' codec can't encode character`` when
-    handed these directly; percent-encoding the path before the request
-    line is built fixes it. Identical helper to ``ttd_availability.py``;
-    duplicated to keep this script standalone.
-    """
+def _ascii_safe_url(url):
+    """Percent-encode non-ASCII characters in URL path/query (TTD show
+    slugs contain curly apostrophes that requests can't put on the HTTP
+    request line as-is)."""
     if not url:
         return url
     parts = urlsplit(url)
     return urlunsplit((
-        parts.scheme,
-        parts.netloc,
+        parts.scheme, parts.netloc,
         quote(parts.path, safe="/-_.~%"),
         quote(parts.query, safe="=&%"),
         parts.fragment,
@@ -137,6 +145,7 @@ def _ascii_safe_url(url: str | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 BASE = "https://www.theatreticketsdirect.co.uk"
+BINDSEATPLAN_URL = f"{BASE}/Show/BindSeatPlan"
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -146,42 +155,38 @@ DEFAULT_HEADERS = {
     ),
     "Accept-Language": "en-GB,en;q=0.9",
 }
+POST_HEADERS = {
+    "X-Requested-With": "XMLHttpRequest",
+    "Origin": BASE,
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+}
 
-# Seat-plan pages are full HTML documents (50–500 KB) — heavier than
-# bindcalendar's small HTML fragments. Default concurrency lower than
-# ttd_availability.py to be a polite citizen on TTD's origin.
-DEFAULT_CONCURRENCY = 4
+# One HTTP call per perf (just the POST — we construct params locally)
+# means we can push concurrency higher than the previous version, which
+# was bounded by static-page fetch heaviness.
+DEFAULT_CONCURRENCY = 8
 DEFAULT_TIMEOUT_S = 25
 
 RETRY_TOTAL = 3
 RETRY_BACKOFF = 0.6
 
-SOURCE_OK         = "seat_plan"
-SOURCE_NO_LEGEND  = "no_legend"
+SOURCE_OK = "bind_seat_plan"
+SOURCE_NO_LEGEND = "no_legend"
 SOURCE_FETCH_FAIL = "fetch_failed"
-SOURCE_SKIPPED    = "skipped"
+SOURCE_SKIPPED = "skipped"
 
-# Calendar-cross-check tolerance: if the seat-plan minimum matches the
-# calendar's verified_min_price within this many pence, count them as
-# in agreement. The legend renders penny-precise so the tolerance only
-# guards against rounding, not real disagreement.
 AGREE_TOLERANCE_GBP = 0.50
 
-# Common-sense bounds for a real ticket-tier price in GBP. A West End
-# top tier rarely exceeds £350; £5 concessions are plausible; anything
-# outside this band is almost certainly noise (booking fees, decoy
-# zeros) and excluded by every strategy.
-PRICE_MIN_GBP = 5.0
+# Plausibility bounds. £4 (some matinee concessions) up to £500
+# (premium box seats). Anything outside is rejected as malformed
+# rather than silently propagated.
+PRICE_MIN_GBP = 4.0
 PRICE_MAX_GBP = 500.0
 
-# A real legend has between 1 and ~10 tiers. >12 is almost certainly a
-# parse where we accidentally swept in fees, gift-voucher amounts, or
-# other non-tier prices; we treat that as a parse miss and fall through.
-MAX_PLAUSIBLE_TIERS = 12
-
-EXIT_CLEAN     = 0
+EXIT_CLEAN = 0
 EXIT_BAD_INPUT = 1
-EXIT_DRIFT     = 2
+EXIT_DRIFT = 2
 
 logging.basicConfig(
     level=logging.INFO,
@@ -195,19 +200,19 @@ log = logging.getLogger("ttd-seats")
 # Session
 # ---------------------------------------------------------------------------
 
-def build_session() -> requests.Session:
+def build_session():
     s = requests.Session()
     s.headers.update(DEFAULT_HEADERS)
     retry = Retry(
         total=RETRY_TOTAL,
         backoff_factor=RETRY_BACKOFF,
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"]),
+        allowed_methods=frozenset(["GET", "POST"]),
         raise_on_status=False,
     )
     adapter = HTTPAdapter(
-        pool_connections=2,
-        pool_maxsize=2,
+        pool_connections=4,
+        pool_maxsize=4,
         max_retries=retry,
     )
     s.mount("https://", adapter)
@@ -216,221 +221,209 @@ def build_session() -> requests.Session:
 
 
 # ---------------------------------------------------------------------------
-# Parsing
+# Params construction
+# ---------------------------------------------------------------------------
+
+# venue_url looks like:
+#   https://www.theatreticketsdirect.co.uk/venue/134/king's-head-theatre
+_VENUE_ID_RE = re.compile(r"/venue/(\d+)/")
+
+
+def extract_venue_id(venue_url):
+    if not venue_url:
+        return None
+    m = _VENUE_ID_RE.search(venue_url)
+    return m.group(1) if m else None
+
+
+def build_params(show, perf):
+    """Construct the BindSeatPlan POST body for one perf. Returns None
+    if any required field is missing — caller treats that as SKIPPED."""
+    pid = perf.get("verified_perf_id")
+    sid = show.get("id")
+    venue_id = extract_venue_id(show.get("venue_url"))
+    date = perf.get("date")       # "YYYY-MM-DD"
+    time_str = perf.get("time")   # "HH:MM"
+    if not (pid and sid and venue_id and date and time_str):
+        return None
+    # YYYY-MM-DD → DD/MM/YYYY
+    try:
+        y, mo, d = date.split("-")
+        pdate = f"{int(d):02d}/{int(mo):02d}/{int(y):04d}"
+    except (ValueError, AttributeError):
+        return None
+    # HH:MM → HH-MM
+    if ":" not in time_str:
+        return None
+    return {
+        "performanceId":   str(pid),
+        "showId":          str(sid),
+        "VenueId":         str(venue_id),
+        "tickets":         "2",
+        "PDate":           pdate,
+        "Time":            time_str.replace(":", "-"),
+        "PerformancesFor": "SeatPlan",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Response parsing
 # ---------------------------------------------------------------------------
 #
-# Three strategies, tried in order. Each takes the raw page HTML and
-# returns a sorted list of unique tier prices (floats). The first
-# strategy that returns a sensible 1..MAX_PLAUSIBLE_TIERS result wins.
+# BindSeatPlan response shape (verified 21 May 2026 across five venues —
+# King's Head, Prince Edward, London Coliseum, Shakespeare's Globe):
 #
-# Why three? TTD is a legacy ASP.NET MVC site and we can't be certain
-# which way it renders the legend without looking at every page. The
-# strategies overlap defensively:
+#   {
+#     "ResultCode": "0",
+#     "RedirectUrl": null,
+#     "data": {
+#       "Performances": [
+#         {
+#           "SeatIdOnMap": "Stalls-G-20",
+#           "SeatCategory": "Stalls",
+#           "Row": "G",
+#           "SeatNumber": "20",
+#           "CssClass": "pln1",                ← tier id
+#           "FaceValueFormatted": "£125.00",   ← without fees
+#           "SellingPriceFormatted": "£150.00",← buyer pays this
+#           "IsDiscountAvailable": false,
+#           "SaveFormatted": "£0.00",
+#           "RestrictedViewDescription": null,
+#           ...
+#         },
+#         ...
+#       ],
+#       "PriceBands": [
+#         {"CssClass":"pln1","Price":"£150.00","FaceValue":"£125.00", ...},
+#         {"CssClass":"pln2","Price":"£180.00","FaceValue":"£150.00", ...}
+#       ],
+#       ...
+#     }
+#   }
 #
-#   A. Inline JSON. .NET MVC views often embed a chunk of state into a
-#      <script> block — e.g. `var priceBands = [{price: 25.00, ...}]`.
-#      If we find a hint token (priceBands / priceCategories / etc.)
-#      we extract numeric prices from a tight window around it.
-#   B. Legend container. Visual legend rendered as <ul>/<div>/<span>
-#      with class/id hints like "legend", "price-band", "seat-key".
-#      We extract £-prefixed prices from windows around those hints.
-#   C. Defensive sweep. Last-resort scan of the first 60 KB for every
-#      distinct £XX.XX, filtering out tokens whose immediate context
-#      contains "booking fee" / "from £" / etc. — see _NOISE_CONTEXT_RE.
+# We use PriceBands directly — it's the legend the buyer sees. The
+# Performances array confirms which tiers actually have seats, but
+# PriceBands is already filtered to those by the server.
 #
-# The bounds-check (PRICE_MIN_GBP / PRICE_MAX_GBP) is applied in all
-# three; the tier-count sanity check happens in the dispatcher.
+# ResultCode != "0" means TTD wants the user to take some action
+# (relog, retry, etc) — we treat as fetch_failed.
 
-# Strategy A: embedded JSON price bands.
-_JSON_PRICE_BAND_RE = re.compile(
-    r'"(?:price|amount|value|fareValue|priceValue)"\s*:\s*"?(\d+(?:\.\d{1,2})?)"?',
-    re.IGNORECASE,
-)
-_JSON_BLOCK_HINT_RE = re.compile(
-    r'(?:priceBands?|priceTypes?|priceList|priceCategories|seatPrices?|'
-    r'ticketTypes?|fareTypes?|seatTypes?)',
-    re.IGNORECASE,
-)
-
-# Strategy B: legend-container £XX.XX patterns.
-_LEGEND_PRICE_RE = re.compile(r'£\s*(\d{1,3}(?:\.\d{2})?)')
-_LEGEND_CONTAINER_HINTS = (
-    "legend", "price-band", "priceband", "price-tier", "pricetier",
-    "seat-key", "seatkey", "price-key", "pricekey", "price-list",
-    "seat-legend", "seatlegend", "price-legend", "seat-types",
-    "seattypes", "ticket-types", "tickettypes",
-)
-
-# Strategy C: defensive head-of-page sweep window (60 KB).
-_HEAD_KB = 60 * 1024
-
-# Noise patterns. If a £XX.XX appears within ~80 chars of any of these
-# tokens, we skip it. "from £X" specifically excludes the upstream
-# database-driven minimum (e.g. the same £13 the calendar reports);
-# the legend tiers are bare £XX.XX without "from".
-_NOISE_CONTEXT_RE = re.compile(
-    r'(?:booking\s*fee|service\s*fee|transaction\s*fee|gift\s*voucher|'
-    r'restoration\s*levy|delivery|postage|handling\s*fee|'
-    r'from\s*£|starting\s*from|prices?\s*from)',
-    re.IGNORECASE,
-)
+# Captures: optional £, optional whitespace, digit run with optional
+# comma thousands separators and optional decimal part. We rely on
+# replace(",", "") downstream to canonicalise — the regex just needs
+# to grab the whole numeric span without splitting at a comma.
+_MONEY_RE = re.compile(r"£?\s*([0-9][0-9,]*(?:\.[0-9]+)?)")
 
 
-def _extract_prices_strategy_a(html: str) -> list[float]:
-    """Strategy A: embedded JSON price bands.
+def _parse_money(s):
+    if not s:
+        return None
+    m = _MONEY_RE.search(s)
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
 
-    Find each occurrence of a price-band-like hint token; within a 4 KB
-    window around each, extract every numeric ``price``/``amount``/
-    ``value`` field. Returns sorted unique tier values within
-    PRICE_MIN_GBP..PRICE_MAX_GBP.
+
+def parse_bindseatplan(body):
+    """Decode a BindSeatPlan response and pull out the bits we care
+    about. Returns ``None`` on any unrecoverable parse error.
+
+    Output shape:
+        {
+            "result_code":  str,
+            "tiers":        list[float]   (selling prices, sorted)
+            "face_tiers":   list[float]   (face values, sorted)
+            "n_seats":      int           (count in Performances array)
+        }
+
+    Empty PriceBands → tiers=[], which the dispatcher treats as no_legend.
     """
-    found: set[float] = set()
-    for hint in _JSON_BLOCK_HINT_RE.finditer(html):
-        lo = max(0, hint.start() - 200)
-        hi = min(len(html), hint.start() + 4096)
-        for m in _JSON_PRICE_BAND_RE.finditer(html, lo, hi):
-            try:
-                v = float(m.group(1))
-            except ValueError:
-                continue
-            if PRICE_MIN_GBP <= v <= PRICE_MAX_GBP:
-                found.add(v)
-    return sorted(found)
+    try:
+        doc = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    result_code = str(doc.get("ResultCode", ""))
+    data = doc.get("data") or {}
+    if not isinstance(data, dict):
+        return {
+            "result_code": result_code,
+            "tiers":       [],
+            "face_tiers":  [],
+            "n_seats":     0,
+        }
 
-
-def _extract_prices_strategy_b(html: str) -> list[float]:
-    """Strategy B: legend-container HTML.
-
-    Find substrings whose class/id contains a legend-related hint, then
-    extract £-prices from a 3 KB window around each. The hint match is
-    case-insensitive but we keep the original case for the £ scan so
-    byte offsets are stable.
-    """
-    found: set[float] = set()
-    html_lower = html.lower()
-    for hint in _LEGEND_CONTAINER_HINTS:
-        idx = 0
-        while True:
-            i = html_lower.find(hint, idx)
-            if i == -1:
-                break
-            lo = max(0, i - 200)
-            hi = min(len(html), i + 3072)
-            window = html[lo:hi]
-            for m in _LEGEND_PRICE_RE.finditer(window):
-                # Check immediate context for noise tokens. We use the
-                # narrower ~80 char window from Strategy C, since legend
-                # containers can be near "from £X" headers in some
-                # layouts.
-                ctx_lo = max(0, m.start() - 60)
-                ctx_hi = min(len(window), m.end() + 20)
-                if _NOISE_CONTEXT_RE.search(window[ctx_lo:ctx_hi]):
-                    continue
-                try:
-                    v = float(m.group(1))
-                except ValueError:
-                    continue
-                if PRICE_MIN_GBP <= v <= PRICE_MAX_GBP:
-                    found.add(v)
-            idx = i + len(hint)
-    return sorted(found)
-
-
-def _extract_prices_strategy_c(html: str) -> list[float]:
-    """Strategy C: defensive head-of-page sweep.
-
-    Scan the first 60 KB of the document for every distinct £XX.XX whose
-    immediate ~80 char context doesn't contain a noise token. Last-
-    resort fallback — the loose bounds and the noise filter together
-    catch most false positives, but we still validate the tier count in
-    the dispatcher before trusting this strategy's output.
-    """
-    head = html[:_HEAD_KB]
-    found: set[float] = set()
-    for m in _LEGEND_PRICE_RE.finditer(head):
-        ctx_lo = max(0, m.start() - 60)
-        ctx_hi = min(len(head), m.end() + 20)
-        if _NOISE_CONTEXT_RE.search(head[ctx_lo:ctx_hi]):
+    bands_raw = data.get("PriceBands") or []
+    perfs_raw = data.get("Performances") or []
+    sell_set = set()
+    face_set = set()
+    for b in bands_raw:
+        if not isinstance(b, dict):
             continue
-        try:
-            v = float(m.group(1))
-        except ValueError:
-            continue
-        if PRICE_MIN_GBP <= v <= PRICE_MAX_GBP:
-            found.add(v)
-    return sorted(found)
-
-
-_STRATEGIES = (
-    ("a_json",   _extract_prices_strategy_a),
-    ("b_legend", _extract_prices_strategy_b),
-    ("c_sweep",  _extract_prices_strategy_c),
-)
-
-
-def parse_seat_plan_prices(html: str) -> tuple[list[float], str]:
-    """Run each strategy in order; return the first sensible result.
-
-    "Sensible" means 1..MAX_PLAUSIBLE_TIERS distinct tiers. Returns
-    ``([], "none")`` if every strategy comes up empty or with too many
-    tiers — that's the parse-failed signal the dispatcher will surface
-    as ``seat_price_source = "no_legend"``.
-    """
-    for name, fn in _STRATEGIES:
-        tiers = fn(html)
-        if 1 <= len(tiers) <= MAX_PLAUSIBLE_TIERS:
-            return tiers, name
-    return [], "none"
+        sp = _parse_money(b.get("Price"))
+        fv = _parse_money(b.get("FaceValue"))
+        if sp is not None and PRICE_MIN_GBP <= sp <= PRICE_MAX_GBP:
+            sell_set.add(sp)
+        if fv is not None and PRICE_MIN_GBP <= fv <= PRICE_MAX_GBP:
+            face_set.add(fv)
+    n_seats = len(perfs_raw) if isinstance(perfs_raw, list) else 0
+    return {
+        "result_code": result_code,
+        "tiers":       sorted(sell_set),
+        "face_tiers":  sorted(face_set),
+        "n_seats":     n_seats,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Per-show worker
 # ---------------------------------------------------------------------------
 
-def _empty_seat_fields(source: str, *, url: str | None = None,
-                        status=None) -> dict:
-    """Build the seat_* fields for a performance we couldn't verify."""
+def _empty_seat_fields(source, url=None, status=None):
     return {
-        "seat_min_price": None,
-        "seat_max_price": None,
-        "seat_price_tiers": [],
-        "seat_price_source": source,
-        "seat_status": status,
-        "seat_url": url,
-        "seat_checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "seat_parse_strategy": None,
+        "seat_min_price":            None,
+        "seat_max_price":            None,
+        "seat_price_tiers":          [],
+        "seat_face_min_price":       None,
+        "seat_face_max_price":       None,
+        "seat_seats_available":      None,
+        "seat_price_source":         source,
+        "seat_status":               status,
+        "seat_url":                  url,
+        "seat_checked_at":           datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "seat_agrees_with_calendar": None,
     }
 
 
-def verify_one_show(
-    show: dict,
-    today_iso: str,
-    include_past: bool,
-    timeout_s: float = DEFAULT_TIMEOUT_S,
-) -> tuple[int, dict[str, int]]:
-    """Fetch the seat-plan page for each verified perf of one show and
-    parse its legend. Mutates ``show['performances']`` in place. Returns
-    ``(perfs_touched, counts_by_source)``.
-    """
+def verify_one_show(show, today_iso, include_past, timeout_s=DEFAULT_TIMEOUT_S):
+    """Verify all bookable performances of one show. Mutates
+    ``show['performances']`` in place. Returns ``(perfs_touched, counts)``."""
     counts = {SOURCE_OK: 0, SOURCE_NO_LEGEND: 0,
               SOURCE_FETCH_FAIL: 0, SOURCE_SKIPPED: 0}
 
     show_id = show.get("id")
     show_url = _ascii_safe_url(show.get("url") or show.get("detail_canonical"))
+    venue_id = extract_venue_id(show.get("venue_url"))
     perfs = show.get("performances") or []
 
-    if not isinstance(show_id, int) or not show_url or not perfs:
+    if not isinstance(show_id, int) or not show_url or not venue_id or not perfs:
+        # Anything wrong at the show level: skip everything cleanly.
+        # Missing venue_id is common enough that we don't treat it as
+        # a hard error — just classify all perfs as skipped.
         for p in perfs:
             p.update(_empty_seat_fields(SOURCE_SKIPPED))
             counts[SOURCE_SKIPPED] += 1
         return len(perfs), counts
 
-    # Filter to perfs we can actually verify. Reasons to skip:
-    #   - past dated (calendar widget doesn't return past months either)
-    #   - no resolved perf_id (calendar didn't return this date/time)
-    #   - no verified_book_url (same root cause)
-    to_check: list[tuple[dict, str]] = []
+    # Build the list of perfs we can actually verify. Skip past dates,
+    # perfs without a verified_perf_id (those have no resolvable URL),
+    # and perfs the calendar pass marked anything other than
+    # "ttd_calendar" (off-sale / fetch-failed → seat plan won't load).
+    to_check = []
     for p in perfs:
         date = p.get("date")
         if not date or (not include_past and date < today_iso):
@@ -441,23 +434,19 @@ def verify_one_show(
             p.update(_empty_seat_fields(SOURCE_SKIPPED))
             counts[SOURCE_SKIPPED] += 1
             continue
-        url = p.get("verified_book_url")
-        if not url:
+        if not p.get("verified_perf_id"):
             p.update(_empty_seat_fields(SOURCE_SKIPPED))
             counts[SOURCE_SKIPPED] += 1
             continue
-        to_check.append((p, url))
+        to_check.append(p)
 
     if not to_check:
         return len(perfs), counts
 
     session = build_session()
 
-    # Warmup: seed ASP.NET_SessionId etc. on this client. Without the
-    # warmup, the seat-plan page sometimes returns an unstyled fallback
-    # page that lacks the legend. If the warmup itself fails we still
-    # try the seat plans — they'll likely fail too but we'll classify
-    # cleanly as fetch_failed rather than no_legend.
+    # Warmup: seed ASP.NET_SessionId. Without this, BindSeatPlan can
+    # return 200 with ResultCode != "0" (an inert "please retry" payload).
     try:
         wr = session.get(show_url, timeout=timeout_s)
         if wr.status_code >= 400:
@@ -465,52 +454,66 @@ def verify_one_show(
     except requests.RequestException as e:
         log.debug("warmup exception for show %d: %s", show_id, e)
 
-    referer = show_url
-    for p, url in to_check:
-        safe_url = _ascii_safe_url(url) or url
+    headers = {**POST_HEADERS, "Referer": show_url}
+    for p in to_check:
+        params = build_params(show, p)
+        if params is None:
+            p.update(_empty_seat_fields(SOURCE_SKIPPED))
+            counts[SOURCE_SKIPPED] += 1
+            continue
+
         try:
-            r = session.get(
-                safe_url,
-                headers={"Referer": referer,
-                         "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},
-                timeout=timeout_s,
-            )
+            r = session.post(BINDSEATPLAN_URL, data=params, headers=headers,
+                             timeout=timeout_s)
         except requests.RequestException as e:
             p.update(_empty_seat_fields(
-                SOURCE_FETCH_FAIL, url=safe_url, status=str(e)[:160],
+                SOURCE_FETCH_FAIL, url=BINDSEATPLAN_URL, status=str(e)[:160],
             ))
             counts[SOURCE_FETCH_FAIL] += 1
             continue
         if r.status_code != 200:
             p.update(_empty_seat_fields(
-                SOURCE_FETCH_FAIL, url=safe_url, status=r.status_code,
+                SOURCE_FETCH_FAIL, url=BINDSEATPLAN_URL, status=r.status_code,
             ))
             counts[SOURCE_FETCH_FAIL] += 1
             continue
         if not r.text:
             p.update(_empty_seat_fields(
-                SOURCE_FETCH_FAIL, url=safe_url, status="empty_body",
+                SOURCE_FETCH_FAIL, url=BINDSEATPLAN_URL, status="empty_body",
             ))
             counts[SOURCE_FETCH_FAIL] += 1
             continue
 
-        try:
-            tiers, strategy = parse_seat_plan_prices(r.text)
-        except Exception as e:  # noqa: BLE001 — defensive; never break the scrape
-            log.warning("parse exception for show %d %s %s: %s",
-                        show_id, p.get("date"), p.get("time"), e)
-            tiers, strategy = [], "exception"
-
-        if not tiers:
+        parsed = parse_bindseatplan(r.text)
+        if parsed is None:
             p.update(_empty_seat_fields(
-                SOURCE_NO_LEGEND, url=safe_url, status=200,
+                SOURCE_FETCH_FAIL, url=BINDSEATPLAN_URL, status="json_parse",
+            ))
+            counts[SOURCE_FETCH_FAIL] += 1
+            continue
+
+        if parsed["result_code"] != "0":
+            # TTD returned a non-zero result code (redirect / error).
+            # Don't write seat fields — fall through to calendar.
+            p.update(_empty_seat_fields(
+                SOURCE_FETCH_FAIL,
+                url=BINDSEATPLAN_URL,
+                status=f"result_code={parsed['result_code']}",
+            ))
+            counts[SOURCE_FETCH_FAIL] += 1
+            continue
+
+        tiers = parsed["tiers"]
+        if not tiers:
+            # ResultCode=0 but no price bands → genuinely off-sale.
+            p.update(_empty_seat_fields(
+                SOURCE_NO_LEGEND, url=BINDSEATPLAN_URL, status=200,
             ))
             counts[SOURCE_NO_LEGEND] += 1
             continue
 
-        # Compute agreement vs calendar
+        # Success — write seat_* fields.
         cal_min = p.get("verified_min_price")
-        agrees: bool | None
         if cal_min is None:
             agrees = None
         else:
@@ -519,13 +522,13 @@ def verify_one_show(
         p["seat_min_price"]            = min(tiers)
         p["seat_max_price"]            = max(tiers)
         p["seat_price_tiers"]          = tiers
+        p["seat_face_min_price"]       = min(parsed["face_tiers"]) if parsed["face_tiers"] else None
+        p["seat_face_max_price"]       = max(parsed["face_tiers"]) if parsed["face_tiers"] else None
+        p["seat_seats_available"]      = parsed["n_seats"]
         p["seat_price_source"]         = SOURCE_OK
         p["seat_status"]               = 200
-        p["seat_url"]                  = safe_url
-        p["seat_checked_at"]           = (
-            datetime.now(timezone.utc).isoformat(timespec="seconds")
-        )
-        p["seat_parse_strategy"]       = strategy
+        p["seat_url"]                  = BINDSEATPLAN_URL
+        p["seat_checked_at"]           = datetime.now(timezone.utc).isoformat(timespec="seconds")
         p["seat_agrees_with_calendar"] = agrees
         counts[SOURCE_OK] += 1
 
@@ -536,8 +539,7 @@ def verify_one_show(
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def run(payload: dict, *, concurrency: int, limit: int | None,
-        include_past: bool) -> dict:
+def run(payload, concurrency, limit, include_past):
     today_iso = datetime.now(timezone.utc).date().isoformat()
     shows = payload.get("shows") or []
     if limit is not None:
@@ -551,13 +553,7 @@ def run(payload: dict, *, concurrency: int, limit: int | None,
         total_perfs, total_shows, concurrency,
     )
     if total_shows == 0:
-        return {
-            "verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "shows_checked": 0, "total_perfs": 0,
-            "ok": 0, "no_legend": 0, "fetch_failed": 0, "skipped": 0,
-            "calendar_agreed": 0, "calendar_disagreed": 0,
-            "duration_seconds": 0.0,
-        }
+        return _empty_summary()
 
     totals = {SOURCE_OK: 0, SOURCE_NO_LEGEND: 0,
               SOURCE_FETCH_FAIL: 0, SOURCE_SKIPPED: 0}
@@ -565,7 +561,7 @@ def run(payload: dict, *, concurrency: int, limit: int | None,
     progress = {"n": 0}
     progress_lock = Lock()
 
-    def _job(show: dict) -> dict[str, int]:
+    def _job(show):
         _, counts = verify_one_show(show, today_iso, include_past)
         return counts
 
@@ -575,7 +571,7 @@ def run(payload: dict, *, concurrency: int, limit: int | None,
         for fut in as_completed(futures):
             try:
                 counts = fut.result()
-            except Exception as e:  # noqa: BLE001 — workers shouldn't raise
+            except Exception as e:  # noqa: BLE001
                 log.warning("worker exception: %s", e)
                 continue
             with totals_lock:
@@ -594,9 +590,7 @@ def run(payload: dict, *, concurrency: int, limit: int | None,
 
     elapsed = time.monotonic() - t0
 
-    # Post-pass: agreement counts across all perfs touched.
-    agreed = 0
-    disagreed = 0
+    agreed = disagreed = 0
     for s in shows:
         for p in s.get("performances", []):
             a = p.get("seat_agrees_with_calendar")
@@ -616,9 +610,9 @@ def run(payload: dict, *, concurrency: int, limit: int | None,
     )
     if disagreed:
         log.info(
-            "%d perfs where the seat plan disagrees with the calendar — "
-            "the seat plan wins. (This is the King's Head / phantom-tier case.)",
-            disagreed,
+            "%d perfs where the seat plan disagrees with the calendar "
+            "by more than £%.2f — the seat plan wins.",
+            disagreed, AGREE_TOLERANCE_GBP,
         )
 
     summary = {
@@ -639,45 +633,54 @@ def run(payload: dict, *, concurrency: int, limit: int | None,
     return summary
 
 
+def _empty_summary():
+    return {
+        "verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "shows_checked": 0, "total_perfs": 0,
+        "ok": 0, "no_legend": 0, "fetch_failed": 0, "skipped": 0,
+        "calendar_agreed": 0, "calendar_disagreed": 0,
+        "duration_seconds": 0.0,
+    }
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv=None):
     p = argparse.ArgumentParser(
         description=(
-            "Verify TTD per-performance prices by fetching the actual "
-            "seat-plan page and parsing its price-tier legend — the "
-            "ground truth for what a buyer can pick from."
+            "Verify TTD per-performance prices by POSTing to "
+            "/Show/BindSeatPlan and reading the JSON PriceBands array "
+            "— the ground truth for what a buyer can pick from."
         ),
     )
     p.add_argument("--in", "-i", dest="in_path", type=Path,
                    default=Path("ttd.json"),
-                   help="Input JSON (default: ttd.json). Must have already "
-                        "been processed by ttd_availability.py — we rely on "
-                        "verified_book_url and verified_min_price.")
+                   help="Input JSON (default: ttd.json). Must have been "
+                        "processed by ttd_availability.py first — we rely "
+                        "on verified_perf_id and verified_price_source.")
     p.add_argument("--out", "-o", dest="out_path", type=Path, default=None,
                    help="Output JSON path. Default: overwrite input in place.")
     p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                    help=f"Parallel workers (default: {DEFAULT_CONCURRENCY}). "
-                        "Lower than ttd_availability since seat-plan pages "
-                        "are heavier.")
+                        "One HTTP POST per perf, so this can be higher than "
+                        "ttd_availability without hammering anything.")
     p.add_argument("--limit", type=int, default=None,
-                   help="Verify only the first N shows (smoke-test the "
-                        "whole pipeline cheaply).")
+                   help="Verify only the first N shows (smoke-test).")
     p.add_argument("--include-past", action="store_true",
-                   help="Also fetch past-dated performances (skipped by "
-                        "default — they 404 on the seat-plan endpoint).")
+                   help="Also verify past-dated performances "
+                        "(skipped by default — they're off-sale).")
     p.add_argument("--dry-run", action="store_true",
                    help="Do everything except write the output file.")
     p.add_argument("--smoke-show", type=int, default=None,
-                   help="Single-show debug mode: fetch the first verified "
-                        "perf for this show ID, dump each strategy's output "
-                        "to stderr, and exit. Use when adding support for a "
-                        "new venue or after a parse failure.")
+                   help="Single-show debug mode: hit BindSeatPlan for the "
+                        "first verified perf of this show, dump the parsed "
+                        "JSON to stderr, and exit. Use to inspect the live "
+                        "response shape after a TTD-side change.")
     p.add_argument("--save-html", type=Path, default=None,
-                   help="With --smoke-show, save the raw seat-plan HTML to "
-                        "this path for offline inspection.")
+                   help="With --smoke-show, save the raw response body "
+                        "(JSON) to this path for offline inspection.")
     args = p.parse_args(argv)
 
     if not args.in_path.exists():
@@ -695,17 +698,14 @@ def main(argv: list[str] | None = None) -> int:
                   "(expected top-level dict with 'shows' list)", args.in_path)
         return EXIT_BAD_INPUT
 
-    # Defensive guard: if the input has zero verified_book_urls,
-    # ttd_availability.py probably didn't run. Warn but don't refuse —
-    # the script will produce all-skipped output which is at least honest.
     has_verified = any(
-        p.get("verified_book_url")
+        p.get("verified_perf_id")
         for s in payload["shows"]
         for p in (s.get("performances") or [])
     )
     if not has_verified:
         log.warning(
-            "Input has no verified_book_url fields — ttd_availability.py "
+            "Input has no verified_perf_id fields — ttd_availability.py "
             "doesn't look like it has run. Every perf will be skipped.",
         )
 
@@ -732,30 +732,21 @@ def main(argv: list[str] | None = None) -> int:
     tmp.replace(out_path)
     log.info("Wrote %s", out_path)
 
-    # Drift sentinel: if we attempted real fetches but got zero legends,
-    # the page structure has probably changed. Surface a hard error so
-    # CI flags it instead of silently shipping a TTD pipeline with no
-    # ground-truth verification.
     attempted_real = (summary["total_perfs"]
                       - summary["skipped"]
                       - summary["fetch_failed"])
     if attempted_real > 0 and summary["ok"] == 0:
         log.error(
-            "No seat-plan pages parsed successfully out of %d attempts — "
-            "the page structure may have changed. Run with "
-            "--smoke-show {id} --save-html /tmp/seat.html to inspect.",
+            "No PriceBands successfully parsed out of %d attempts — "
+            "BindSeatPlan may have changed shape. Run with "
+            "--smoke-show {id} --save-html /tmp/bsp.json to inspect.",
             attempted_real,
         )
         return EXIT_DRIFT
     return EXIT_CLEAN
 
 
-def _smoke_one(payload: dict, show_id: int, save_html: Path | None) -> int:
-    """Single-show debug pass. Fetches the first verified perf for this
-    show and prints what each parser strategy extracted, separately.
-    Run this once on a known show after any parser tweak to confirm
-    the legend is still being picked up.
-    """
+def _smoke_one(payload, show_id, save_html):
     shows = payload.get("shows") or []
     show = next((s for s in shows if s.get("id") == show_id), None)
     if show is None:
@@ -765,63 +756,69 @@ def _smoke_one(payload: dict, show_id: int, save_html: Path | None) -> int:
     perf = next(
         (p for p in show.get("performances") or []
          if p.get("verified_price_source") == "ttd_calendar"
-         and p.get("verified_book_url")),
+         and p.get("verified_perf_id")),
         None,
     )
     if perf is None:
-        log.error("Show %d has no verified-calendar perf to test against. "
+        log.error("Show %d has no verified-calendar perf to test. "
                   "Run ttd_availability.py first.", show_id)
         return EXIT_BAD_INPUT
 
-    url = _ascii_safe_url(perf["verified_book_url"]) or perf["verified_book_url"]
+    params = build_params(show, perf)
+    if not params:
+        log.error("Could not build params (missing show.venue_url maybe?). "
+                  "Show fields: id=%s venue_url=%s",
+                  show.get("id"), show.get("venue_url"))
+        return EXIT_BAD_INPUT
+
     show_url = _ascii_safe_url(show.get("url") or show.get("detail_canonical"))
     session = build_session()
 
-    log.info("Smoke-test: show=%d  perf=%s %s",
-             show_id, perf.get("date"), perf.get("time"))
-    log.info("  show URL: %s", show_url)
-    log.info("  seat URL: %s", url)
-    log.info("  calendar said: from £%s", perf.get("verified_min_price"))
+    log.info("Smoke-test: show=%d  perf=%s %s  cal=£%s",
+             show_id, perf.get("date"), perf.get("time"),
+             perf.get("verified_min_price"))
+    log.info("  params: %s", params)
+    log.info("  show URL (warmup): %s", show_url)
 
-    log.info("Warmup GET...")
     try:
         wr = session.get(show_url, timeout=DEFAULT_TIMEOUT_S)
-        log.info("  warmup status %d, %d bytes", wr.status_code, len(wr.text))
+        log.info("  warmup → %d, %d bytes", wr.status_code, len(wr.text))
     except requests.RequestException as e:
         log.warning("warmup failed: %s", e)
 
-    log.info("Fetching seat plan...")
+    log.info("POST %s", BINDSEATPLAN_URL)
     try:
-        r = session.get(url, headers={"Referer": show_url or ""},
-                        timeout=DEFAULT_TIMEOUT_S)
+        r = session.post(BINDSEATPLAN_URL, data=params,
+                         headers={**POST_HEADERS, "Referer": show_url or ""},
+                         timeout=DEFAULT_TIMEOUT_S)
     except requests.RequestException as e:
-        log.error("fetch failed: %s", e)
+        log.error("BindSeatPlan failed: %s", e)
         return EXIT_DRIFT
-    log.info("  status %d, %d bytes, content-type=%s",
+    log.info("  → %d, %d bytes, content-type=%s",
              r.status_code, len(r.text),
              r.headers.get("content-type", "?"))
 
     if save_html is not None:
         save_html.parent.mkdir(parents=True, exist_ok=True)
         save_html.write_text(r.text, encoding="utf-8")
-        log.info("Saved raw HTML to %s", save_html)
+        log.info("Saved raw response to %s", save_html)
 
-    for name, fn in _STRATEGIES:
-        try:
-            tiers = fn(r.text)
-        except Exception as e:  # noqa: BLE001 — surface parser bugs here
-            log.warning("strategy %s raised: %s", name, e)
-            continue
-        log.info("  strategy %-9s -> %s", name, tiers)
+    parsed = parse_bindseatplan(r.text)
+    if parsed is None:
+        log.error("Response did not parse as JSON.")
+        log.error("First 400 bytes: %r", r.text[:400])
+        return EXIT_DRIFT
 
-    final, strategy = parse_seat_plan_prices(r.text)
-    log.info("FINAL: tiers=%s  strategy=%s  calendar_said=£%s",
-             final, strategy, perf.get("verified_min_price"))
-    if final and perf.get("verified_min_price") is not None:
-        agrees = abs(min(final) - perf["verified_min_price"]) <= AGREE_TOLERANCE_GBP
-        log.info("  agrees with calendar: %s%s",
+    log.info("Parsed:")
+    log.info("  ResultCode:   %s", parsed["result_code"])
+    log.info("  selling tiers (PriceBands):  %s", parsed["tiers"])
+    log.info("  face tiers:                  %s", parsed["face_tiers"])
+    log.info("  seats in Performances:       %d", parsed["n_seats"])
+    if parsed["tiers"] and perf.get("verified_min_price") is not None:
+        agrees = abs(min(parsed["tiers"]) - perf["verified_min_price"]) <= AGREE_TOLERANCE_GBP
+        log.info("  agrees with calendar:        %s%s",
                  agrees,
-                 "" if agrees else "  <-- phantom-tier case!")
+                 "" if agrees else "   <-- phantom-tier case (seat plan wins)")
     return EXIT_CLEAN
 
 
