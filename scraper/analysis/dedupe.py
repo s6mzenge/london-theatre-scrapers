@@ -431,24 +431,58 @@ def _seatplan_available(p: dict) -> bool | None:
 # Per-performance field extractors. Each source phrases dates/times/prices
 # differently; this normalizes to a canonical shape so we can join across
 # sources on (date, time).
-# TTD's detail-page JSON-LD emits the show-wide minimum on every
-# TheaterEvent.offers.price (e.g. £7 for *A Midsummer Night's Dream*
-# at the Globe, even though most evening performances actually start
-# at £13). When ttd_availability.py has run, each performance carries
-# a verified_min_price scraped from TTD's bindcalendar response — the
-# real per-perf "from £X.XX" the calendar widget displays. Prefer it
-# whenever it's present.
+# TTD has three sources of truth for a per-perf minimum, in order of
+# how much we trust each:
 #
-# verified_price_source semantics (set by ttd_availability.py):
-#   "ttd_calendar"     — verified successfully; trust verified_min_price
-#   "not_in_calendar"  — month was fetched but this (date, time) wasn't
-#                        returned → not on sale → drop TTD's price so the
-#                        cross-source min isn't dragged down by JSON-LD bogosity
-#   "fetch_failed"     — network/HTTP failure → fall back to raw price
-#                        (still bogus, but better than nothing)
-#   "skipped"          — perf wasn't checked → fall back to raw price
-#   (missing field)    — availability pass never ran → fall back to raw price
+#   1. seat_min_price        Set by ttd_seat_verification.py. The
+#                            actual price-tier legend on the seat-plan
+#                            page — the buyer's ground truth. Trumps
+#                            everything below.
+#   2. verified_min_price    Set by ttd_availability.py. The "from £X"
+#                            the calendar widget displays. Often right
+#                            but can echo the same database-driven
+#                            phantom minimum that the listing card and
+#                            detail-page JSON-LD share (observed:
+#                            every King's Head Theatre show advertises
+#                            "from £13" on all three surfaces while
+#                            the seat plan starts at £25).
+#   3. price                 Detail-page JSON-LD lowPrice. Show-wide
+#                            leak; misleading for most perfs but
+#                            better than nothing as a last resort.
+#
+# Source-status semantics for the two verification passes:
+#
+#   seat_price_source (set by ttd_seat_verification.py):
+#     "seat_plan"        — trust seat_min_price
+#     "no_legend"        — page returned but no buyable tiers; treat
+#                          as off-sale, return None
+#     "fetch_failed"     — seat-plan fetch errored; fall through to
+#                          calendar
+#     "skipped"          — not checked (past, no perf_id, etc.); fall
+#                          through to calendar
+#     (missing field)    — seat verification pass never ran; fall
+#                          through to calendar
+#
+#   verified_price_source (set by ttd_availability.py):
+#     "ttd_calendar"     — trust verified_min_price
+#     "not_in_calendar"  — calendar fetched but this (date, time) not
+#                          returned → not on sale → return None
+#     "fetch_failed"     — calendar fetch errored; fall back to price
+#     "skipped"          — perf wasn't checked; fall back to price
+#     (missing field)    — calendar pass never ran; fall back to price
 def _ttd_price_from(p: dict) -> float | None:
+    seat_source = p.get("seat_price_source")
+    if seat_source == "seat_plan":
+        seat_min = p.get("seat_min_price")
+        if seat_min is not None:
+            return seat_min
+    if seat_source == "no_legend":
+        # Seat plan said there are no tiers to pick from. Don't fall
+        # back to the calendar — that's exactly the value we no longer
+        # trust for this perf.
+        return None
+    # Seat verification didn't conclusively answer; fall through to
+    # the calendar-widget verification.
     source = p.get("verified_price_source")
     if source == "not_in_calendar":
         return None
@@ -459,6 +493,16 @@ def _ttd_price_from(p: dict) -> float | None:
     # show-wide leak (probably wrong) but we'd rather show a stale
     # number than no number at all when verification was never attempted.
     return p.get("price")
+
+
+def _ttd_price_to(p: dict) -> float | None:
+    """Maximum price tier for the perf. Only the seat-plan verifier
+    produces a meaningful max — JSON-LD lowPrice and the calendar
+    widget's 'from £X' both have no upper bound. Returns None when
+    seat verification didn't conclude or had nothing to report."""
+    if p.get("seat_price_source") == "seat_plan":
+        return p.get("seat_max_price")
+    return None
 
 
 PERF_SCHEMAS: dict[str, dict[str, Any]] = {
@@ -521,12 +565,11 @@ PERF_SCHEMAS: dict[str, dict[str, Any]] = {
     "ttd": {
         "date":       lambda p: p.get("date"),
         "time":       lambda p: p.get("time"),
-        # Prefer the bindcalendar-verified per-perf price (set by
-        # ttd_availability.py) over the detail-page JSON-LD, which is
-        # the show-wide minimum and misleads for performances where the
-        # cheapest tier isn't actually on sale.
+        # Three-tier price selection — see _ttd_price_from above.
+        # Seat-plan ground truth > calendar widget verification > raw JSON-LD.
         "price_from": _ttd_price_from,
-        "price_to":   lambda p: None,
+        # Only the seat-plan verifier produces a max; None otherwise.
+        "price_to":   _ttd_price_to,
         "currency":   lambda p: p.get("currency"),
         # verified_book_url has the real perf_id; raw book_url has /0
         # placeholders for any perf the existing scraper couldn't resolve.
