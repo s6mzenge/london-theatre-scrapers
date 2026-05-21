@@ -284,6 +284,15 @@ function computeAnalysis(performances, today) {
     }
   }
 
+  // Default visible month: whichever calendar contains the default-
+  // selected date. So the page opens with the selected date already
+  // on screen rather than the user having to page forward to find it.
+  const defaultDate = parseISO(defaultDateIso)
+  let defaultMonthIdx = months.findIndex(
+    (m) => m.year === defaultDate.getFullYear() && m.month === defaultDate.getMonth(),
+  )
+  if (defaultMonthIdx < 0) defaultMonthIdx = 0
+
   return {
     isEmpty: false,
     scoreboard,
@@ -292,6 +301,7 @@ function computeAnalysis(performances, today) {
     axisMin,
     axisMax,
     defaultDateIso,
+    defaultMonthIdx,
     runLabel: formatRunLabel(firstIso, lastIso),
     totalPerformances: countedPerfs,
   }
@@ -310,13 +320,17 @@ export default function ShowDetail({ show, onBack }) {
   const [selectedDateIso, setSelectedDateIso] = useState(
     analysis.defaultDateIso,
   )
+  const [currentMonthIdx, setCurrentMonthIdx] = useState(
+    analysis.defaultMonthIdx ?? 0,
+  )
 
   // Re-anchor when the user navigates between shows — the default for
   // the new show might be entirely different, and the old iso may not
   // exist on this show at all.
   useEffect(() => {
     setSelectedDateIso(analysis.defaultDateIso)
-  }, [analysis.defaultDateIso])
+    setCurrentMonthIdx(analysis.defaultMonthIdx ?? 0)
+  }, [analysis.defaultDateIso, analysis.defaultMonthIdx])
 
   const descParagraphs = useMemo(
     () => cleanDescription(show.description),
@@ -370,6 +384,8 @@ export default function ShowDetail({ show, onBack }) {
             analysis={analysis}
             selectedDateIso={selectedDateIso}
             onSelectDate={setSelectedDateIso}
+            currentMonthIdx={currentMonthIdx}
+            onChangeMonth={setCurrentMonthIdx}
           />
           {selectedDate && (
             <DrillDown
@@ -459,7 +475,21 @@ function Scoreboard({ analysis }) {
 // Performances section: 1+ month calendar(s) stacked vertically
 // ---------------------------------------------------------------------------
 
-function PerformancesSection({ analysis, selectedDateIso, onSelectDate }) {
+function PerformancesSection({
+  analysis,
+  selectedDateIso,
+  onSelectDate,
+  currentMonthIdx,
+  onChangeMonth,
+}) {
+  const months = analysis.months
+  // Clamp in case state ever gets ahead of the data (e.g. analysis
+  // recomputed with fewer months while a higher index was stored).
+  const idx = Math.max(0, Math.min(currentMonthIdx, months.length - 1))
+  const current = months[idx]
+  const prev = idx > 0 ? months[idx - 1] : null
+  const next = idx < months.length - 1 ? months[idx + 1] : null
+
   return (
     <section className="stg-section stg-show-section">
       <div className="stg-section-head">
@@ -477,18 +507,48 @@ function PerformancesSection({ analysis, selectedDateIso, onSelectDate }) {
         </div>
       </div>
 
-      {analysis.months.map((m) => (
-        <div key={`${m.year}-${m.month}`} className="stg-show-cal-block">
-          {analysis.months.length > 1 && (
-            <div className="stg-show-cal-label">{m.label.toUpperCase()}</div>
-          )}
-          <ShowCalendar
-            weeks={m.weeks}
-            selectedDateIso={selectedDateIso}
-            onSelectDate={onSelectDate}
-          />
+      {/* Month navigator. Only renders the controls when there's more
+          than one month in the run — single-month runs just show the
+          month label centred without dead arrows flanking it. */}
+      {months.length > 1 ? (
+        <div className="stg-show-monthnav">
+          <button
+            type="button"
+            className="stg-show-monthnav-arrow"
+            onClick={() => onChangeMonth(idx - 1)}
+            disabled={!prev}
+            aria-label={prev ? `Previous month, ${prev.label}` : 'No previous month'}
+          >
+            ←
+          </button>
+          <div className="stg-show-monthnav-label">
+            {current.label.toUpperCase()}
+          </div>
+          <button
+            type="button"
+            className="stg-show-monthnav-arrow"
+            onClick={() => onChangeMonth(idx + 1)}
+            disabled={!next}
+            aria-label={next ? `Next month, ${next.label}` : 'No next month'}
+          >
+            →
+          </button>
         </div>
-      ))}
+      ) : (
+        <div className="stg-show-monthnav single">
+          <div className="stg-show-monthnav-label">
+            {current.label.toUpperCase()}
+          </div>
+        </div>
+      )}
+
+      <div className="stg-show-cal-block">
+        <ShowCalendar
+          weeks={current.weeks}
+          selectedDateIso={selectedDateIso}
+          onSelectDate={onSelectDate}
+        />
+      </div>
     </section>
   )
 }
