@@ -6,7 +6,7 @@ import Search from './components/Search.jsx'
 import Sellers from './components/Sellers.jsx'
 import ShowDetail from './components/ShowDetail.jsx'
 import { loadUnifiedData } from './lib/data.js'
-import { useRoute, navigate } from './lib/router.jsx'
+import { useRoute } from './lib/router.jsx'
 
 const CURTAIN_KEY = 'stg-curtain-seen'
 
@@ -54,14 +54,6 @@ export default function App() {
       /* sessionStorage unavailable; that's fine */
     }
     setCurtainVisible(false)
-  }, [])
-
-  // Show-detail entry pushes /shows/:id and scrolls to top, matching
-  // the previous behaviour. Tab changes don't scroll. Browser back /
-  // forward restore scroll position automatically (they go through
-  // popstate, which navigate() doesn't trigger).
-  const handleSelectShow = useCallback((id) => {
-    navigate(`/shows/${encodeURIComponent(id)}`, { scroll: true })
   }, [])
 
   // "← BACK" from a show detail walks the browser history rather than
@@ -122,17 +114,11 @@ export default function App() {
           </div>
         )}
 
-        {data && route.name === 'cheapest' && (
-          <Cheapest data={data} onSelectShow={handleSelectShow} />
-        )}
+        {data && route.name === 'cheapest' && <Cheapest data={data} />}
 
-        {data && route.name === 'shows' && (
-          <Search data={data} onSelectShow={handleSelectShow} />
-        )}
+        {data && route.name === 'shows' && <Search data={data} />}
 
-        {data && route.name === 'sellers' && (
-          <Sellers data={data} onSelectShow={handleSelectShow} />
-        )}
+        {data && route.name === 'sellers' && <Sellers data={data} />}
       </main>
     </div>
   )
