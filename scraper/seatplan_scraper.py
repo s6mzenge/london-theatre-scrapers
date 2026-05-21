@@ -1806,13 +1806,34 @@ def fetch_show_detail(
             return None, last_err
 
         try:
-            return parse_show(resp.text, scraped_at), None
+            detail = parse_show(resp.text, scraped_at)
         except Exception as e:
             last_err = f"parse: {type(e).__name__}: {e}"
             if attempt == 1:
                 time.sleep(DETAIL_PARSE_RETRY_DELAY_S)
                 continue
             return None, last_err
+
+        # Enrich with actually-bookable prices from the internal API.
+        # Failures here are non-fatal: perfs retain their JSON-LD
+        # low_price (with price_source=None) so the scrape still
+        # produces output, just less accurate for this show.
+        try:
+            enriched = _enrich_with_availability(
+                session,
+                detail.get("sku"),
+                card.slug,
+                detail.get("performances", []),
+                scraped_at,
+            )
+            if enriched:
+                log.debug("  %s: enriched %d perfs with normal-prices",
+                          card.slug, enriched)
+        except Exception as e:
+            log.warning("availability enrichment failed for %s: %s",
+                        card.slug, e)
+
+        return detail, None
 
     return None, last_err or "unknown"
 
