@@ -431,6 +431,36 @@ def _seatplan_available(p: dict) -> bool | None:
 # Per-performance field extractors. Each source phrases dates/times/prices
 # differently; this normalizes to a canonical shape so we can join across
 # sources on (date, time).
+# TTD's detail-page JSON-LD emits the show-wide minimum on every
+# TheaterEvent.offers.price (e.g. £7 for *A Midsummer Night's Dream*
+# at the Globe, even though most evening performances actually start
+# at £13). When ttd_availability.py has run, each performance carries
+# a verified_min_price scraped from TTD's bindcalendar response — the
+# real per-perf "from £X.XX" the calendar widget displays. Prefer it
+# whenever it's present.
+#
+# verified_price_source semantics (set by ttd_availability.py):
+#   "ttd_calendar"     — verified successfully; trust verified_min_price
+#   "not_in_calendar"  — month was fetched but this (date, time) wasn't
+#                        returned → not on sale → drop TTD's price so the
+#                        cross-source min isn't dragged down by JSON-LD bogosity
+#   "fetch_failed"     — network/HTTP failure → fall back to raw price
+#                        (still bogus, but better than nothing)
+#   "skipped"          — perf wasn't checked → fall back to raw price
+#   (missing field)    — availability pass never ran → fall back to raw price
+def _ttd_price_from(p: dict) -> float | None:
+    source = p.get("verified_price_source")
+    if source == "not_in_calendar":
+        return None
+    verified = p.get("verified_min_price")
+    if verified is not None:
+        return verified
+    # No verified data — fall back to raw JSON-LD price. This is the
+    # show-wide leak (probably wrong) but we'd rather show a stale
+    # number than no number at all when verification was never attempted.
+    return p.get("price")
+
+
 PERF_SCHEMAS: dict[str, dict[str, Any]] = {
     "todaytix": {
         "date":       lambda p: p.get("local_date") or p.get("date"),
@@ -482,10 +512,16 @@ PERF_SCHEMAS: dict[str, dict[str, Any]] = {
     "ttd": {
         "date":       lambda p: p.get("date"),
         "time":       lambda p: p.get("time"),
-        "price_from": lambda p: p.get("price"),
+        # Prefer the bindcalendar-verified per-perf price (set by
+        # ttd_availability.py) over the detail-page JSON-LD, which is
+        # the show-wide minimum and misleads for performances where the
+        # cheapest tier isn't actually on sale.
+        "price_from": _ttd_price_from,
         "price_to":   lambda p: None,
         "currency":   lambda p: p.get("currency"),
-        "book_url":   lambda p: p.get("book_url"),
+        # verified_book_url has the real perf_id; raw book_url has /0
+        # placeholders for any perf the existing scraper couldn't resolve.
+        "book_url":   lambda p: p.get("verified_book_url") or p.get("book_url"),
         "available":  lambda p: ("InStock" in (p.get("availability") or ""))
                                 if p.get("availability") else None,
     },
