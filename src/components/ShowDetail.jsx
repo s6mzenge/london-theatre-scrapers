@@ -757,29 +757,31 @@ function PerformanceBlock({ performance, axisMin, axisMax }) {
 
           {/* Sorted seller list — every seller as a clickable entry,
               cheapest first. flex-wrap means narrow viewports just
-              break to a second line instead of overlapping. Each
-              entry deep-links to that seller's booking page. */}
+              break to a second line instead of overlapping. We
+              iterate over `sellers` (not `groups`) so sellers tied
+              at the same price still get their own link side by
+              side — collapsing them to a single combined entry,
+              as we used to, meant only one of the two URLs was
+              reachable. The dots above stay grouped because tied
+              prices map to the same x% on the axis; here, side-by-
+              side text is fine. */}
           <div className="stg-show-spread-list">
-            {groups.map((group, gi) => {
-              const isCheap = group.price === cheapest.price
-              const linkSeller = group.sellers[0]
-              const sellerNames = group.sellers
-                .map((s) => sellerLabel(s.sellerId).toUpperCase())
-                .join(' · ')
+            {sellers.map((s, si) => {
+              const isCheap = s.price === cheapest.price
               return (
                 <a
-                  key={gi}
+                  key={si}
                   className={`stg-show-spread-item ${isCheap ? 'cheap' : ''}`}
-                  href={linkSeller.bookUrl || '#'}
-                  target={linkSeller.bookUrl ? '_blank' : undefined}
-                  rel={linkSeller.bookUrl ? 'noopener noreferrer' : undefined}
-                  aria-label={`Book ${sellerNames} at £${Math.round(group.price)}`}
+                  href={s.bookUrl || '#'}
+                  target={s.bookUrl ? '_blank' : undefined}
+                  rel={s.bookUrl ? 'noopener noreferrer' : undefined}
+                  aria-label={`Book ${sellerLabel(s.sellerId)} at £${Math.round(s.price)}`}
                 >
                   <span className="stg-show-spread-item-price">
-                    {formatPrice(group.price)}
+                    {formatPrice(s.price)}
                   </span>
                   <span className="stg-show-spread-item-seller">
-                    {sellerNames}
+                    {sellerLabel(s.sellerId).toUpperCase()}
                   </span>
                 </a>
               )
