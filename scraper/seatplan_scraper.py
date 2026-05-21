@@ -228,17 +228,35 @@ class ListingCard:
 @dataclass
 class Performance:
     """One upcoming performance, sourced from the detail page's
-    TheaterEvent JSON-LD and (where overlapping) the Last Minute table."""
+    TheaterEvent JSON-LD and (where overlapping) the Last Minute table.
+
+    Five fields at the end are filled by the availability-enrichment step
+    (see `_enrich_with_availability`), which calls SeatPlan's internal
+    /api/performance/normal-prices/ endpoint to get the actually-bookable
+    price. `low_price` is kept untouched — it carries the marketing
+    "from £X" price from JSON-LD, which SeatPlan themselves know is
+    stale (their new-quotes endpoint fires an `sp_ticketing_calendar_error`
+    event when this diverges from the real quote). Consumers should
+    prefer `available_from` and fall back to `low_price` only when
+    enrichment couldn't run (e.g. show outside the 30-perf cap, network
+    error during enrichment, or production has no sku)."""
     iso: str | None            # full ISO with offset, e.g. "2026-05-19T19:30:00+01:00"
     date: str | None           # "2026-05-19"
     time: str | None           # "19:30"
-    low_price: float | None
+    low_price: float | None    # JSON-LD lowPrice — MARKETING price, often stale
     currency: str | None
     availability: str | None
     # Filled from the Last Minute table where dates overlap
     showtime_id: str | None    # data-id on the booking link
     book_url: str | None       # absolute URL for checkout
     has_deals: bool            # whether the row carried a "Deals" badge
+    # Filled by _enrich_with_availability. All None when enrichment
+    # didn't run for this perf.
+    performance_id: int | None = None       # SeatPlan's numeric perf ID
+    available_seats: int | None = None      # count from /normal-prices/ (0 = sold out)
+    available_from: float | None = None     # min normalMinPrice — the REAL cheapest
+    available_to: float | None = None       # max normalMaxPrice
+    price_source: str | None = None         # "normal_prices" | "sold_out" | None
 
 
 @dataclass
