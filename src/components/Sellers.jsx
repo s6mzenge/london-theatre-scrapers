@@ -1,6 +1,7 @@
 import { useState, useMemo } from 'react'
 import { formatPrice, sellerLabel } from '../lib/format.js'
 import { relativeTime } from '../lib/dates.js'
+import { ShowLink } from '../lib/router.jsx'
 
 // Sellers tab: a per-seller leaderboard with two stats per card.
 //
@@ -22,7 +23,7 @@ const KNOWN_SELLERS = [
   'ttd',
 ]
 
-export default function Sellers({ data, onSelectShow }) {
+export default function Sellers({ data }) {
   const [active, setActive] = useState(null)
 
   const cheapestPerSeller = useMemo(() => {
@@ -118,16 +119,10 @@ export default function Sellers({ data, onSelectShow }) {
           </div>
           <div className="stg-search-results">
             {activeRows.map((row) => (
-              <div
+              <ShowLink
                 key={row.show.id}
+                id={row.show.id}
                 className="stg-search-row"
-                onClick={() => onSelectShow(row.show.id)}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ')
-                    onSelectShow(row.show.id)
-                }}
               >
                 <div className="stg-search-row-body">
                   <div className="stg-search-row-title">{row.show.title}</div>
@@ -149,7 +144,7 @@ export default function Sellers({ data, onSelectShow }) {
                     <span className="stg-search-row-from">PRICE TBC</span>
                   )}
                 </div>
-              </div>
+              </ShowLink>
             ))}
             {activeRows.length === 0 && (
               <div className="stg-empty">
