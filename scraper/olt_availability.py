@@ -87,6 +87,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -113,10 +114,24 @@ DEFAULT_HEADERS = {
     "Accept-Language": "en-GB,en;q=0.9",
 }
 
-DEFAULT_CONCURRENCY = 16
+DEFAULT_CONCURRENCY = 6
 DEFAULT_TIMEOUT_S = 15
 
-RETRY_TOTAL = 3
+# Per-request jitter (seconds, uniform). Each worker sleeps this much
+# before its fetch. With concurrency=6 and ~150ms mean jitter, aggregate
+# request rate stays around 4-5 RPS — well under what Akamai/SeeTickets
+# tolerates from a single egress IP. Local testing through the same
+# proxy with sequential calls returned 200; the CI run with 16-way
+# concurrency tripped Akamai's burst protection (1906×403, 95×429).
+JITTER_S_MIN = 0.05
+JITTER_S_MAX = 0.20
+
+# Slightly higher retry budget. urllib3 retries on the statuses below
+# with exponential backoff (RETRY_BACKOFF * 2^N seconds). With 5
+# retries and 0.5s backoff, total wait can reach ~15s per request —
+# slow on a real outage but rare; mostly we just need to ride out
+# transient Akamai pushback.
+RETRY_TOTAL = 5
 RETRY_BACKOFF = 0.5
 
 # verified_price_source values. Keep aligned with the dedupe OLT schema.
@@ -204,7 +219,11 @@ def build_session(
     retry = Retry(
         total=RETRY_TOTAL,
         backoff_factor=RETRY_BACKOFF,
-        status_forcelist=(429, 500, 502, 503, 504),
+        # 403 is added because Akamai uses it as a soft "slow down"
+        # signal alongside 429. A real "you're not allowed here" 403
+        # will exhaust retries quickly and surface as fetch_failed,
+        # which is fine.
+        status_forcelist=(403, 429, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET"]),
         raise_on_status=False,
     )
@@ -383,6 +402,12 @@ def verify_one(
     """
     if not url:
         return _empty_result(url, SOURCE_SKIPPED)
+
+    # Per-request jitter. Without this, all N workers can launch their
+    # first fetches within a few milliseconds of each other — a clean
+    # burst pattern Akamai will flag. The randomised delay desynchronises
+    # workers and keeps aggregate RPS in a sustainable range.
+    time.sleep(random.uniform(JITTER_S_MIN, JITTER_S_MAX))
 
     try:
         r = session.get(url, timeout=timeout_s)
