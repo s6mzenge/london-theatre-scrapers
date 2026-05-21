@@ -710,42 +710,82 @@ function PerformanceBlock({ performance, axisMin, axisMax }) {
           </span>
         </div>
       ) : (
-        <div className="stg-show-spread">
-          <div className="stg-show-spread-axis" />
-          {groups.map((group, gi) => {
-            const pct =
-              axisRange > 0
-                ? ((group.price - axisMin) / axisRange) * 100
-                : 50
-            const isCheap = group.price === cheapest.price
-            const label = group.sellers
-              .map((s) => sellerLabel(s.sellerId).toUpperCase())
-              .join(' · ')
-            // Each group's dot links to the cheapest seller in that
-            // group (they're tied, so any will do; we just pick the
-            // first by iteration order).
-            const linkSeller = group.sellers[0]
-            return (
-              <a
-                key={gi}
-                className={`stg-show-spread-tick ${isCheap ? 'cheap' : ''}`}
-                style={{ left: `${pct}%` }}
-                href={linkSeller.bookUrl || '#'}
-                target={linkSeller.bookUrl ? '_blank' : undefined}
-                rel={linkSeller.bookUrl ? 'noopener noreferrer' : undefined}
-                aria-label={`${label} at £${Math.round(group.price)}`}
-              >
-                <span className="stg-show-spread-dot" />
-                <div className="stg-show-spread-lbl">
-                  <span className="stg-show-spread-price">
+        <>
+          {/* Axis with dots only — no per-dot labels. Trying to label
+              each dot caused collisions when prices were close (£19.25,
+              £19.50, £20 on a £15–£48 axis bunch into ~10% of the
+              strip width). The labels now live in the seller list below,
+              which flex-wraps cleanly. The dots' job is purely spatial:
+              show where each seller sits on the show-wide axis. */}
+          <div className="stg-show-spread">
+            <div className="stg-show-spread-axis" />
+            {groups.map((group, gi) => {
+              const pct =
+                axisRange > 0
+                  ? ((group.price - axisMin) / axisRange) * 100
+                  : 50
+              const isCheap = group.price === cheapest.price
+              const label = group.sellers
+                .map((s) => sellerLabel(s.sellerId))
+                .join(' · ')
+              const linkSeller = group.sellers[0]
+              return (
+                <a
+                  key={gi}
+                  className={`stg-show-spread-tick ${isCheap ? 'cheap' : ''}`}
+                  style={{ left: `${pct}%` }}
+                  href={linkSeller.bookUrl || '#'}
+                  target={linkSeller.bookUrl ? '_blank' : undefined}
+                  rel={linkSeller.bookUrl ? 'noopener noreferrer' : undefined}
+                  aria-label={`${label} at £${Math.round(group.price)}`}
+                >
+                  <span className="stg-show-spread-dot" />
+                </a>
+              )
+            })}
+          </div>
+
+          {/* Axis end-markers — tiny captions anchoring "what 0% and
+              100% mean". Without these the bare axis line is opaque;
+              with them the user reads "ah, the cheap end is £15, the
+              expensive end is £48, this performance bunches near the
+              cheap end." */}
+          <div className="stg-show-spread-ends">
+            <span>{formatPrice(axisMin)} SHOW FLOOR</span>
+            <span>{formatPrice(axisMax)} CEILING</span>
+          </div>
+
+          {/* Sorted seller list — every seller as a clickable entry,
+              cheapest first. flex-wrap means narrow viewports just
+              break to a second line instead of overlapping. Each
+              entry deep-links to that seller's booking page. */}
+          <div className="stg-show-spread-list">
+            {groups.map((group, gi) => {
+              const isCheap = group.price === cheapest.price
+              const linkSeller = group.sellers[0]
+              const sellerNames = group.sellers
+                .map((s) => sellerLabel(s.sellerId).toUpperCase())
+                .join(' · ')
+              return (
+                <a
+                  key={gi}
+                  className={`stg-show-spread-item ${isCheap ? 'cheap' : ''}`}
+                  href={linkSeller.bookUrl || '#'}
+                  target={linkSeller.bookUrl ? '_blank' : undefined}
+                  rel={linkSeller.bookUrl ? 'noopener noreferrer' : undefined}
+                  aria-label={`Book ${sellerNames} at £${Math.round(group.price)}`}
+                >
+                  <span className="stg-show-spread-item-price">
                     {formatPrice(group.price)}
                   </span>
-                  <span className="stg-show-spread-seller">{label}</span>
-                </div>
-              </a>
-            )
-          })}
-        </div>
+                  <span className="stg-show-spread-item-seller">
+                    {sellerNames}
+                  </span>
+                </a>
+              )
+            })}
+          </div>
+        </>
       )}
     </div>
   )
