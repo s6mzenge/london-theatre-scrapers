@@ -93,6 +93,95 @@ function priceRangeLabel(perf, effectiveMin) {
 }
 
 // =============================================================
+// Per-day drill-down helpers
+// Used by the week strip + month calendar so each future date has a
+// "top 5 cheapest shows on this day" list with a "vs other dates"
+// context for each row.
+// =============================================================
+
+// Map of show.id -> [{ iso, price }, ...] for all future performances
+// (today or later) with a valid effective price. Built once per
+// aggregation pass and shared with both the week + month views.
+function buildShowFuturePrices(data, today) {
+  const map = new Map()
+  for (const show of data.shows) {
+    for (const perf of show.performances || []) {
+      if (perf.date < today) continue
+      const eff = effectiveCheapest(perf)
+      if (!eff) continue
+      let arr = map.get(show.id)
+      if (!arr) {
+        arr = []
+        map.set(show.id, arr)
+      }
+      arr.push({ iso: perf.date, price: eff.price })
+    }
+  }
+  return map
+}
+
+// "vs other dates" label for a show on a specific date: the price range
+// across this show's other future performances. Returns "£12–£28",
+// "£18" when all other dates share one price, or null when the show
+// has no other future dates on file.
+function otherDatesRangeLabel(showId, dateIso, showFuturePrices) {
+  const all = showFuturePrices.get(showId)
+  if (!all) return null
+  let lo = Infinity
+  let hi = -Infinity
+  let count = 0
+  for (const x of all) {
+    if (x.iso === dateIso) continue
+    count++
+    if (x.price < lo) lo = x.price
+    if (x.price > hi) hi = x.price
+  }
+  if (count === 0) return null
+  return lo === hi
+    ? `£${Math.round(lo)}`
+    : `£${Math.round(lo)}–£${Math.round(hi)}`
+}
+
+// Top-N cheapest shows on `dateIso`. Dedups per show (so a show with
+// both a matinee and an evening on the same day only appears once,
+// using the cheaper performance), then returns the shape the
+// DayDrill panel renders.
+function cheapestShowsForDate(
+  perfsOnDay,
+  dateIso,
+  showFuturePrices,
+  limit = 5,
+) {
+  const byShow = new Map()
+  for (const item of perfsOnDay) {
+    const existing = byShow.get(item.show.id)
+    if (!existing || item.effPrice < existing.effPrice) {
+      byShow.set(item.show.id, item)
+    }
+  }
+  return [...byShow.values()]
+    .sort((a, b) => a.effPrice - b.effPrice)
+    .slice(0, limit)
+    .map((item) => ({
+      show: {
+        id: item.show.id,
+        title: item.show.title,
+        venue: item.show.venue,
+        genre: deriveGenre(item.show),
+      },
+      perf: {
+        time: item.perf.time || '',
+        minPrice: item.effPrice,
+      },
+      otherDatesRange: otherDatesRangeLabel(
+        item.show.id,
+        dateIso,
+        showFuturePrices,
+      ),
+    }))
+}
+
+// =============================================================
 // Derived (Tier-2) field shims
 // These are best-effort and return undefined when the underlying signal
 // isn't in unified.json yet. Components hide the badge/tag accordingly.
@@ -111,10 +200,11 @@ function deriveOnOffer(show) {
 // =============================================================
 
 export function computeAggregations(data, today) {
+  const showFuturePrices = buildShowFuturePrices(data, today)
   return {
     tonight: aggregateTonight(data, today),
-    week: aggregateWeek(data, today),
-    month: aggregateMonth(data, today),
+    week: aggregateWeek(data, today, showFuturePrices),
+    month: aggregateMonth(data, today, showFuturePrices),
   }
 }
 
@@ -193,7 +283,7 @@ function priceBucket(price, percentiles) {
   return 5
 }
 
-function aggregateWeek(data, today) {
+function aggregateWeek(data, today, showFuturePrices) {
   const days = []
   for (let i = 0; i < 7; i++) {
     const iso = addDaysISO(today, i)
@@ -207,6 +297,7 @@ function aggregateWeek(data, today) {
       showCount: 0,
       isDark: false,
       bucket: 5,
+      cheapestShows: [],
     })
   }
   const isoToDay = Object.fromEntries(days.map((d) => [d.iso, d]))
@@ -228,6 +319,12 @@ function aggregateWeek(data, today) {
     }
     d.floor = Math.min(...d.perfs.map((x) => x.effPrice))
     d.showCount = new Set(d.perfs.map((x) => x.show.id)).size
+    d.cheapestShows = cheapestShowsForDate(
+      d.perfs,
+      d.iso,
+      showFuturePrices,
+      5,
+    )
     dayFloors.push(d.floor)
   }
 
@@ -313,7 +410,7 @@ function aggregateWeek(data, today) {
 // three insight cards.
 // =============================================================
 
-function aggregateMonth(data, today) {
+function aggregateMonth(data, today, showFuturePrices) {
   const todayDate = parseISO(today)
   const year = todayDate.getFullYear()
   const month = todayDate.getMonth()
@@ -376,6 +473,12 @@ function aggregateMonth(data, today) {
     const isPast = iso < today
     const isToday = iso === today
     const isDark = !slot || slot.floor === Infinity
+    // Pre-compute the per-day drill-down list for any clickable cell
+    // (anything that isn't past, padding, or dark).
+    const cheapestShows =
+      !isDark && !isPast
+        ? cheapestShowsForDate(slot.perfs, iso, showFuturePrices, 5)
+        : []
     week.push({
       iso,
       dayOfMonth: d,
@@ -384,6 +487,7 @@ function aggregateMonth(data, today) {
       isDark,
       floor: isDark ? null : slot.floor,
       bucket: isDark ? null : priceBucket(slot.floor, percentiles) - 1,
+      cheapestShows,
     })
     if (week.length === 7) {
       weeks.push(week)
