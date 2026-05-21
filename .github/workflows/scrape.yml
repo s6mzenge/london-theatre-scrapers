@@ -192,6 +192,65 @@ jobs:
             --in scraper/data/olt.json \
             --within-days 10
 
+      - name: OLT availability — report block from JSON
+        # Always runs (even if the verifier step above failed) so the
+        # CI log has a labelled, easy-to-find summary of what the
+        # verifier wrote into olt.json. Independent of the verifier's
+        # stdout, which can scroll off / get truncated.
+        if: always() && steps.gate.outputs.run == 'true' && matrix.name == 'olt'
+        continue-on-error: true
+        run: |
+          python <<'PY'
+          import json, sys
+          try:
+              d = json.load(open("scraper/data/olt.json"))
+          except Exception as e:
+              print(f"::warning::Couldn't read olt.json for report: {e}")
+              sys.exit(0)
+          rpt = (d.get("report") or {}).get("availability_verification")
+          if not rpt:
+              print("::warning::No availability_verification block in olt.json")
+              sys.exit(0)
+          print("===== availability_verification (from olt.json) =====")
+          print(json.dumps(rpt, indent=2, ensure_ascii=False))
+          # GitHub Actions warning ribbons for quick scanning.
+          fail_rate = (rpt.get("fetch_failed", 0)
+                       / max(rpt.get("total_checked", 1), 1))
+          if fail_rate > 0.20:
+              print(f"::warning::OLT verifier fetch_failed rate {fail_rate:.1%} > 20% — proxy/upstream issue")
+          elif rpt.get("ok", 0) == 0 and rpt.get("total_checked", 0) > 0:
+              print("::warning::OLT verifier returned zero ok results — investigate")
+          PY
+
+      - name: OLT availability — spot-check Beetlejuice 22 May 19:30
+        # The original bug case. If this perf comes back available=True
+        # with min_price=83 the verifier is silently broken.
+        if: always() && steps.gate.outputs.run == 'true' && matrix.name == 'olt'
+        continue-on-error: true
+        run: |
+          python <<'PY'
+          import json
+          d = json.load(open("scraper/data/olt.json"))
+          target_date, target_time = "2026-05-22", "19:30"
+          for s in d.get("shows") or []:
+              if (s.get("name") or "").lower().startswith("beetlejuice"):
+                  for p in s.get("performances") or []:
+                      if p.get("date") == target_date and p.get("time") == target_time:
+                          print("Beetlejuice 22 May 19:30 verification snapshot:")
+                          for k in ("verified_price_source", "verified_status",
+                                    "verified_available", "verified_min_price",
+                                    "verified_max_price", "verified_tier_count",
+                                    "verified_available_tier_count",
+                                    "min_price", "max_price", "available",
+                                    "verified_url"):
+                              if k in p:
+                                  print(f"  {k:35} = {p[k]!r}")
+                          break
+                  break
+          else:
+              print("(Beetlejuice show not found — skipping spot-check)")
+          PY
+
       - name: Verify TTD per-performance prices
         if: steps.gate.outputs.run == 'true' && matrix.name == 'ttd'
         run: |
