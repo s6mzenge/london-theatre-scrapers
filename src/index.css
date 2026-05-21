@@ -89,6 +89,21 @@ a {
   display: flex;
   min-height: 100vh;
   position: relative;
+  /* Paint the ink "rail" on the parent itself with a hard-edge gradient
+     at the sidebar's right edge. The sidebar is position:sticky with
+     height:100vh, so it never grows to match a taller .stg-main — without
+     this, the parent's default (paper) background shows through below
+     the 100vh mark on long pages. The gradient guarantees the left
+     column is always ink-coloured, whatever the sidebar's height. On
+     mobile (≤640px) the layout flips to a column and both children
+     fully cover the parent, so the gradient is harmless there. */
+  background: linear-gradient(
+    to right,
+    var(--color-ink) 0,
+    var(--color-ink) var(--sidebar-width),
+    var(--color-paper) var(--sidebar-width),
+    var(--color-paper) 100%
+  );
 }
 
 .stg-main {
