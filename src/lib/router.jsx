@@ -126,3 +126,21 @@ export function Link({
     </a>
   )
 }
+
+// ---------------------------------------------------------------------------
+// <ShowLink> — convenience wrapper for clickable show entries
+// ---------------------------------------------------------------------------
+// Almost every list in the app links to a show detail page. Centralising
+// the href construction here means:
+//
+//   1. URL scheme changes (e.g. /shows/:id → /show/:id) happen in one
+//      place instead of six.
+//   2. Show-detail entry scrolls to top by default — matches the old
+//      useState-based behaviour without each callsite remembering to
+//      pass `scroll`.
+//   3. The id is URL-encoded once, here, so a show id with a slash or
+//      a space doesn't blow up the path.
+
+export function ShowLink({ id, ...rest }) {
+  return <Link href={`/shows/${encodeURIComponent(id)}`} scroll {...rest} />
+}
