@@ -640,9 +640,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Verify only the first N performances (smoke-test).",
     )
     p.add_argument(
-        "--within-days", type=int, default=30, metavar="N",
+        "--within-days", type=int, default=10, metavar="N",
         help="Only verify performances scheduled within the next N "
-             "calendar days (default: 30). Pass 0 to disable the "
+             "calendar days (default: 10). Pass 0 to disable the "
              "window and verify every future perf. The user-visible "
              "bug window is near-term anyway: nobody books 9 months "
              "out and gets burned by a sold-out tier.",
