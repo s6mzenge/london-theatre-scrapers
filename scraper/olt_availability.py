@@ -126,12 +126,7 @@ DEFAULT_TIMEOUT_S = 15
 JITTER_S_MIN = 0.05
 JITTER_S_MAX = 0.20
 
-# Slightly higher retry budget. urllib3 retries on the statuses below
-# with exponential backoff (RETRY_BACKOFF * 2^N seconds). With 5
-# retries and 0.5s backoff, total wait can reach ~15s per request —
-# slow on a real outage but rare; mostly we just need to ride out
-# transient Akamai pushback.
-RETRY_TOTAL = 5
+RETRY_TOTAL = 3
 RETRY_BACKOFF = 0.5
 
 # verified_price_source values. Keep aligned with the dedupe OLT schema.
@@ -219,11 +214,12 @@ def build_session(
     retry = Retry(
         total=RETRY_TOTAL,
         backoff_factor=RETRY_BACKOFF,
-        # 403 is added because Akamai uses it as a soft "slow down"
-        # signal alongside 429. A real "you're not allowed here" 403
-        # will exhaust retries quickly and surface as fetch_failed,
-        # which is fine.
-        status_forcelist=(403, 429, 500, 502, 503, 504),
+        # 429 is retried (genuine rate-limit signal; backoff actually
+        # helps), 5xx is retried (transient upstream errors). 403 is
+        # explicitly NOT retried — Akamai's block is sticky, retrying
+        # within seconds doesn't help, and the extra requests damage
+        # IP reputation further.
+        status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET"]),
         raise_on_status=False,
     )
@@ -572,14 +568,53 @@ def run(
         proxy_token=proxy_token,
     )
 
+    # Early-abort threshold: if we hit this many attempts with zero
+    # successes, SeeTickets is almost certainly blocking the proxy
+    # egress IPs (Akamai IP-reputation). Bail out fast instead of
+    # burning the rest of the run on guaranteed-failed requests.
+    # Setting to 30 means ~5-10s to detect on a 6-worker run.
+    EARLY_ABORT_AFTER = 30
+    abort_flag = {"set": False}
+
     def _job(task: tuple[int, int, str | None]) -> tuple[int, int, dict]:
         si, pi, url = task
+        # Short-circuit once the run is known-broken.
+        if abort_flag["set"]:
+            return si, pi, _empty_result(url, SOURCE_SKIPPED, status="aborted")
         return si, pi, verify_one(session, url)
 
-    # Progress every ~10% of total (with a floor of 50) — gives ~10
-    # progress lines regardless of run size. Small runs get a heartbeat
-    # every 50; large runs don't drown the log.
-    progress_step = max(50, total // 10)
+    # Progress: time-based heartbeat. Emit a status line every 10s of
+    # wall clock, plus on the very first completion (so the operator
+    # sees activity immediately) and the very last (so the final state
+    # is logged regardless of timing). Count-based progress thresholds
+    # mis-fire when fetches are slow — a 6-worker run through a
+    # throttled proxy can easily go 30s+ between hitting a round
+    # number, leaving the CI log apparently silent.
+    HEARTBEAT_S = 10.0
+    last_heartbeat = {"t": 0.0}
+
+    def _maybe_log_progress(now: float) -> None:
+        """Caller must hold progress_lock."""
+        n = progress["n"]
+        is_first = (n == 1)
+        is_last  = (n == total)
+        timed    = (now - last_heartbeat["t"]) >= HEARTBEAT_S
+        if not (is_first or is_last or timed):
+            return
+        last_heartbeat["t"] = now
+        elapsed_now = now - t0
+        rate = n / elapsed_now if elapsed_now > 0 else 0.0
+        eta_s = (total - n) / rate if rate > 0 else 0.0
+        log.info(
+            "  progress: %4d/%-4d (%3d%%)  "
+            "ok=%-4d  no_seats=%-3d  fetch_failed=%-3d  "
+            "rate=%.1f/s  eta=%ds",
+            n, total, int(100 * n / total),
+            counts[SOURCE_OK],
+            counts[SOURCE_NO_SEATS],
+            counts[SOURCE_FETCH_FAIL],
+            rate, int(eta_s),
+        )
 
     t0 = time.monotonic()
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -598,8 +633,6 @@ def run(
             with counts_lock:
                 counts[src] = counts.get(src, 0) + 1
                 if status is not None:
-                    # Truncate exception strings so the bucket key
-                    # stays a stable, readable identifier.
                     key = str(status)[:50]
                     status_counts[key] = status_counts.get(key, 0) + 1
                 bucket = host_counts.setdefault(
@@ -613,24 +646,34 @@ def run(
                     fb = sample_failures.setdefault(str(status)[:50], [])
                     if len(fb) < 3 and url:
                         fb.append(url)
-                # Table parser produced a tier_count? Otherwise it's
-                # the meta-tag / JSON-LD fallback path.
                 if out.get("verified_tier_count") is not None:
                     branch_counts["table"] += 1
                 elif src in (SOURCE_OK, SOURCE_NO_SEATS):
                     branch_counts["fallback"] += 1
             with progress_lock:
                 progress["n"] += 1
-                if (progress["n"] % progress_step == 0
-                        or progress["n"] == total):
-                    pct = 100 * progress["n"] / total
-                    log.info(
-                        "  progress: %d/%d (%d%%)  "
-                        "ok=%d  no_seats=%d  fetch_failed=%d",
-                        progress["n"], total, int(pct),
-                        counts[SOURCE_OK],
-                        counts[SOURCE_NO_SEATS],
-                        counts[SOURCE_FETCH_FAIL],
+                _maybe_log_progress(time.monotonic())
+                # Early-abort detection. Don't trip it on the first
+                # few failures (a transient blip is normal); wait
+                # until we have a clear signal.
+                if (not abort_flag["set"]
+                        and progress["n"] >= EARLY_ABORT_AFTER
+                        and counts[SOURCE_OK] == 0
+                        and counts[SOURCE_NO_SEATS] == 0):
+                    abort_flag["set"] = True
+                    remaining = total - progress["n"]
+                    log.warning("")
+                    log.warning(
+                        "EARLY ABORT: %d attempts, 0 successes. SeeTickets "
+                        "is blocking the proxy egress IPs (Akamai IP "
+                        "reputation). Skipping remaining %d perf(s).",
+                        progress["n"], remaining,
+                    )
+                    log.warning(
+                        "Likely cause: a prior burst flagged the shared "
+                        "Cloudflare Worker egress pool. Akamai's IP "
+                        "reputation typically clears within 1-24 hours. "
+                        "Try again later, or use a different proxy egress."
                     )
 
     elapsed = time.monotonic() - t0
