@@ -1,7 +1,8 @@
 import { SectionHead } from './Cheapest.jsx'
 import { formatPrice, sellerLabel } from '../lib/format.js'
+import { ShowLink } from '../lib/router.jsx'
 
-export default function CheapestTonight({ tonight, onSelectShow }) {
+export default function CheapestTonight({ tonight }) {
   if (!tonight || tonight.performances.length === 0) {
     return (
       <section className="stg-section">
@@ -33,15 +34,7 @@ export default function CheapestTonight({ tonight, onSelectShow }) {
 
       <div className="stg-tonight-grid">
         {/* The dark hero card — the single cheapest seat in London tonight */}
-        <div
-          className="stg-hero"
-          onClick={() => onSelectShow(hero.show.id)}
-          role="button"
-          tabIndex={0}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') onSelectShow(hero.show.id)
-          }}
-        >
+        <ShowLink id={hero.show.id} className="stg-hero">
           <div>
             <div className="stg-hero-eyebrow">
               TONIGHT&rsquo;S CHEAPEST{hero.perf.time && ` · ${hero.perf.time}`}
@@ -74,21 +67,15 @@ export default function CheapestTonight({ tonight, onSelectShow }) {
               )}
             </div>
           </div>
-        </div>
+        </ShowLink>
 
         {/* Compact list of next-cheapest performances tonight */}
         <div className="stg-alt-list">
           {alts.map((item) => (
-            <div
+            <ShowLink
               key={`${item.show.id}-${item.perf.time}`}
+              id={item.show.id}
               className="stg-alt"
-              onClick={() => onSelectShow(item.show.id)}
-              role="button"
-              tabIndex={0}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ')
-                  onSelectShow(item.show.id)
-              }}
             >
               <div className="stg-alt-body">
                 <div className="stg-alt-title">{item.show.title}</div>
@@ -101,7 +88,7 @@ export default function CheapestTonight({ tonight, onSelectShow }) {
               <div className="stg-alt-price">
                 {formatPrice(item.perf.minPrice)}
               </div>
-            </div>
+            </ShowLink>
           ))}
         </div>
       </div>
