@@ -428,6 +428,59 @@ def _seatplan_available(p: dict) -> bool | None:
     return None
 
 
+# OLT's data-cal (embedded in each show's detail page) lists every
+# perf with min/max/avail/bookable, but it lags real-time bookability
+# on the SeeTickets backend — perfs that the calendar reports as
+# `avail:true` can already be off-sale on the live event page. The
+# 22 May 2026 Beetlejuice perf at the Prince Edward was the canonical
+# case: data-cal said £83 available, the live page said "Tickets not
+# available" with the only tier flagged SoldOut.
+#
+# olt_availability.py fixes this by walking each live event page's
+# ticket-type table and writing verified_* fields back onto the perf.
+#
+# verified_price_source semantics (set by olt_availability.py):
+#   "ticketing_page" — verified successfully; trust verified_min_price
+#                      and verified_available
+#   "no_seats"       — page loaded but every tier is sold out → drop
+#                      OLT from cross-source min, mark not available
+#   "fetch_failed"   — network/HTTP failure → fall back to data-cal
+#   "skipped"        — perf wasn't checked → fall back to data-cal
+#   (missing field)  — availability pass never ran → fall back to data-cal
+def _olt_price_from(p: dict) -> float | None:
+    source = p.get("verified_price_source")
+    if source == "no_seats":
+        return None
+    verified = p.get("verified_min_price")
+    if verified is not None:
+        return verified
+    return p.get("min_price")
+
+
+def _olt_price_to(p: dict) -> float | None:
+    source = p.get("verified_price_source")
+    if source == "no_seats":
+        return None
+    verified = p.get("verified_max_price")
+    if verified is not None:
+        return verified
+    return p.get("max_price")
+
+
+def _olt_available(p: dict) -> bool | None:
+    source = p.get("verified_price_source")
+    if source == "no_seats":
+        return False
+    if source == "ticketing_page":
+        v = p.get("verified_available")
+        if v is not None:
+            return v
+    # No verified data (or fetch failed) — fall back to the data-cal
+    # flag. This carries the known stale-calendar risk but it's the
+    # best signal we have when the live page didn't respond.
+    return p.get("available")
+
+
 # Per-performance field extractors. Each source phrases dates/times/prices
 # differently; this normalizes to a canonical shape so we can join across
 # sources on (date, time).
@@ -529,11 +582,17 @@ PERF_SCHEMAS: dict[str, dict[str, Any]] = {
     "olt": {
         "date":       lambda p: p.get("date"),
         "time":       lambda p: p.get("time"),
-        "price_from": lambda p: p.get("min_price"),
-        "price_to":   lambda p: p.get("max_price"),
+        # Use the helpers defined above. The data-cal min_price/max_price
+        # written by olt_scraper.py is a calendar snapshot that lags
+        # real-time bookability; olt_availability.py overlays a per-perf
+        # check that consults the live ticket-type table. The helpers
+        # encapsulate the verified_price_source semantics — verified wins
+        # when present, data-cal is the documented fallback.
+        "price_from": _olt_price_from,
+        "price_to":   _olt_price_to,
         "currency":   lambda p: "GBP",
         "book_url":   lambda p: p.get("book_url"),
-        "available":  lambda p: p.get("available"),
+        "available":  _olt_available,
     },
     "lovetheatre": {
         "date":       lambda p: p.get("date"),
