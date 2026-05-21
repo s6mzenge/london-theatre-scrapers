@@ -2,12 +2,13 @@ import { useMemo, useState } from 'react'
 import { SectionHead } from './Cheapest.jsx'
 import DayDrill from './DayDrill.jsx'
 import { formatPrice } from '../lib/format.js'
+import { ShowLink } from '../lib/router.jsx'
 
 // Legend bar widths, in pixels, ramping cheapest → priciest. The same
 // width-by-bucket scale used inline on each calendar cell's tick.
 const LEGEND_WIDTHS = [30, 24, 18, 14, 10]
 
-export default function CheapestMonth({ month, onSelectShow }) {
+export default function CheapestMonth({ month }) {
   // Month default is "nothing selected" rather than today — this keeps
   // the calendar the visual centerpiece and avoids visually duplicating
   // the week strip's already-open today drill-down on first paint.
@@ -127,36 +128,36 @@ export default function CheapestMonth({ month, onSelectShow }) {
         <span className="stg-cal-legend-lbl">PRICIEST</span>
       </div>
 
-      {selectedDay && (
-        <DayDrill day={selectedDay} onSelectShow={onSelectShow} />
-      )}
+      {selectedDay && <DayDrill day={selectedDay} />}
 
-      {/* Three insight cards — the "interesting aggregations" */}
+      {/* Three insight cards — the "interesting aggregations". Cards
+          whose insight is tied to a specific show render as ShowLink
+          anchors so they get the full link UX (middle-click, cmd-click,
+          right-click → open in new tab). Cards without a showId stay
+          as plain divs. */}
       <div className="stg-insights">
-        {month.insights.map((ins, i) => (
-          <div
-            key={i}
-            className={`stg-insight ${ins.showId ? 'clickable' : ''}`}
-            onClick={() => {
-              if (ins.showId) onSelectShow(ins.showId)
-            }}
-            role={ins.showId ? 'button' : undefined}
-            tabIndex={ins.showId ? 0 : undefined}
-            onKeyDown={(e) => {
-              if (
-                ins.showId &&
-                (e.key === 'Enter' || e.key === ' ')
-              ) {
-                e.preventDefault()
-                onSelectShow(ins.showId)
-              }
-            }}
-          >
-            <div className="stg-insight-lbl">{ins.label}</div>
-            <div className="stg-insight-val">{ins.value}</div>
-            <div className="stg-insight-sub">{ins.sub}</div>
-          </div>
-        ))}
+        {month.insights.map((ins, i) => {
+          if (ins.showId) {
+            return (
+              <ShowLink
+                key={i}
+                id={ins.showId}
+                className="stg-insight clickable"
+              >
+                <div className="stg-insight-lbl">{ins.label}</div>
+                <div className="stg-insight-val">{ins.value}</div>
+                <div className="stg-insight-sub">{ins.sub}</div>
+              </ShowLink>
+            )
+          }
+          return (
+            <div key={i} className="stg-insight">
+              <div className="stg-insight-lbl">{ins.label}</div>
+              <div className="stg-insight-val">{ins.value}</div>
+              <div className="stg-insight-sub">{ins.sub}</div>
+            </div>
+          )
+        })}
       </div>
     </section>
   )
