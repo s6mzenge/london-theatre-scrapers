@@ -61,7 +61,7 @@ Each performance dict gets the following keys (mutated in place):
     seat_face_max_price     float | None   maximum face value
     seat_seats_available    int | None     number of seats in Performances
     seat_price_source       str            one of:
-        "bind_seat_plan"   — JSON parsed, PriceBands non-empty
+        "seat_plan"        — JSON parsed, PriceBands non-empty
         "no_legend"        — ResultCode=0 but PriceBands empty
                              (= off-sale / no inventory)
         "fetch_failed"     — HTTP error, redirect, or ResultCode != 0
@@ -171,7 +171,7 @@ DEFAULT_TIMEOUT_S = 25
 RETRY_TOTAL = 3
 RETRY_BACKOFF = 0.6
 
-SOURCE_OK = "bind_seat_plan"
+SOURCE_OK = "seat_plan"
 SOURCE_NO_LEGEND = "no_legend"
 SOURCE_FETCH_FAIL = "fetch_failed"
 SOURCE_SKIPPED = "skipped"
