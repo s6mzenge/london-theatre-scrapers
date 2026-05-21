@@ -5,7 +5,7 @@ import CheapestMonth from './CheapestMonth.jsx'
 import { todayISO, formatLongDate } from '../lib/dates.js'
 import { computeAggregations } from '../lib/data.js'
 
-export default function Cheapest({ data, onSelectShow }) {
+export default function Cheapest({ data }) {
   const today = todayISO()
   const agg = useMemo(() => computeAggregations(data, today), [data, today])
 
@@ -19,9 +19,9 @@ export default function Cheapest({ data, onSelectShow }) {
         <div className="stg-mast-date">{formatLongDate(today)}</div>
       </header>
 
-      <CheapestTonight tonight={agg.tonight} onSelectShow={onSelectShow} />
-      <CheapestWeek week={agg.week} onSelectShow={onSelectShow} />
-      <CheapestMonth month={agg.month} onSelectShow={onSelectShow} />
+      <CheapestTonight tonight={agg.tonight} />
+      <CheapestWeek week={agg.week} />
+      <CheapestMonth month={agg.month} />
     </div>
   )
 }
