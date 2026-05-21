@@ -187,6 +187,10 @@ jobs:
         env:
           OLT_PROXY_URL: ${{ secrets.OLT_PROXY_URL }}
           OLT_PROXY_TOKEN: ${{ secrets.OLT_PROXY_TOKEN }}
+          # Force line-buffered output so the time-based heartbeat
+          # surfaces in the CI log in real time instead of being
+          # block-buffered until the process exits.
+          PYTHONUNBUFFERED: "1"
         run: |
           python scraper/olt_availability.py \
             --in scraper/data/olt.json \
