@@ -1,16 +1,30 @@
+import { useMemo, useState } from 'react'
 import { SectionHead } from './Cheapest.jsx'
+import DayDrill from './DayDrill.jsx'
 import { formatPrice } from '../lib/format.js'
 
-const LEGEND_BUCKETS = [
-  'rgba(163, 50, 42, 0.55)',
-  'rgba(163, 50, 42, 0.32)',
-  'rgba(163, 50, 42, 0.18)',
-  'rgba(163, 50, 42, 0.08)',
-  'rgba(28, 26, 23, 0.03)',
-]
+// Legend bar widths, in pixels, ramping cheapest → priciest. The same
+// width-by-bucket scale used inline on each calendar cell's tick.
+const LEGEND_WIDTHS = [30, 24, 18, 14, 10]
 
 export default function CheapestMonth({ month, onSelectShow }) {
+  // Month default is "nothing selected" rather than today — this keeps
+  // the calendar the visual centerpiece and avoids visually duplicating
+  // the week strip's already-open today drill-down on first paint.
+  const [selectedIso, setSelectedIso] = useState(null)
+
+  // Flatten the week rows once so we can look up the selected cell by iso.
+  const flatCells = useMemo(
+    () => (month ? month.weeks.flat() : []),
+    [month],
+  )
+
   if (!month || !month.weeks.length) return null
+
+  const selectedDay =
+    selectedIso != null
+      ? flatCells.find((c) => !c.padding && c.iso === selectedIso) || null
+      : null
 
   return (
     <section className="stg-section">
@@ -25,7 +39,10 @@ export default function CheapestMonth({ month, onSelectShow }) {
         }
       />
 
-      {/* Calendar heatmap: 4–6 week rows × 7 day columns */}
+      {/* Calendar grid: hairline-divided cells (no full-cell fills).
+          Each non-dark, non-past cell renders a brick "tick" under
+          its price — width + opacity encode the bucket. Click any
+          future date to open its drill-down below. */}
       <div className="stg-cal">
         <div className="stg-cal-dow">MON</div>
         <div className="stg-cal-dow">TUE</div>
@@ -35,31 +52,63 @@ export default function CheapestMonth({ month, onSelectShow }) {
         <div className="stg-cal-dow">SAT</div>
         <div className="stg-cal-dow">SUN</div>
 
-        {month.weeks.flat().map((cell, idx) => {
+        {flatCells.map((cell, idx) => {
           if (cell.padding) {
             return <div key={`pad-${idx}`} className="stg-calcell padding" />
           }
+          const clickable = !cell.isPast && !cell.isDark
+          const isSelected = cell.iso === selectedIso
           const classes = [
             'stg-calcell',
-            cell.bucket != null ? `bucket-${cell.bucket + 1}` : '',
+            cell.bucket != null ? `bucket-${cell.bucket + 1}` : 'dark',
             cell.isPast ? 'past' : '',
             cell.isToday ? 'today' : '',
+            isSelected ? 'sel' : '',
+            clickable ? '' : 'nonclick',
           ]
             .filter(Boolean)
             .join(' ')
+
+          // Use a real <button> for clickable cells, a plain <div>
+          // for past/dark/padding so screen readers don't announce
+          // them as actionable.
+          if (clickable) {
+            return (
+              <button
+                key={cell.iso}
+                type="button"
+                className={classes}
+                onClick={() => setSelectedIso(cell.iso)}
+                aria-pressed={isSelected}
+                aria-label={`${cell.iso}: floor £${Math.round(cell.floor)}`}
+              >
+                <div className="stg-calcell-d">{cell.dayOfMonth}</div>
+                <div className="stg-calcell-foot">
+                  <div className="stg-calcell-p">
+                    {formatPrice(cell.floor, { whole: true })}
+                  </div>
+                  {cell.bucket != null && (
+                    <div
+                      className={`stg-calcell-tick bucket-${cell.bucket + 1}`}
+                    />
+                  )}
+                </div>
+              </button>
+            )
+          }
+
           return (
-            <div
-              key={cell.iso}
-              className={classes}
-              title={
-                cell.isDark
-                  ? 'No shows'
-                  : `Floor £${Math.round(cell.floor)} on ${cell.iso}`
-              }
-            >
+            <div key={cell.iso} className={classes}>
               <div className="stg-calcell-d">{cell.dayOfMonth}</div>
-              <div className="stg-calcell-p">
-                {cell.isDark ? '—' : formatPrice(cell.floor, { whole: true })}
+              <div className="stg-calcell-foot">
+                <div className="stg-calcell-p">
+                  {cell.isDark ? '—' : formatPrice(cell.floor, { whole: true })}
+                </div>
+                {cell.bucket != null && (
+                  <div
+                    className={`stg-calcell-tick bucket-${cell.bucket + 1}`}
+                  />
+                )}
               </div>
             </div>
           )
@@ -67,16 +116,20 @@ export default function CheapestMonth({ month, onSelectShow }) {
       </div>
 
       <div className="stg-cal-legend">
-        CHEAPEST
-        {LEGEND_BUCKETS.map((bg, i) => (
+        <span className="stg-cal-legend-lbl">CHEAPEST</span>
+        {LEGEND_WIDTHS.map((w, i) => (
           <span
             key={i}
-            className="stg-legend-dot"
-            style={{ background: bg }}
+            className={`stg-cal-legend-bar bucket-${i + 1}`}
+            style={{ width: `${w}px` }}
           />
         ))}
-        PRICIEST
+        <span className="stg-cal-legend-lbl">PRICIEST</span>
       </div>
+
+      {selectedDay && (
+        <DayDrill day={selectedDay} onSelectShow={onSelectShow} />
+      )}
 
       {/* Three insight cards — the "interesting aggregations" */}
       <div className="stg-insights">
@@ -89,6 +142,15 @@ export default function CheapestMonth({ month, onSelectShow }) {
             }}
             role={ins.showId ? 'button' : undefined}
             tabIndex={ins.showId ? 0 : undefined}
+            onKeyDown={(e) => {
+              if (
+                ins.showId &&
+                (e.key === 'Enter' || e.key === ' ')
+              ) {
+                e.preventDefault()
+                onSelectShow(ins.showId)
+              }
+            }}
           >
             <div className="stg-insight-lbl">{ins.label}</div>
             <div className="stg-insight-val">{ins.value}</div>
