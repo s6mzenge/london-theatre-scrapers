@@ -85,7 +85,31 @@ from threading import Lock
 
 import requests
 from requests.adapters import HTTPAdapter
+from urllib.parse import quote, urlsplit, urlunsplit
 from urllib3.util.retry import Retry
+
+
+def _ascii_safe_url(url: str) -> str:
+    """Re-encode URL path/query to be ASCII-safe for HTTP transmission.
+
+    The TTD scraper stores show URLs with raw Unicode characters in the
+    path — e.g. *A Midsummer Night's Dream* contains U+2019 (right
+    single quotation mark), and several show titles contain U+2013
+    (en-dash). HTTP/1.1 request lines must be Latin-1 encodable, so
+    `requests` throws 'latin-1 codec can't encode character' when
+    handed these URLs directly, killing the worker before the warmup
+    GET completes. Percent-encoding the path fixes it.
+    """
+    if not url:
+        return url
+    parts = urlsplit(url)
+    return urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        quote(parts.path, safe="/-_.~%"),  # safe= keeps existing %-encoding intact
+        quote(parts.query, safe="=&%"),
+        parts.fragment,
+    ))
 
 # ---------------------------------------------------------------------------
 # Config
@@ -289,7 +313,7 @@ def verify_one_show(
               SOURCE_FETCH_FAIL: 0, SOURCE_SKIPPED: 0}
 
     show_id = show.get("id")
-    show_url = show.get("url") or show.get("detail_canonical")
+    show_url = _ascii_safe_url(show.get("url") or show.get("detail_canonical"))
     perfs = show.get("performances") or []
 
     if not isinstance(show_id, int) or not show_url or not perfs:
