@@ -1,11 +1,12 @@
 import { useState, useMemo } from 'react'
 import { formatPrice } from '../lib/format.js'
+import { ShowLink } from '../lib/router.jsx'
 
 // Search is the title/venue lookup tab. Filter input + three sort modes.
 // Designed as the bare-minimum useful version; richer faceting (genre,
 // price band, run-length filters) blocks on Tier 2 plumbing.
 
-export default function Search({ data, onSelectShow }) {
+export default function Search({ data }) {
   const [query, setQuery] = useState('')
   const [sortBy, setSortBy] = useState('title')
 
@@ -77,15 +78,10 @@ export default function Search({ data, onSelectShow }) {
 
       <div className="stg-search-results">
         {filtered.map((show) => (
-          <div
+          <ShowLink
             key={show.id}
+            id={show.id}
             className="stg-search-row"
-            onClick={() => onSelectShow(show.id)}
-            role="button"
-            tabIndex={0}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') onSelectShow(show.id)
-            }}
           >
             <div className="stg-search-row-body">
               <div className="stg-search-row-title">{show.title}</div>
@@ -106,7 +102,7 @@ export default function Search({ data, onSelectShow }) {
                 <span className="stg-search-row-from">PRICE TBC</span>
               )}
             </div>
-          </div>
+          </ShowLink>
         ))}
         {filtered.length === 0 && (
           <div className="stg-empty">
