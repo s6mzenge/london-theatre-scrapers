@@ -6,12 +6,17 @@ import Search from './components/Search.jsx'
 import Sellers from './components/Sellers.jsx'
 import ShowDetail from './components/ShowDetail.jsx'
 import { loadUnifiedData } from './lib/data.js'
+import { useRoute, navigate } from './lib/router.jsx'
 
 const CURTAIN_KEY = 'stg-curtain-seen'
 
 export default function App() {
-  const [view, setView] = useState('cheapest')
-  const [selectedShowId, setSelectedShowId] = useState(null)
+  // The URL is now the source of truth for "what page am I on". Tab
+  // switches and show-detail entry/exit all go through navigate(),
+  // which updates the URL and re-renders the tree below. Previously
+  // this was a useState pair (`view` + `selectedShowId`); the route
+  // object replaces both.
+  const route = useRoute()
   const [data, setData] = useState(null)
   const [loadError, setLoadError] = useState(null)
 
@@ -51,32 +56,30 @@ export default function App() {
     setCurtainVisible(false)
   }, [])
 
+  // Show-detail entry pushes /shows/:id and scrolls to top, matching
+  // the previous behaviour. Tab changes don't scroll. Browser back /
+  // forward restore scroll position automatically (they go through
+  // popstate, which navigate() doesn't trigger).
   const handleSelectShow = useCallback((id) => {
-    setSelectedShowId(id)
-    window.scrollTo({ top: 0, behavior: 'auto' })
+    navigate(`/shows/${encodeURIComponent(id)}`, { scroll: true })
   }, [])
 
-  const handleBack = useCallback(() => setSelectedShowId(null), [])
-
-  const handleChangeView = useCallback((v) => {
-    setView(v)
-    setSelectedShowId(null)
-  }, [])
+  // "← BACK" from a show detail walks the browser history rather than
+  // navigating to a fixed URL. That way the user lands wherever they
+  // came from (Cheapest, Shows catalogue, Sellers, a different show)
+  // with their scroll position restored.
+  const handleBack = useCallback(() => window.history.back(), [])
 
   const selectedShow =
-    data && selectedShowId
-      ? data.shows.find((s) => s.id === selectedShowId) || null
+    data && route.name === 'show'
+      ? data.shows.find((s) => s.id === route.id) || null
       : null
 
   return (
     <div className="stg-app">
       {curtainVisible && <Curtain onComplete={handleCurtainDone} />}
 
-      <Sidebar
-        activeView={view}
-        onChangeView={handleChangeView}
-        lastScrapedAt={data?.generated_at}
-      />
+      <Sidebar activeRoute={route} lastScrapedAt={data?.generated_at} />
 
       <main className="stg-main">
         {loadError && (
@@ -98,19 +101,36 @@ export default function App() {
           </div>
         )}
 
-        {data && selectedShow && (
+        {data && route.name === 'show' && selectedShow && (
           <ShowDetail show={selectedShow} onBack={handleBack} />
         )}
 
-        {data && !selectedShow && view === 'cheapest' && (
+        {/* Show URL points at an id we don't have — past run, bad link,
+            data refreshed mid-session. We render a small not-found
+            state so the user sees something instead of falling through
+            to whichever component happens to match next. */}
+        {data && route.name === 'show' && !selectedShow && (
+          <div className="stg-state">
+            <div className="stg-state-eyebrow">SHOW NOT FOUND</div>
+            <div className="stg-state-msg">
+              No show with id <b>{route.id}</b> in the current catalogue.
+            </div>
+            <div className="stg-state-hint">
+              It may have finished its run, or the link may be out of
+              date. Try the SHOWS tab for what's on.
+            </div>
+          </div>
+        )}
+
+        {data && route.name === 'cheapest' && (
           <Cheapest data={data} onSelectShow={handleSelectShow} />
         )}
 
-        {data && !selectedShow && view === 'search' && (
+        {data && route.name === 'shows' && (
           <Search data={data} onSelectShow={handleSelectShow} />
         )}
 
-        {data && !selectedShow && view === 'sellers' && (
+        {data && route.name === 'sellers' && (
           <Sellers data={data} onSelectShow={handleSelectShow} />
         )}
       </main>
