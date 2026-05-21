@@ -1303,97 +1303,443 @@ a {
   margin-bottom: 0;
 }
 
-.stg-show-grid-wrap {
-  overflow-x: auto;
-  border: 0.5px solid var(--line-soft);
-  border-radius: 3px;
-  background: var(--color-paper-warm);
+/* ==========================================================================
+   SHOW DETAIL — scoreboard, show-scoped calendar, per-date drill-down
+   Replaces the old date×seller table. Visual language is shared with
+   the homepage calendar so "click a date to see the breakdown" reads
+   as the same UX, just scoped to one show's run.
+   ========================================================================== */
+
+.stg-show-section {
+  /* The section already has margin-bottom from .stg-section. We want a
+     bit more visual breathing room than the home page between scoreboard
+     → calendar → drill-down, since this page has more distinct blocks. */
+  margin-top: var(--section-gap);
 }
 
-.stg-show-grid {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12px;
+/* -- Scoreboard ---------------------------------------------------- */
+
+.stg-show-scoreboard {
+  display: flex;
+  flex-direction: column;
 }
 
-.stg-show-grid thead {
-  background: var(--color-ink);
-  color: var(--color-paper);
+.stg-sb-row {
+  display: grid;
+  grid-template-columns: 130px 1fr 170px;
+  gap: 16px;
+  align-items: center;
+  padding: 9px 0;
+  border-top: 0.5px solid rgba(28, 26, 23, 0.06);
 }
 
-.stg-show-grid th {
-  padding: 12px 10px;
-  text-align: left;
+.stg-sb-row:first-child {
+  border-top: 0;
+}
+
+.stg-sb-seller {
   font-family: var(--font-slab);
-  font-size: 9px;
-  letter-spacing: 1.8px;
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  color: var(--color-ink);
   font-weight: 500;
 }
 
-.stg-show-grid-h-date {
-  width: 100px;
+.stg-sb-row.fade .stg-sb-seller {
+  color: var(--color-text-faint);
+  font-weight: 400;
 }
 
-.stg-show-grid-h-time {
-  width: 70px;
+.stg-sb-bar-wrap {
+  height: 10px;
+  background: rgba(28, 26, 23, 0.04);
+  position: relative;
 }
 
-.stg-show-grid-h-seller {
-  text-align: center !important;
+.stg-sb-bar {
+  height: 100%;
+  background: rgba(163, 50, 42, 0.75);
 }
 
-.stg-show-grid-row {
-  border-top: 0.5px solid var(--line-faint);
-  transition: background 0.15s;
+.stg-sb-bar.zero {
+  /* Non-winning sellers still get a nub so the row has a visual anchor.
+     4px is wide enough to read as "present but zero", not "the bar
+     fell off the layout". */
+  background: rgba(28, 26, 23, 0.10);
+  width: 4px;
 }
 
-.stg-show-grid-row:hover {
-  background: rgba(163, 50, 42, 0.04);
-}
-
-.stg-show-grid-c-date {
-  padding: 10px;
+.stg-sb-meta {
   font-family: var(--font-slab);
-  font-size: 11px;
-  color: var(--color-ink);
-  white-space: nowrap;
-}
-
-.stg-show-grid-c-time {
-  padding: 10px;
-  font-family: var(--font-display);
-  font-size: 13px;
-  color: var(--color-ink);
-}
-
-.stg-show-grid-c-cell {
-  padding: 10px;
-  text-align: center;
-  font-family: var(--font-display);
-  font-size: 13px;
+  font-size: 10px;
+  letter-spacing: 0.8px;
   color: var(--color-text-muted);
+  text-align: right;
 }
 
-.stg-show-grid-c-cell.empty {
+.stg-sb-meta b {
+  font-family: var(--font-display);
+  font-size: 13px;
+  color: var(--color-ink);
+  font-weight: 400;
+  letter-spacing: 0;
+  margin: 0 1px;
+}
+
+.stg-sb-meta.dim {
   color: var(--color-text-faint);
 }
 
-.stg-show-grid-c-cell.cheapest {
-  background: rgba(163, 50, 42, 0.12);
-  color: var(--color-brick);
-  font-size: 15px;
+.stg-sb-meta.dim b {
+  color: var(--color-text-muted);
 }
 
-.stg-show-grid-c-link {
-  display: block;
-  padding: 4px 6px;
+/* -- Performances section: 1+ stacked month calendars -------------- */
+
+.stg-show-runlabel {
+  /* Override .stg-section-stat's brick Bodoni — the run dates aren't a
+     headline price, they're a date range, so slab caps reads better. */
+  font-family: var(--font-slab);
+  font-size: 13px;
+  color: var(--color-ink);
+  letter-spacing: 1.5px;
+}
+
+.stg-show-cal-block + .stg-show-cal-block {
+  margin-top: 24px;
+}
+
+.stg-show-cal-label {
+  font-family: var(--font-slab);
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: var(--color-text-muted);
+  margin-bottom: 8px;
+}
+
+.stg-show-cal {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  border-top: 0.5px solid var(--line-soft);
+  border-left: 0.5px solid var(--line-faint);
+}
+
+.stg-show-cal-dow {
+  font-family: var(--font-slab);
+  font-size: 9px;
+  letter-spacing: 2px;
+  color: var(--color-text-muted);
+  text-align: center;
+  padding: 9px 0;
+  border-right: 0.5px solid var(--line-faint);
+  border-bottom: 0.5px solid var(--line-faint);
+}
+
+.stg-show-cal-c {
+  /* Button reset for clickable cells (harmless on div cells). */
+  font: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-right: 0.5px solid var(--line-faint);
+  border-bottom: 0.5px solid var(--line-faint);
+  /* Layout */
+  min-height: 70px;
+  padding: 7px 9px 8px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  position: relative;
+  cursor: pointer;
+  transition: background 0.15s;
+  color: inherit;
+}
+
+.stg-show-cal-c.padding,
+.stg-show-cal-c.past,
+.stg-show-cal-c.dark,
+.stg-show-cal-c.nonclick {
+  cursor: default;
+}
+
+/* "Dark" = a day inside the run-window with no performance scheduled.
+   Show the day number but ghost it; nothing to click. */
+.stg-show-cal-c.dark .stg-show-cal-d {
+  color: rgba(28, 26, 23, 0.32);
+}
+
+.stg-show-cal-c.past .stg-show-cal-d,
+.stg-show-cal-c.past .stg-show-cal-p,
+.stg-show-cal-c.past .stg-show-cal-times {
+  color: rgba(28, 26, 23, 0.28);
+}
+
+.stg-show-cal-c.perf:not(.past):not(.nonclick):hover:not(.sel) {
+  background: rgba(28, 26, 23, 0.025);
+}
+
+.stg-show-cal-c.sel {
+  background: var(--color-paper-warm);
+}
+
+.stg-show-cal-c.today::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 8px;
+  right: 8px;
+  height: 2px;
+  background: var(--color-ink);
+}
+
+.stg-show-cal-c:focus-visible {
+  outline: 2px solid var(--color-brick);
+  outline-offset: -2px;
+}
+
+.stg-show-cal-d {
+  font-family: var(--font-display);
+  font-size: 16px;
+  color: var(--color-ink);
+  line-height: 1;
+}
+
+.stg-show-cal-p {
+  font-family: var(--font-display);
+  font-size: 13px;
+  color: var(--color-ink);
+  line-height: 1;
+}
+
+.stg-show-cal-times {
+  font-family: var(--font-slab);
+  font-size: 8px;
+  letter-spacing: 0.5px;
+  color: var(--color-text-faint);
+  margin-top: 3px;
+}
+
+/* -- Drill-down panel: per-performance price-spread strips --------- */
+
+.stg-show-drill {
+  background: var(--color-paper-warm);
+  padding: 14px 22px 22px;
+  border-left: 0.5px solid var(--line-soft);
+  border-right: 0.5px solid var(--line-soft);
+  border-bottom: 0.5px solid var(--line-soft);
+  margin-bottom: var(--section-gap);
+}
+
+.stg-show-drill-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding-bottom: 10px;
+  border-bottom: 0.5px solid var(--line-faint);
+}
+
+.stg-show-drill-eye {
+  font-family: var(--font-slab);
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: var(--color-text-muted);
+}
+
+.stg-show-drill-eye b {
+  color: var(--color-ink);
+  font-weight: 500;
+}
+
+.stg-show-drill-r-lbl {
+  font-family: var(--font-slab);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: var(--color-text-faint);
+}
+
+.stg-show-perf {
+  padding: 16px 0 14px;
+  border-top: 0.5px dashed rgba(28, 26, 23, 0.08);
+}
+
+.stg-show-perf:first-of-type {
+  border-top: 0;
+}
+
+.stg-show-perf-top {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.stg-show-perf-time {
+  font-family: var(--font-display);
+  font-size: 24px;
+  line-height: 1;
+  color: var(--color-ink);
+  min-width: 64px;
+}
+
+.stg-show-perf-floor {
+  font-family: var(--font-slab);
+  font-size: 10px;
+  letter-spacing: 1.4px;
+  color: var(--color-text-muted);
+}
+
+.stg-show-perf-floor b {
+  font-family: var(--font-display);
+  font-size: 19px;
+  letter-spacing: 0;
+  color: var(--color-brick);
+  font-weight: 400;
+  margin: 0 4px 0 6px;
+}
+
+.stg-show-perf-via {
+  font-weight: 500;
+  color: var(--color-ink);
+}
+
+.stg-show-perf-book {
+  margin-left: auto;
+  font-family: var(--font-slab);
+  font-size: 9px;
+  letter-spacing: 1.8px;
+  color: var(--color-brick);
+  text-decoration: none;
+  padding: 5px 11px;
+  border: 0.5px solid rgba(163, 50, 42, 0.4);
   border-radius: 2px;
+  cursor: pointer;
   transition: background 0.15s;
 }
 
-.stg-show-grid-c-link:hover {
-  background: rgba(163, 50, 42, 0.15);
-  text-decoration: underline;
+.stg-show-perf-book:hover {
+  background: rgba(163, 50, 42, 0.08);
+}
+
+/* Spread strip: horizontal axis with seller dots positioned by price.
+   The axis spans show-min → show-max, so the cheapest is always at
+   left:0% and the priciest at left:100% — spreads are comparable
+   across performances. */
+.stg-show-spread {
+  position: relative;
+  height: 44px;
+  margin-left: 78px;
+  margin-right: 18px;
+}
+
+.stg-show-spread-axis {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 18px;
+  height: 1px;
+  background: var(--line-soft);
+}
+
+.stg-show-spread-tick {
+  position: absolute;
+  top: 18px;
+  transform: translate(-50%, -50%);
+  /* The tick itself is the clickable area; the inner dot + label
+     are visual. */
+  text-decoration: none;
+  color: inherit;
+}
+
+.stg-show-spread-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: transparent;
+  border: 1px solid var(--color-ink);
+  display: block;
+  transition: transform 0.15s;
+}
+
+.stg-show-spread-tick.cheap {
+  z-index: 2;
+}
+
+.stg-show-spread-tick.cheap .stg-show-spread-dot {
+  background: var(--color-brick);
+  border-color: var(--color-brick);
+  width: 11px;
+  height: 11px;
+}
+
+.stg-show-spread-tick:hover .stg-show-spread-dot {
+  transform: scale(1.25);
+}
+
+.stg-show-spread-lbl {
+  position: absolute;
+  top: 14px;
+  transform: translateX(-50%);
+  text-align: center;
+  white-space: nowrap;
+}
+
+.stg-show-spread-price {
+  font-family: var(--font-display);
+  font-size: 12px;
+  color: var(--color-ink);
+  display: block;
+  line-height: 1;
+}
+
+.stg-show-spread-tick.cheap .stg-show-spread-price {
+  color: var(--color-brick);
+  font-size: 14px;
+}
+
+.stg-show-spread-seller {
+  font-family: var(--font-slab);
+  font-size: 7.5px;
+  letter-spacing: 0.8px;
+  color: var(--color-text-faint);
+  display: block;
+  margin-top: 3px;
+  text-transform: uppercase;
+}
+
+.stg-show-spread-tick.cheap .stg-show-spread-seller {
+  color: var(--color-ink);
+}
+
+/* Solo: a performance with only one seller listed — there's nothing
+   to compare against, so we skip the axis and show an honest editorial
+   line. Avoids a single lonely dot floating on an empty axis. */
+.stg-show-solo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: 78px;
+  margin-bottom: 8px;
+  font-family: var(--font-slab);
+  font-size: 11px;
+  color: var(--color-text-muted);
+  font-style: italic;
+  letter-spacing: 0.3px;
+}
+
+.stg-show-solo-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--color-brick);
+  flex-shrink: 0;
+}
+
+.stg-show-solo-price {
+  font-family: var(--font-display);
+  font-size: 14px;
+  color: var(--color-brick);
+  font-style: normal;
+  margin-left: 2px;
 }
 
 /* ==========================================================================
