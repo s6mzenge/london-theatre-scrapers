@@ -487,36 +487,54 @@ a {
 .stg-weekstrip {
   display: grid;
   grid-template-columns: repeat(7, 1fr);
-  gap: 6px;
-  margin-bottom: 22px;
+  border-top: 0.5px solid var(--line-soft);
+  border-bottom: 0.5px solid var(--line-soft);
+  background: rgba(28, 26, 23, 0.01);
 }
 
 .stg-weekcell {
-  padding: 12px 8px;
-  border-radius: 3px;
+  /* Button reset — these were spans/divs before and are now buttons */
+  font: inherit;
   text-align: center;
-  cursor: default;
+  background: transparent;
+  border: 0;
+  /* Layout */
+  padding: 14px 6px 0;
+  border-right: 0.5px solid var(--line-faint);
   position: relative;
-  min-height: 78px;
+  min-height: 100px;
   display: flex;
   flex-direction: column;
-  justify-content: space-between;
-  outline: 0.5px solid var(--line-faint);
-  transition: outline 0.15s;
+  justify-content: flex-start;
+  cursor: pointer;
+  transition: background 0.15s;
 }
 
-.stg-weekcell:hover {
-  outline: 1px solid rgba(163, 50, 42, 0.6);
+.stg-weekcell:last-child {
+  border-right: 0;
 }
 
-.stg-weekcell.bucket-1 { background: rgba(163, 50, 42, 0.55); }
-.stg-weekcell.bucket-2 { background: rgba(163, 50, 42, 0.32); }
-.stg-weekcell.bucket-3 { background: rgba(163, 50, 42, 0.18); }
-.stg-weekcell.bucket-4 { background: rgba(163, 50, 42, 0.08); }
-.stg-weekcell.bucket-5 { background: rgba(28, 26, 23, 0.03); }
+.stg-weekcell:hover:not(.sel) {
+  background: rgba(28, 26, 23, 0.025);
+}
 
-.stg-weekcell.today {
-  outline: 1.5px solid var(--color-ink);
+.stg-weekcell.sel {
+  background: var(--color-paper-warm);
+}
+
+.stg-weekcell.today::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 10px;
+  right: 10px;
+  height: 2px;
+  background: var(--color-ink);
+}
+
+.stg-weekcell:focus-visible {
+  outline: 2px solid var(--color-brick);
+  outline-offset: -2px;
 }
 
 .stg-weekcell-top {
@@ -527,46 +545,193 @@ a {
 
 .stg-weekcell-dow {
   font-family: var(--font-slab);
-  font-size: 9px;
+  font-size: 10px;
   letter-spacing: 2px;
-  color: var(--color-ink);
+  color: var(--color-text-muted);
 }
 
 .stg-weekcell-d {
   font-family: var(--font-display);
-  font-size: 18px;
-  color: var(--color-ink);
-  line-height: 1;
-  margin-top: 2px;
-}
-
-.stg-weekcell.bucket-1 .stg-weekcell-dow,
-.stg-weekcell.bucket-1 .stg-weekcell-d {
-  color: var(--color-paper);
-}
-
-.stg-weekcell-price {
-  font-family: var(--font-display);
-  font-size: 14px;
+  font-size: 30px;
   color: var(--color-ink);
   line-height: 1;
   margin-top: 4px;
 }
 
-.stg-weekcell.bucket-1 .stg-weekcell-price {
-  color: var(--color-paper);
+.stg-weekcell-bottom {
+  margin-top: auto;
+}
+
+.stg-weekcell-price {
+  font-family: var(--font-display);
+  font-size: 15px;
+  color: var(--color-ink);
+  line-height: 1;
+}
+
+.stg-weekcell.dark .stg-weekcell-price {
+  color: var(--color-text-faint);
 }
 
 .stg-weekcell-lbl {
   font-family: var(--font-sans);
-  font-size: 7px;
+  font-size: 8.5px;
   letter-spacing: 1.3px;
-  color: rgba(28, 26, 23, 0.55);
-  margin-top: 1px;
+  color: var(--color-text-faint);
+  margin-top: 4px;
+  text-transform: uppercase;
 }
 
-.stg-weekcell.bucket-1 .stg-weekcell-lbl {
-  color: rgba(236, 230, 214, 0.7);
+/* Heatmap bar — sits at the bottom of every cell. Width is constant,
+   colour intensity encodes the bucket. The selected cell gets a
+   thicker bar so the active row stands out without changing the
+   bucket signal. */
+.stg-weekcell-bar {
+  height: 3px;
+  margin: 10px 10px 0;
+  background: rgba(28, 26, 23, 0.08);
+}
+
+.stg-weekcell.bucket-1 .stg-weekcell-bar { background: rgba(163, 50, 42, 0.85); }
+.stg-weekcell.bucket-2 .stg-weekcell-bar { background: rgba(163, 50, 42, 0.55); }
+.stg-weekcell.bucket-3 .stg-weekcell-bar { background: rgba(163, 50, 42, 0.32); }
+.stg-weekcell.bucket-4 .stg-weekcell-bar { background: rgba(163, 50, 42, 0.18); }
+.stg-weekcell.bucket-5 .stg-weekcell-bar { background: rgba(28, 26, 23, 0.10); }
+.stg-weekcell.dark .stg-weekcell-bar { background: transparent; }
+
+.stg-weekcell.sel .stg-weekcell-bar {
+  height: 5px;
+  margin: 8px 8px 0;
+}
+
+/* ==========================================================================
+   Per-day drill-down panel — shared by week strip and month calendar.
+   Sits flush below either grid; its warm-paper fill ties it to the
+   selected (also warm-paper) cell above.
+   ========================================================================== */
+
+.stg-day-drill {
+  background: var(--color-paper-warm);
+  padding: 14px 22px 18px;
+  border-left: 0.5px solid var(--line-soft);
+  border-right: 0.5px solid var(--line-soft);
+  border-bottom: 0.5px solid var(--line-soft);
+  margin-bottom: 22px;
+}
+
+.stg-day-drill-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding-bottom: 10px;
+  border-bottom: 0.5px solid var(--line-faint);
+}
+
+.stg-day-drill-eye {
+  font-family: var(--font-slab);
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: var(--color-text-muted);
+}
+
+.stg-day-drill-eye b {
+  color: var(--color-ink);
+  font-weight: 500;
+}
+
+.stg-day-drill-r-lbl {
+  font-family: var(--font-slab);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: var(--color-text-faint);
+}
+
+.stg-day-drill-row {
+  display: grid;
+  grid-template-columns: 26px 1fr auto auto;
+  gap: 14px;
+  align-items: baseline;
+  padding: 11px 0 10px;
+  border-top: 0.5px solid rgba(28, 26, 23, 0.06);
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+.stg-day-drill-row:first-of-type {
+  border-top: 0;
+  padding-top: 14px;
+}
+
+.stg-day-drill-row:hover .stg-day-drill-title,
+.stg-day-drill-row:focus-visible .stg-day-drill-title {
+  color: var(--color-brick);
+}
+
+.stg-day-drill-row:focus-visible {
+  outline: 2px solid var(--color-brick);
+  outline-offset: 2px;
+}
+
+.stg-day-drill-rank {
+  font-family: var(--font-slab);
+  font-size: 11px;
+  color: var(--color-text-faint);
+  letter-spacing: 1.2px;
+}
+
+.stg-day-drill-body {
+  min-width: 0;
+}
+
+.stg-day-drill-title {
+  font-family: var(--font-shout);
+  font-weight: 400;
+  font-size: 17px;
+  letter-spacing: 0.5px;
+  color: var(--color-ink);
+  line-height: 1.1;
+  transition: color 0.15s;
+}
+
+.stg-day-drill-meta {
+  font-family: var(--font-slab);
+  font-size: 10px;
+  color: var(--color-text-muted);
+  margin-top: 4px;
+  letter-spacing: 0.3px;
+}
+
+.stg-day-drill-vs {
+  font-family: var(--font-sans);
+  font-size: 9px;
+  color: var(--color-text-faint);
+  letter-spacing: 0.8px;
+  text-align: right;
+  line-height: 1.4;
+  text-transform: uppercase;
+  min-width: 90px;
+}
+
+.stg-day-drill-vs b {
+  font-family: var(--font-display);
+  font-size: 12px;
+  color: var(--color-ink);
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.stg-day-drill-price {
+  font-family: var(--font-display);
+  font-size: 18px;
+  color: var(--color-brick);
+}
+
+.stg-day-drill-empty {
+  padding: 16px 0;
+  font-style: italic;
+  color: var(--color-text-faint);
+  text-align: center;
 }
 
 .stg-bestshows {
@@ -647,8 +812,9 @@ a {
 .stg-cal {
   display: grid;
   grid-template-columns: repeat(7, 1fr);
-  gap: 4px;
-  margin-bottom: 8px;
+  border-top: 0.5px solid var(--line-soft);
+  border-left: 0.5px solid var(--line-faint);
+  margin-bottom: 0;
 }
 
 .stg-cal-dow {
@@ -657,88 +823,127 @@ a {
   letter-spacing: 2px;
   color: var(--color-text-muted);
   text-align: center;
-  padding: 4px 0 8px;
+  padding: 9px 0;
+  border-right: 0.5px solid var(--line-faint);
+  border-bottom: 0.5px solid var(--line-faint);
 }
 
 .stg-calcell {
-  padding: 9px 6px 7px;
-  border-radius: 3px;
-  text-align: center;
-  min-height: 56px;
+  /* Button reset for clickable cells; harmless on div cells */
+  font: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  /* Grid lines via right + bottom; container draws top + left */
+  border-right: 0.5px solid var(--line-faint);
+  border-bottom: 0.5px solid var(--line-faint);
+  /* Layout */
+  min-height: 62px;
+  padding: 7px 8px 8px;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  outline: 0.5px solid var(--line-faint);
-  cursor: default;
-  transition: outline 0.15s;
+  position: relative;
+  cursor: pointer;
+  transition: background 0.15s;
+  color: inherit;
 }
 
-.stg-calcell:hover:not(.past):not(.padding) {
-  outline: 1px solid rgba(163, 50, 42, 0.6);
+.stg-calcell.padding,
+.stg-calcell.past,
+.stg-calcell.nonclick {
+  cursor: default;
 }
 
 .stg-calcell.padding {
+  /* Padding cells still draw the grid lines so the row is uniform */
   background: transparent;
-  outline: none;
 }
 
-.stg-calcell.past {
-  opacity: 0.32;
-  background: rgba(28, 26, 23, 0.03);
+.stg-calcell.past .stg-calcell-d,
+.stg-calcell.past .stg-calcell-p {
+  color: rgba(28, 26, 23, 0.30);
 }
 
-.stg-calcell.bucket-1 { background: rgba(163, 50, 42, 0.55); }
-.stg-calcell.bucket-2 { background: rgba(163, 50, 42, 0.32); }
-.stg-calcell.bucket-3 { background: rgba(163, 50, 42, 0.18); }
-.stg-calcell.bucket-4 { background: rgba(163, 50, 42, 0.08); }
-.stg-calcell.bucket-5 { background: rgba(28, 26, 23, 0.03); }
+.stg-calcell:not(.padding):not(.past):not(.nonclick):hover:not(.sel) {
+  background: rgba(28, 26, 23, 0.025);
+}
 
-.stg-calcell.today {
-  outline: 2px solid var(--color-ink);
+.stg-calcell.sel {
+  background: var(--color-paper-warm);
+}
+
+.stg-calcell.today::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 8px;
+  right: 8px;
+  height: 2px;
+  background: var(--color-ink);
+}
+
+.stg-calcell:focus-visible {
+  outline: 2px solid var(--color-brick);
+  outline-offset: -2px;
 }
 
 .stg-calcell-d {
   font-family: var(--font-display);
-  font-size: 14px;
+  font-size: 15px;
   color: var(--color-ink);
   line-height: 1;
 }
 
-.stg-calcell.bucket-1 .stg-calcell-d {
-  color: var(--color-paper);
+.stg-calcell-foot {
+  /* Wraps price + tick at the bottom of the cell */
 }
 
 .stg-calcell-p {
   font-family: var(--font-display);
-  font-size: 11px;
+  font-size: 13px;
   color: var(--color-ink);
   line-height: 1;
-  opacity: 0.85;
 }
 
-.stg-calcell.bucket-1 .stg-calcell-p {
-  color: var(--color-paper);
-  opacity: 1;
+.stg-calcell-tick {
+  height: 2px;
+  margin-top: 5px;
+  background: rgba(28, 26, 23, 0.08);
+  width: 10px; /* default; bucket classes override */
 }
+
+.stg-calcell-tick.bucket-1 { background: rgba(163, 50, 42, 0.85); width: 30px; }
+.stg-calcell-tick.bucket-2 { background: rgba(163, 50, 42, 0.55); width: 24px; }
+.stg-calcell-tick.bucket-3 { background: rgba(163, 50, 42, 0.32); width: 18px; }
+.stg-calcell-tick.bucket-4 { background: rgba(163, 50, 42, 0.18); width: 14px; }
+.stg-calcell-tick.bucket-5 { background: rgba(28, 26, 23, 0.10); width: 10px; }
 
 .stg-cal-legend {
   display: flex;
-  gap: 12px;
-  justify-content: flex-end;
-  margin-top: 4px;
-  font-family: var(--font-sans);
-  font-size: 9px;
-  color: var(--color-text-muted);
-  letter-spacing: 0.5px;
+  gap: 10px;
   align-items: center;
+  justify-content: flex-end;
+  margin: 12px 0 22px;
+  font-family: var(--font-slab);
+  font-size: 9px;
+  letter-spacing: 1.8px;
 }
 
-.stg-legend-dot {
-  display: inline-block;
-  width: 12px;
-  height: 12px;
-  border-radius: 2px;
+.stg-cal-legend-lbl {
+  color: var(--color-text-faint);
 }
+
+.stg-cal-legend-bar {
+  display: inline-block;
+  height: 2px;
+}
+
+.stg-cal-legend-bar.bucket-1 { background: rgba(163, 50, 42, 0.85); }
+.stg-cal-legend-bar.bucket-2 { background: rgba(163, 50, 42, 0.55); }
+.stg-cal-legend-bar.bucket-3 { background: rgba(163, 50, 42, 0.32); }
+.stg-cal-legend-bar.bucket-4 { background: rgba(163, 50, 42, 0.18); }
+.stg-cal-legend-bar.bucket-5 { background: rgba(28, 26, 23, 0.10); }
 
 .stg-insights {
   display: grid;
