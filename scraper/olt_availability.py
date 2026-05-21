@@ -86,11 +86,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 
@@ -145,9 +146,60 @@ log = logging.getLogger("olt-avail")
 # ---------------------------------------------------------------------------
 # HTTP session
 # ---------------------------------------------------------------------------
+#
+# SeeTickets event pages sit behind Akamai bot mitigation that 403s
+# requests from cloud-CI IP ranges (Azure-hosted GitHub Actions runners
+# are blocklisted). To get past it, we route every request through the
+# same Cloudflare Worker that olt_scraper.py uses for the parent
+# officiallondontheatre.com site — a fetch-and-forward proxy living on
+# clean IPs that Akamai trusts.
+#
+# Wire protocol: instead of the path-rewriting trick olt_scraper.py uses
+# (only good for one fixed origin), we pass the full target URL as a
+# request header. The Worker reads `X-Proxy-Target`, fetches that URL,
+# and streams the response back. The auth header is the same
+# `X-Proxy-Auth: <token>` the existing proxy expects.
+#
+# If proxy-url isn't configured we fall back to direct fetches — fine
+# for local development on a residential IP, broken in CI.
 
-def build_session(pool_size: int) -> requests.Session:
-    s = requests.Session()
+class _ProxyingSession(requests.Session):
+    """A session that tunnels every GET through a reverse proxy.
+
+    Each request is rewritten so the URL points at the proxy, with the
+    original target URL passed via `X-Proxy-Target`. Auth is a static
+    shared-secret in `X-Proxy-Auth`. Both headers are added per-request
+    so the secret only leaves the process on proxied calls, never on
+    any other host that might share the session.
+    """
+
+    def __init__(self, proxy_url: str, proxy_token: str | None) -> None:
+        super().__init__()
+        # Strip trailing slash so the URL is well-formed regardless of
+        # whether the user supplied "https://w.dev" or "https://w.dev/".
+        self._proxy_url = proxy_url.rstrip("/")
+        self._proxy_token = proxy_token or ""
+
+    def request(self, method, url, **kwargs):
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            caller_headers = kwargs.get("headers") or {}
+            proxy_headers = {**caller_headers, "X-Proxy-Target": url}
+            if self._proxy_token:
+                proxy_headers["X-Proxy-Auth"] = self._proxy_token
+            kwargs["headers"] = proxy_headers
+            url = self._proxy_url
+        return super().request(method, url, **kwargs)
+
+
+def build_session(
+    pool_size: int,
+    proxy_url: str | None = None,
+    proxy_token: str | None = None,
+) -> requests.Session:
+    if proxy_url:
+        s: requests.Session = _ProxyingSession(proxy_url, proxy_token)
+    else:
+        s = requests.Session()
     s.headers.update(DEFAULT_HEADERS)
     retry = Retry(
         total=RETRY_TOTAL,
@@ -392,18 +444,34 @@ def verify_one(
 # ---------------------------------------------------------------------------
 
 def iter_perfs_to_check(
-    payload: dict, today_iso: str, include_past: bool,
+    payload: dict,
+    today_iso: str,
+    include_past: bool,
+    within_days: int | None,
 ) -> list[tuple[int, int, str | None]]:
     """(show_idx, perf_idx, book_url) for every perf to verify.
 
-    Past-dated perfs are dropped unless --include-past. Perfs without
-    a book_url get a None and are recorded as SKIPPED.
+    Past-dated perfs are dropped unless --include-past. With
+    within_days=N, perfs more than N calendar days in the future are
+    also dropped (catches the user-visible bug window without paying
+    for every long-tail booking). Perfs without a book_url get a None
+    and are recorded as SKIPPED.
     """
+    if within_days is not None:
+        end_date = (
+            datetime.fromisoformat(today_iso).date()
+            + timedelta(days=within_days)
+        ).isoformat()
+    else:
+        end_date = None
+
     out: list[tuple[int, int, str | None]] = []
     for si, show in enumerate(payload.get("shows") or []):
         for pi, perf in enumerate(show.get("performances") or []):
             date = perf.get("date")
             if not include_past and date and date < today_iso:
+                continue
+            if end_date is not None and date and date > end_date:
                 continue
             out.append((si, pi, perf.get("book_url")))
     return out
@@ -415,6 +483,9 @@ def run(
     concurrency: int,
     limit: int | None,
     include_past: bool,
+    within_days: int | None,
+    proxy_url: str | None = None,
+    proxy_token: str | None = None,
 ) -> dict:
     """Verify in-place on payload['shows'][i]['performances'][j].
 
@@ -422,15 +493,24 @@ def run(
     payload['report']['availability_verification'].
     """
     today_iso = datetime.now(timezone.utc).date().isoformat()
-    tasks = iter_perfs_to_check(payload, today_iso, include_past=include_past)
+    tasks = iter_perfs_to_check(
+        payload, today_iso,
+        include_past=include_past,
+        within_days=within_days,
+    )
     if limit is not None:
         tasks = tasks[:limit]
         log.info("--limit %d applied", limit)
 
     total = len(tasks)
     log.info(
-        "Verifying %d performance(s) across %d show(s) with %d worker(s)",
-        total, len(payload.get("shows") or []), concurrency,
+        "Verifying %d performance(s) across %d show(s) with %d worker(s)"
+        "%s%s",
+        total,
+        len(payload.get("shows") or []),
+        concurrency,
+        f" (within {within_days}d window)" if within_days is not None else "",
+        " (via proxy)" if proxy_url else "",
     )
     if total == 0:
         return {
@@ -445,7 +525,11 @@ def run(
     progress = {"n": 0}
     progress_lock = Lock()
 
-    session = build_session(pool_size=max(concurrency, 8))
+    session = build_session(
+        pool_size=max(concurrency, 8),
+        proxy_url=proxy_url,
+        proxy_token=proxy_token,
+    )
 
     def _job(task: tuple[int, int, str | None]) -> tuple[int, int, dict]:
         si, pi, url = task
@@ -531,9 +615,33 @@ def main(argv: list[str] | None = None) -> int:
         help="Verify only the first N performances (smoke-test).",
     )
     p.add_argument(
+        "--within-days", type=int, default=30, metavar="N",
+        help="Only verify performances scheduled within the next N "
+             "calendar days (default: 30). Pass 0 to disable the "
+             "window and verify every future perf. The user-visible "
+             "bug window is near-term anyway: nobody books 9 months "
+             "out and gets burned by a sold-out tier.",
+    )
+    p.add_argument(
         "--include-past", action="store_true",
         help="Also verify performances whose date is in the past "
              "(skipped by default since they typically 404 or redirect).",
+    )
+    p.add_argument(
+        "--proxy-url", default=os.environ.get("OLT_PROXY_URL"),
+        metavar="URL",
+        help="Route every SeeTickets request through this reverse-proxy "
+             "URL (e.g. the same Cloudflare Worker olt_scraper.py uses). "
+             "The proxy must accept an X-Proxy-Target header carrying "
+             "the original URL and fetch+forward. Defaults to "
+             "$OLT_PROXY_URL if set. Required when running from cloud "
+             "CI; SeeTickets 403s Azure/GitHub Actions runner IPs.",
+    )
+    p.add_argument(
+        "--proxy-token", default=os.environ.get("OLT_PROXY_TOKEN"),
+        metavar="TOKEN",
+        help="Shared-secret value sent as X-Proxy-Auth on every "
+             "request to --proxy-url. Defaults to $OLT_PROXY_TOKEN.",
     )
     p.add_argument(
         "--dry-run", action="store_true",
@@ -561,7 +669,19 @@ def main(argv: list[str] | None = None) -> int:
         concurrency=args.concurrency,
         limit=args.limit,
         include_past=args.include_past,
+        within_days=None if args.within_days <= 0 else args.within_days,
+        proxy_url=args.proxy_url,
+        proxy_token=args.proxy_token,
     )
+
+    if args.proxy_url:
+        log.info("Using proxy: %s", args.proxy_url)
+    elif summary["fetch_failed"] > 0 and summary["ok"] == 0:
+        log.warning(
+            "No --proxy-url set and all fetches failed. SeeTickets 403s "
+            "cloud-CI IPs; set OLT_PROXY_URL/OLT_PROXY_TOKEN to route "
+            "through the Cloudflare Worker."
+        )
 
     if args.dry_run:
         log.info("--dry-run: not writing output")
@@ -578,6 +698,25 @@ def main(argv: list[str] | None = None) -> int:
 
     attempted_real = summary["total_checked"] - summary["skipped"]
     if attempted_real > 0 and summary["ok"] == 0:
+        # Zero successes despite real attempts. Two possible causes,
+        # very different in severity:
+        #   - All fetches blocked at the network layer (403, 429, or
+        #     connection errors). The parser never ran. NOT drift —
+        #     just IP reputation. Partial output is already written
+        #     with verified_price_source="fetch_failed" on every perf;
+        #     dedupe correctly falls back to data-cal. Don't fail the
+        #     pipeline; warn loudly so the operator sees it.
+        #   - Fetches succeeded (200) but the parser found nothing.
+        #     That IS template drift — exit 2 so CI flags it red.
+        if summary["fetch_failed"] >= attempted_real:
+            log.warning(
+                "All %d fetches failed (no 200 responses). Almost certainly "
+                "the SeeTickets IP-block on cloud-CI runners. Set "
+                "--proxy-url / OLT_PROXY_URL to route through the worker. "
+                "Output is still written; dedupe will fall back to data-cal.",
+                attempted_real,
+            )
+            return EXIT_CLEAN
         log.error(
             "No performances verified successfully out of %d attempts — "
             "possible event-page template drift",
