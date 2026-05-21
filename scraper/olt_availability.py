@@ -546,6 +546,22 @@ def run(
 
     counts = {SOURCE_OK: 0, SOURCE_NO_SEATS: 0,
               SOURCE_FETCH_FAIL: 0, SOURCE_SKIPPED: 0}
+    # HTTP status (or exception summary) → count. Lets us tell 403
+    # (Akamai block) apart from 429 (rate limited) apart from 500/502
+    # (genuine upstream errors) apart from connection-error strings.
+    status_counts: dict[str, int] = {}
+    # SeeTickets subdomain → {ok, fail, total}. Catches the case where
+    # one subdomain (e.g. kidsweek) is systematically failing while
+    # the others are fine.
+    host_counts: dict[str, dict[str, int]] = {}
+    # Up to 3 sample failure URLs per HTTP status, so a reader can
+    # eyeball "are these the same kind of perfs?" without unzipping
+    # the JSON artifact.
+    sample_failures: dict[str, list[str]] = {}
+    # How often the table parser fired vs we had to fall back to the
+    # show-wide meta tag / JSON-LD. Table-parse perfs get per-tier
+    # prices; fallback perfs only get an availability bool.
+    branch_counts = {"table": 0, "fallback": 0}
     counts_lock = Lock()
     progress = {"n": 0}
     progress_lock = Lock()
@@ -560,6 +576,11 @@ def run(
         si, pi, url = task
         return si, pi, verify_one(session, url)
 
+    # Progress every ~10% of total (with a floor of 50) — gives ~10
+    # progress lines regardless of run size. Small runs get a heartbeat
+    # every 50; large runs don't drown the log.
+    progress_step = max(50, total // 10)
+
     t0 = time.monotonic()
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = [pool.submit(_job, t) for t in tasks]
@@ -571,28 +592,110 @@ def run(
                 continue
             payload["shows"][si]["performances"][pi].update(out)
             src = out["verified_price_source"]
+            status = out.get("verified_status")
+            url = out.get("verified_url") or ""
+            host = url.split("/")[2] if url.startswith(("http://", "https://")) else "<unknown>"
             with counts_lock:
                 counts[src] = counts.get(src, 0) + 1
+                if status is not None:
+                    # Truncate exception strings so the bucket key
+                    # stays a stable, readable identifier.
+                    key = str(status)[:50]
+                    status_counts[key] = status_counts.get(key, 0) + 1
+                bucket = host_counts.setdefault(
+                    host, {"ok": 0, "fail": 0, "total": 0},
+                )
+                bucket["total"] += 1
+                if src == SOURCE_OK:
+                    bucket["ok"] += 1
+                elif src == SOURCE_FETCH_FAIL:
+                    bucket["fail"] += 1
+                    fb = sample_failures.setdefault(str(status)[:50], [])
+                    if len(fb) < 3 and url:
+                        fb.append(url)
+                # Table parser produced a tier_count? Otherwise it's
+                # the meta-tag / JSON-LD fallback path.
+                if out.get("verified_tier_count") is not None:
+                    branch_counts["table"] += 1
+                elif src in (SOURCE_OK, SOURCE_NO_SEATS):
+                    branch_counts["fallback"] += 1
             with progress_lock:
                 progress["n"] += 1
-                if progress["n"] % 500 == 0:
+                if (progress["n"] % progress_step == 0
+                        or progress["n"] == total):
+                    pct = 100 * progress["n"] / total
                     log.info(
-                        "  progress: %d/%d  (ok=%d, no_seats=%d, fail=%d)",
-                        progress["n"], total,
+                        "  progress: %d/%d (%d%%)  "
+                        "ok=%d  no_seats=%d  fetch_failed=%d",
+                        progress["n"], total, int(pct),
                         counts[SOURCE_OK],
                         counts[SOURCE_NO_SEATS],
                         counts[SOURCE_FETCH_FAIL],
                     )
 
     elapsed = time.monotonic() - t0
-    log.info(
-        "Done in %.1fs — ok=%d, no_seats=%d, fetch_failed=%d, skipped=%d",
-        elapsed,
-        counts[SOURCE_OK],
-        counts[SOURCE_NO_SEATS],
-        counts[SOURCE_FETCH_FAIL],
-        counts[SOURCE_SKIPPED],
-    )
+
+    # ----- Detailed end-of-run summary -----
+    # Multi-section so CI readers can scan-and-skim. Keep section
+    # headers distinct so they're greppable in the log.
+    log.info("")
+    log.info("===== OLT availability verification summary =====")
+    log.info("Total checked     : %d performance(s) across %d show(s)",
+             total, len(payload.get("shows") or []))
+    log.info("Wall time         : %.1fs  (%.1f req/sec effective)",
+             elapsed, total / elapsed if elapsed > 0 else 0)
+    log.info("")
+    log.info("Outcomes:")
+    for src, label in [
+        (SOURCE_OK,         "ticketing_page (OK)"),
+        (SOURCE_NO_SEATS,   "no_seats           "),
+        (SOURCE_FETCH_FAIL, "fetch_failed       "),
+        (SOURCE_SKIPPED,    "skipped            "),
+    ]:
+        n = counts[src]
+        pct = 100 * n / total if total else 0.0
+        log.info("  %s : %5d  (%5.1f%%)", label, n, pct)
+
+    if status_counts:
+        log.info("")
+        log.info("HTTP status distribution:")
+        for st, n in sorted(status_counts.items(),
+                            key=lambda kv: (-kv[1], kv[0])):
+            pct = 100 * n / total if total else 0.0
+            log.info("  %-30s : %5d  (%5.1f%%)", st, n, pct)
+
+    if host_counts:
+        log.info("")
+        log.info("Per-host breakdown (ok / fetch_failed / total):")
+        for host, hc in sorted(host_counts.items(),
+                               key=lambda kv: -kv[1]["total"]):
+            ok_pct = 100 * hc["ok"] / hc["total"] if hc["total"] else 0.0
+            log.info("  %-42s : %4d / %4d / %4d  (%5.1f%% ok)",
+                     host, hc["ok"], hc["fail"], hc["total"], ok_pct)
+
+    log.info("")
+    log.info("Parser branch (where verified data came from):")
+    tot_parsed = branch_counts["table"] + branch_counts["fallback"]
+    if tot_parsed > 0:
+        for branch, label in [
+            ("table",    "ticket-table (primary, gives tier prices) "),
+            ("fallback", "meta/json-ld (fallback, no tier prices)   "),
+        ]:
+            n = branch_counts[branch]
+            pct = 100 * n / tot_parsed
+            log.info("  %s : %5d  (%5.1f%%)", label, n, pct)
+    else:
+        log.info("  (none — all attempts failed before parsing)")
+
+    if sample_failures:
+        log.info("")
+        log.info("Sample fetch_failed URLs (up to 3 per status):")
+        for st in sorted(sample_failures.keys()):
+            log.info("  status=%s:", st)
+            for u in sample_failures[st]:
+                log.info("    %s", u)
+
+    log.info("=" * 49)
 
     summary = {
         "verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -602,6 +705,14 @@ def run(
         "fetch_failed": counts[SOURCE_FETCH_FAIL],
         "skipped": counts[SOURCE_SKIPPED],
         "duration_seconds": round(elapsed, 1),
+        # Diagnostic extras: lets the post-run workflow step (or
+        # post-hoc inspection of olt.json) reproduce the summary.
+        "status_distribution": dict(
+            sorted(status_counts.items(), key=lambda kv: -kv[1])
+        ),
+        "host_distribution": host_counts,
+        "parser_branches": dict(branch_counts),
+        "sample_failure_urls": sample_failures,
     }
 
     report = payload.setdefault("report", {})
