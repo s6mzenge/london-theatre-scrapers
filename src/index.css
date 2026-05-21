@@ -89,14 +89,16 @@ a {
   display: flex;
   min-height: 100vh;
   position: relative;
-  /* Paint the ink "rail" on the parent itself with a hard-edge gradient
-     at the sidebar's right edge. The sidebar is position:sticky with
-     height:100vh, so it never grows to match a taller .stg-main — without
-     this, the parent's default (paper) background shows through below
-     the 100vh mark on long pages. The gradient guarantees the left
-     column is always ink-coloured, whatever the sidebar's height. On
-     mobile (≤640px) the layout flips to a column and both children
-     fully cover the parent, so the gradient is harmless there. */
+  /* Reserve space for the fixed sidebar — without this, .stg-main would
+     start at x=0 and the sidebar would overlay its first 200px of
+     content. Overridden to 0 at the mobile breakpoint where the
+     sidebar flips to a horizontal top bar and is back in normal flow. */
+  padding-left: var(--sidebar-width);
+  /* Paint the ink "rail" on the parent itself as a fallback. The fixed
+     sidebar covers this area at all times, but the gradient guarantees
+     the left column is always ink-coloured even if the sidebar ever
+     fails to render (CSS error, JS hydration glitch). Harmless on
+     mobile because both children fully cover the parent there. */
   background: linear-gradient(
     to right,
     var(--color-ink) 0,
@@ -124,8 +126,15 @@ a {
   box-shadow: inset -0.5px 0 0 rgba(163, 50, 42, 0.55);
   display: flex;
   flex-direction: column;
-  position: sticky;
+  /* Fixed (not sticky) so the sidebar is pinned to the viewport at
+     every scroll position. With sticky+height:100vh, on pages taller
+     than the viewport the sticky element gets "released" once its
+     bottom hits the bottom of its containing block, and the SCRAPED
+     footer drifts up off the viewport bottom. Fixed avoids that
+     entirely. .stg-app's padding-left reserves the column for us. */
+  position: fixed;
   top: 0;
+  left: 0;
   height: 100vh;
   z-index: 10;
 }
@@ -1692,6 +1701,10 @@ a {
 @media (max-width: 640px) {
   .stg-app {
     flex-direction: column;
+    /* Undo the desktop padding-left — on mobile the sidebar collapses
+       to a horizontal top bar in normal flow, so it doesn't need the
+       column reserved for it. */
+    padding-left: 0;
   }
   .stg-sidebar {
     width: 100%;
