@@ -1,0 +1,128 @@
+// Tiny hand-rolled router for STAGE. We have three top-level tabs and
+// one parameterized detail page — not enough surface area to justify
+// pulling in react-router-dom (~12 kB gzipped on top of React). This
+// file is ~70 lines and exposes everything the rest of the app needs:
+//
+//   useRoute()             → current route as a plain object
+//   navigate(path, opts)   → push (default) or replace a new URL
+//   <Link href="/x">       → anchor that intercepts plain left-clicks
+//                            but preserves modifier-click / middle-click
+//                            so "open in new tab" still works.
+//
+// Cloudflare Pages already rewrites every path to index.html via the
+// _redirects file, so deep-links like /shows/hamilton boot React on
+// the right page without any extra config. Vite's dev server has the
+// same SPA fallback on by default, so dev and prod behave the same.
+//
+// State flow:
+//   navigate(path) → history.pushState → notify subscribers → useRoute
+//                    fires setState → React re-renders with new route.
+//   Browser back  → popstate event → setState directly → same render.
+
+import { useState, useEffect } from 'react'
+
+// ---------------------------------------------------------------------------
+// URL <-> route object
+// ---------------------------------------------------------------------------
+
+// Route shape:
+//   { name: 'cheapest' }
+//   { name: 'shows' }
+//   { name: 'show', id: string }
+//   { name: 'sellers' }
+//
+// Anything unrecognised maps back to 'cheapest' so a stale or mistyped
+// URL doesn't dead-end the user — they see the home page instead of a
+// blank screen.
+
+function parsePath(pathname) {
+  const p = pathname.replace(/\/+$/, '') || '/'
+  if (p === '/') return { name: 'cheapest' }
+  if (p === '/shows') return { name: 'shows' }
+  if (p === '/sellers') return { name: 'sellers' }
+  const m = p.match(/^\/shows\/(.+)$/)
+  if (m) return { name: 'show', id: decodeURIComponent(m[1]) }
+  return { name: 'cheapest' }
+}
+
+// ---------------------------------------------------------------------------
+// Subscription — useRoute() reads, navigate() writes, listeners get notified
+// ---------------------------------------------------------------------------
+
+const listeners = new Set()
+
+function currentRoute() {
+  if (typeof window === 'undefined') return { name: 'cheapest' }
+  return parsePath(window.location.pathname)
+}
+
+function notify() {
+  const r = currentRoute()
+  for (const fn of listeners) fn(r)
+}
+
+export function useRoute() {
+  const [route, setRoute] = useState(currentRoute)
+  useEffect(() => {
+    listeners.add(setRoute)
+    // popstate covers the back/forward buttons. The browser restores
+    // scroll position automatically on popstate, which is the whole
+    // reason we don't auto-scroll inside navigate() on a back-nav.
+    const onPop = () => setRoute(currentRoute())
+    window.addEventListener('popstate', onPop)
+    return () => {
+      listeners.delete(setRoute)
+      window.removeEventListener('popstate', onPop)
+    }
+  }, [])
+  return route
+}
+
+export function navigate(path, { replace = false, scroll = false } = {}) {
+  if (typeof window === 'undefined') return
+  // Already on this URL — clicking the active tab shouldn't pollute
+  // the history stack with no-op entries.
+  if (path === window.location.pathname) return
+  const method = replace ? 'replaceState' : 'pushState'
+  window.history[method]({}, '', path)
+  // Caller opts in to scroll-to-top. We don't do this by default
+  // because tab-to-tab nav shouldn't yank the user back to the top —
+  // only show-detail entry does (matches the previous useState-based
+  // behaviour in App.jsx).
+  if (scroll) window.scrollTo({ top: 0, behavior: 'auto' })
+  notify()
+}
+
+// ---------------------------------------------------------------------------
+// <Link> — anchor with SPA click interception
+// ---------------------------------------------------------------------------
+// Preserves modifier-click and middle-click so users can still open in
+// a new tab. Plain left-clicks become pushState navigations. Any
+// onClick passed by the parent runs first; if it preventDefault()s,
+// we bail out and let the anchor behave normally.
+
+export function Link({
+  href,
+  className,
+  children,
+  scroll = false,
+  onClick,
+  ...rest
+}) {
+  const handleClick = (e) => {
+    if (onClick) onClick(e)
+    if (e.defaultPrevented) return
+    // Let the browser handle anything that isn't a plain left-click:
+    // cmd/ctrl-click opens in new tab, shift-click in new window,
+    // middle-click in new tab, right-click shows the context menu.
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+    if (e.button !== undefined && e.button !== 0) return
+    e.preventDefault()
+    navigate(href, { scroll })
+  }
+  return (
+    <a href={href} className={className} onClick={handleClick} {...rest}>
+      {children}
+    </a>
+  )
+}
