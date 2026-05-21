@@ -177,6 +177,11 @@ jobs:
         run: |
           python scraper/seatplan_availability.py --in scraper/data/seatplan.json
 
+      - name: Verify OLT per-performance availability
+        if: steps.gate.outputs.run == 'true' && matrix.name == 'olt'
+        run: |
+          python scraper/olt_availability.py --in scraper/data/olt.json
+
       - name: Verify TTD per-performance prices
         if: steps.gate.outputs.run == 'true' && matrix.name == 'ttd'
         run: |
