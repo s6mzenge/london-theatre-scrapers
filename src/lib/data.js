@@ -63,14 +63,14 @@ export function extractMeta(data) {
 // up into perf.min_price = 0, which would otherwise dominate every
 // aggregation ("cheapest tonight: £0"). We treat any non-positive
 // number as missing data throughout.
-function validPrice(p) {
+export function validPrice(p) {
   return typeof p === 'number' && p > 0 && Number.isFinite(p)
 }
 
 // Recompute the effective cheapest price + seller for a performance,
 // ignoring sources with invalid prices. Returns null when no seller has
 // usable data, in which case the performance should be skipped entirely.
-function effectiveCheapest(perf) {
+export function effectiveCheapest(perf) {
   if (!perf.sources) return null
   let best = null
   let sellerCount = 0
