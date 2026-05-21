@@ -1406,15 +1406,73 @@ a {
 }
 
 .stg-show-cal-block + .stg-show-cal-block {
+  /* Kept for safety though we no longer stack months — single-page
+     navigation means this rule rarely fires, but if anything ever
+     renders a second calendar block it'll still space sensibly. */
   margin-top: 24px;
 }
 
-.stg-show-cal-label {
+/* Month navigator — small bar between the section header and the
+   calendar grid. Centered label flanked by arrow buttons; arrows
+   grey out at the run boundaries instead of disappearing so the
+   layout stays steady when you reach the ends. */
+.stg-show-monthnav {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  margin-bottom: 10px;
+  padding: 2px 0 8px;
+}
+
+.stg-show-monthnav.single {
+  /* Single-month runs: no arrows, just the centered label */
+  padding-top: 4px;
+}
+
+.stg-show-monthnav-label {
   font-family: var(--font-slab);
-  font-size: 10px;
-  letter-spacing: 2px;
-  color: var(--color-text-muted);
-  margin-bottom: 8px;
+  font-size: 11px;
+  letter-spacing: 2.5px;
+  color: var(--color-ink);
+  font-weight: 500;
+  min-width: 130px;
+  text-align: center;
+}
+
+.stg-show-monthnav-arrow {
+  font-family: var(--font-display);
+  font-size: 18px;
+  line-height: 1;
+  color: var(--color-ink);
+  background: transparent;
+  border: 0.5px solid var(--line-soft);
+  width: 32px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  padding: 0;
+}
+
+.stg-show-monthnav-arrow:hover:not(:disabled) {
+  background: var(--color-paper-warm);
+  border-color: var(--color-brick);
+  color: var(--color-brick);
+}
+
+.stg-show-monthnav-arrow:focus-visible {
+  outline: 2px solid var(--color-brick);
+  outline-offset: 2px;
+}
+
+.stg-show-monthnav-arrow:disabled {
+  color: var(--color-text-faint);
+  border-color: var(--line-faint);
+  cursor: default;
+  opacity: 0.5;
 }
 
 .stg-show-cal {
