@@ -454,8 +454,15 @@ def _seatplan_available(p: dict) -> bool | None:
 #
 #   seat_price_source (set by ttd_seat_verification.py):
 #     "seat_plan"        — trust seat_min_price
-#     "no_legend"        — page returned but no buyable tiers; treat
-#                          as off-sale, return None
+#     "no_legend"        — page returned but no buyable tiers parsed.
+#                          IDEALLY this means off-sale and we'd return
+#                          None, but the first live CI run had this
+#                          fire on 321 of 332 perfs (big-venue pages
+#                          where the parser doesn't match the actual
+#                          HTML structure), so currently we fall
+#                          through to the calendar verification.
+#                          Switch back to `return None` once the
+#                          parser covers more venues.
 #     "fetch_failed"     — seat-plan fetch errored; fall through to
 #                          calendar
 #     "skipped"          — not checked (past, no perf_id, etc.); fall
@@ -476,11 +483,14 @@ def _ttd_price_from(p: dict) -> float | None:
         seat_min = p.get("seat_min_price")
         if seat_min is not None:
             return seat_min
-    if seat_source == "no_legend":
-        # Seat plan said there are no tiers to pick from. Don't fall
-        # back to the calendar — that's exactly the value we no longer
-        # trust for this perf.
-        return None
+    # Note: previously also returned None on seat_source == "no_legend"
+    # under the assumption that "no legend on the page" meant
+    # "off-sale". First CI run (21 May 2026) showed the parser fails
+    # on most big-venue pages — 321 of 332 perfs came back no_legend,
+    # only 11 successful — so that early-return was zeroing out
+    # TTD's price contribution on ~300 perfs with perfectly valid
+    # calendar data. Falling through to the calendar verification is
+    # the safe behaviour until the parser covers more venues.
     # Seat verification didn't conclusively answer; fall through to
     # the calendar-widget verification.
     source = p.get("verified_price_source")
