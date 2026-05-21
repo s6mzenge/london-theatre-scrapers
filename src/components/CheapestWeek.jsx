@@ -2,8 +2,9 @@ import { useState, useEffect, useMemo } from 'react'
 import { SectionHead } from './Cheapest.jsx'
 import DayDrill from './DayDrill.jsx'
 import { formatPrice } from '../lib/format.js'
+import { ShowLink } from '../lib/router.jsx'
 
-export default function CheapestWeek({ week, onSelectShow }) {
+export default function CheapestWeek({ week }) {
   // Default the drill-down to today (the day in the window with isToday).
   // If today isn't in the window for some reason, fall back to the first
   // day with availability, else just the first day.
@@ -90,27 +91,17 @@ export default function CheapestWeek({ week, onSelectShow }) {
         })}
       </div>
 
-      {selectedDay && (
-        <DayDrill day={selectedDay} onSelectShow={onSelectShow} />
-      )}
+      {selectedDay && <DayDrill day={selectedDay} />}
 
       {/* Per-show "cheapest this week" ranking — answers a different
           question than the per-day drill-down above (show-first
           ranking across the whole week vs date-first slice). */}
       <div className="stg-bestshows">
         {week.bestPerShow.slice(0, 5).map((entry, idx) => (
-          <div
+          <ShowLink
             key={entry.show.id}
+            id={entry.show.id}
             className="stg-bestshow"
-            onClick={() => onSelectShow(entry.show.id)}
-            role="button"
-            tabIndex={0}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault()
-                onSelectShow(entry.show.id)
-              }
-            }}
           >
             <div className="stg-bestshow-rank">
               {String(idx + 1).padStart(2, '0')}
@@ -133,7 +124,7 @@ export default function CheapestWeek({ week, onSelectShow }) {
             <div className="stg-bestshow-price">
               {formatPrice(entry.cheapestPerf.minPrice)}
             </div>
-          </div>
+          </ShowLink>
         ))}
       </div>
     </section>
