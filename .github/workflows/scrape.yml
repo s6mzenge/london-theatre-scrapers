@@ -190,7 +190,7 @@ jobs:
         run: |
           python scraper/olt_availability.py \
             --in scraper/data/olt.json \
-            --within-days 30
+            --within-days 10
 
       - name: Verify TTD per-performance prices
         if: steps.gate.outputs.run == 'true' && matrix.name == 'ttd'
