@@ -16,6 +16,7 @@ import {
   formatShortDate,
   monthLabel,
   parseISO,
+  todayISO,
 } from './dates.js'
 
 // unified.json is committed to public/data/ by the scrape workflow,
@@ -38,7 +39,41 @@ export async function loadUnifiedData() {
   // browsers since 2023, so this works everywhere we care about.
   const decompressed = r.body.pipeThrough(new DecompressionStream('gzip'))
   const text = await new Response(decompressed).text()
-  return JSON.parse(text)
+  const data = JSON.parse(text)
+  // The unified.json that ships with the build can include shows whose
+  // entire run is in the past — the scrape doesn't actively prune them,
+  // and a show that closed last week is still a valid catalogue entry
+  // from the scrape's point of view. For the site, though, "past shows"
+  // are noise: they pad the Search list, inflate Sellers' win counts
+  // with stale data, and clutter the show-detail lookup. We hide them
+  // here, once, at the data-loading layer, so every downstream consumer
+  // (Search, Sellers, the Cheapest Tonight/Week/Month aggregations, the
+  // App-level show lookup) automatically sees only upcoming shows
+  // without having to add its own filter.
+  return filterToUpcomingShows(data, todayISO())
+}
+
+// A show counts as upcoming if at least one of its performances is dated
+// today or later. We keep the show's past performances intact on the
+// surviving entries so ShowDetail's per-show calendar can still render
+// the full run with past dates greyed out (it already treats them as
+// non-clickable `isPast` cells). Only when *every* performance is in the
+// past do we drop the show entirely.
+//
+// show_count is rewritten to match the filtered length so the metadata
+// the sidebar reads stays internally consistent. performance_count and
+// source_summary are left alone — they describe what the scrape covered,
+// which is a separate concept from what the site chooses to display.
+function filterToUpcomingShows(data, today) {
+  if (!data || !Array.isArray(data.shows)) return data
+  const upcoming = data.shows.filter((show) =>
+    (show.performances || []).some((p) => p.date >= today),
+  )
+  return {
+    ...data,
+    shows: upcoming,
+    show_count: upcoming.length,
+  }
 }
 
 // Extract the top-level scrape metadata: when was it generated, and what
