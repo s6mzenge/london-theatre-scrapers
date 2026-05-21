@@ -2,7 +2,18 @@
 
 A daily price-comparison aggregator for London West End tickets across five seller sources (TodayTix, Official London Theatre, LOVEtheatre, SeatPlan, TheatreTicketsDirect).
 
-The site shows you the cheapest seat for tonight, this week, and this month — across every seller — with direct booking links and per-source seat-plan metadata.
+The site organises the catalogue into six surfaces:
+
+| Tab | What it answers |
+|---|---|
+| **CHEAPEST** | What's on for less — Tonight, Weekend, Matinées, This Week, Budget Tiers, Widest Spreads, Closing Soon, Opening Soon, This Month |
+| **WHEN** | Plan a night — day-of-week heatmap, 90-day strip, deep-linkable per-date pages (`/when/YYYY-MM-DD`) |
+| **SHOWS** | Catalogue browse with curated chips (Closing Soon, Opening Soon, Limited, Hidden Gems, Exclusives) plus title/venue search |
+| **VENUES** | Browse by theatre, with per-venue detail pages (`/venues/:slug`) |
+| **SELLERS** | Per-seller leaderboard — who's cheapest where |
+| **DATA** | Coverage, freshness, dedupe pipeline, methodology (footer link) |
+
+Each page is one or two scrolls of editorial-density information rather than a single tile. The whole site is a static React + Vite bundle reading one `unified.json` snapshot.
 
 ## How it works
 
@@ -68,12 +79,17 @@ Or just trigger the GitHub Actions workflow — same thing, in parallel, on clou
 │   └── data/
 │       └── unified.json        # Auto-generated; the file the site reads
 ├── src/
-│   ├── App.jsx                 # Main app
-│   ├── components/             # Cheapest{Tonight,Week,Month}, Sellers, …
+│   ├── App.jsx                 # Main app + route dispatch
+│   ├── additions.css           # Styles for the expanded IA (loaded after index.css)
+│   ├── components/             # Cheapest{Tonight,Weekend,Matinees,Week,
+│   │                           #   Tiers,Spreads,ClosingSoon,OpeningSoon,Month},
+│   │                           # When, WhenDate, Venues (+ VenueDetail),
+│   │                           # Sellers, Search, ShowDetail, Sidebar, Data, …
 │   ├── lib/
-│   │   ├── data.js             # Loads /data/unified.json + aggregations
+│   │   ├── data.js             # Loads /data/unified.json + all aggregations
 │   │   ├── dates.js
-│   │   └── format.js
+│   │   ├── format.js
+│   │   └── router.jsx          # /when, /when/:date, /shows?filter=…, /venues/:slug
 │   ├── index.css
 │   └── main.jsx
 ├── scraper/

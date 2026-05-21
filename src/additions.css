@@ -1,0 +1,1311 @@
+/* ==========================================================================
+   STAGE. — Additions for the expanded IA
+   --------------------------------------------------------------------------
+   Layered on top of index.css. New rules only — every selector here is
+   either net-new or extends an existing one without overriding visual
+   intent. Token names (--color-paper, --font-display, etc.) are reused
+   from the base sheet so the palette stays consistent.
+   ========================================================================== */
+
+/* ==========================================================================
+   SIDEBAR — Data footer link
+   ========================================================================== */
+
+.stg-sb-foot-link {
+  display: block;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 0.5px solid var(--line-faint);
+  font-family: var(--font-slab);
+  font-size: 9px;
+  letter-spacing: 1.6px;
+  color: var(--color-text-faint);
+  text-decoration: none;
+  transition: color 0.18s;
+}
+
+.stg-sb-foot-link:hover,
+.stg-sb-foot-link.active {
+  color: var(--color-brick);
+}
+
+/* ==========================================================================
+   SECTION HEAD — action slot (used by "SEE ALL N →" cross-links)
+   ========================================================================== */
+
+.stg-section-action {
+  margin-top: 6px;
+}
+
+.stg-section-action-link {
+  font-family: var(--font-slab);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: var(--color-brick);
+  text-decoration: none;
+  transition: opacity 0.18s;
+}
+
+.stg-section-action-link:hover {
+  opacity: 0.65;
+}
+
+/* ==========================================================================
+   CHEAPEST — Weekend (Fri/Sat/Sun day cards)
+   ========================================================================== */
+
+.stg-weekend-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.stg-weekend-grid.cards-3 { grid-template-columns: repeat(3, 1fr); }
+.stg-weekend-grid.cards-2 { grid-template-columns: repeat(2, 1fr); }
+.stg-weekend-grid.cards-1 { grid-template-columns: 1fr; }
+
+.stg-weekend-card {
+  display: flex;
+  flex-direction: column;
+  background: var(--color-paper-warm);
+  border: 0.5px solid var(--line-soft);
+  border-radius: 3px;
+  padding: 16px 18px;
+  min-height: 240px;
+  transition: border-color 0.18s;
+}
+
+.stg-weekend-card.dark { opacity: 0.5; }
+
+.stg-weekend-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding-bottom: 12px;
+  border-bottom: 0.5px solid var(--line-faint);
+}
+
+.stg-weekend-dow {
+  font-family: var(--font-slab);
+  font-size: 11px;
+  letter-spacing: 2px;
+  color: var(--color-text-muted);
+}
+
+.stg-weekend-dom {
+  font-family: var(--font-display);
+  font-size: 26px;
+  color: var(--color-ink);
+  line-height: 1;
+}
+
+.stg-weekend-floor {
+  margin-left: auto;
+  text-align: right;
+}
+
+.stg-weekend-floor-lbl {
+  font-family: var(--font-sans);
+  font-size: 8px;
+  letter-spacing: 1.5px;
+  color: var(--color-text-muted);
+}
+
+.stg-weekend-floor-val {
+  font-family: var(--font-display);
+  font-size: 18px;
+  color: var(--color-brick);
+  line-height: 1;
+  margin-top: 2px;
+}
+
+.stg-weekend-hero {
+  display: block;
+  padding: 14px 0;
+  border-bottom: 0.5px solid var(--line-faint);
+  transition: opacity 0.18s;
+  text-decoration: none;
+  color: inherit;
+}
+
+.stg-weekend-hero:hover { opacity: 0.75; }
+
+.stg-weekend-hero-title {
+  font-family: var(--font-shout);
+  font-size: 22px;
+  color: var(--color-ink);
+  letter-spacing: -0.2px;
+  line-height: 1.05;
+}
+
+.stg-weekend-hero-meta {
+  font-family: var(--font-slab);
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-top: 5px;
+}
+
+.stg-weekend-hero-price {
+  font-family: var(--font-display);
+  font-size: 24px;
+  color: var(--color-brick);
+  margin-top: 10px;
+  line-height: 1;
+}
+
+.stg-weekend-rest {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 8px 0 4px;
+  flex: 1;
+}
+
+.stg-weekend-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 0.5px solid var(--line-faint);
+  transition: opacity 0.18s;
+  text-decoration: none;
+  color: inherit;
+}
+
+.stg-weekend-row:last-child { border-bottom: none; }
+.stg-weekend-row:hover { opacity: 0.65; }
+
+.stg-weekend-row-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.stg-weekend-row-title {
+  font-family: var(--font-shout);
+  font-size: 13px;
+  color: var(--color-ink);
+  line-height: 1.1;
+  letter-spacing: -0.05px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stg-weekend-row-time {
+  font-family: var(--font-slab);
+  font-size: 10px;
+  color: var(--color-text-muted);
+  margin-top: 2px;
+}
+
+.stg-weekend-row-price {
+  font-family: var(--font-display);
+  font-size: 14px;
+  color: var(--color-brick);
+  margin-left: 12px;
+  flex-shrink: 0;
+}
+
+.stg-weekend-card-foot {
+  margin-top: auto;
+  padding-top: 10px;
+  font-family: var(--font-sans);
+  font-size: 9px;
+  letter-spacing: 1.2px;
+  color: var(--color-text-faint);
+  text-transform: uppercase;
+}
+
+.stg-weekend-empty {
+  font-family: var(--font-slab);
+  font-style: italic;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  margin-top: 20px;
+}
+
+/* ==========================================================================
+   CHEAPEST — Matinées
+   ========================================================================== */
+
+.stg-matinee-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  border-top: 0.5px solid var(--line-soft);
+}
+
+.stg-matinee-row {
+  display: grid;
+  grid-template-columns: 90px 1fr 130px 70px;
+  gap: 18px;
+  align-items: center;
+  padding: 14px 4px;
+  border-bottom: 0.5px solid var(--line-faint);
+  transition: opacity 0.18s;
+  text-decoration: none;
+  color: inherit;
+}
+
+.stg-matinee-row:hover { opacity: 0.7; }
+
+.stg-matinee-day {
+  font-family: var(--font-slab);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  color: var(--color-text-muted);
+}
+
+.stg-matinee-time {
+  font-family: var(--font-display);
+  font-size: 18px;
+  color: var(--color-ink);
+  line-height: 1;
+  margin-top: 4px;
+}
+
+.stg-matinee-body { min-width: 0; }
+
+.stg-matinee-title {
+  font-family: var(--font-shout);
+  font-size: 16px;
+  color: var(--color-ink);
+  letter-spacing: -0.1px;
+  line-height: 1.1;
+}
+
+.stg-matinee-venue {
+  font-family: var(--font-slab);
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-top: 4px;
+}
+
+.stg-matinee-vs {
+  text-align: right;
+}
+
+.stg-matinee-vs-lbl {
+  display: block;
+  font-family: var(--font-sans);
+  font-size: 8px;
+  letter-spacing: 1.4px;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+}
+
+.stg-matinee-vs-lbl.dim { min-height: 20px; }
+
+.stg-matinee-vs-num {
+  display: block;
+  font-family: var(--font-display);
+  font-size: 16px;
+  color: var(--color-ink);
+  margin-top: 4px;
+  line-height: 1;
+}
+
+.stg-matinee-price {
+  font-family: var(--font-display);
+  font-size: 22px;
+  color: var(--color-brick);
+  text-align: right;
+}
+
+/* ==========================================================================
+   CHEAPEST — Budget Tiers (4 horizontal tiles)
+   ========================================================================== */
+
+.stg-tier-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+
+.stg-tier-tile {
+  display: block;
+  padding: 16px 18px;
+  background: var(--color-paper-warm);
+  border: 0.5px solid var(--line-soft);
+  border-radius: 3px;
+  transition: border-color 0.18s;
+  min-height: 200px;
+  text-decoration: none;
+  color: inherit;
+}
+
+.stg-tier-tile:hover { border-color: rgba(163, 50, 42, 0.5); }
+
+.stg-tier-tile.empty {
+  opacity: 0.55;
+  cursor: default;
+  pointer-events: none;
+}
+
+.stg-tier-tile-lbl {
+  font-family: var(--font-slab);
+  font-size: 10px;
+  letter-spacing: 1.8px;
+  color: var(--color-brick);
+}
+
+.stg-tier-tile-count {
+  font-family: var(--font-display);
+  font-size: 36px;
+  color: var(--color-ink);
+  line-height: 1;
+  margin-top: 8px;
+}
+
+.stg-tier-tile-sub {
+  font-family: var(--font-sans);
+  font-size: 9px;
+  letter-spacing: 1.2px;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  margin-top: 5px;
+}
+
+.stg-tier-tile-rule {
+  height: 0.5px;
+  background: var(--line-faint);
+  margin: 14px 0 12px;
+}
+
+.stg-tier-tile-headline-lbl {
+  font-family: var(--font-sans);
+  font-size: 8px;
+  letter-spacing: 1.4px;
+  color: var(--color-text-faint);
+  text-transform: uppercase;
+}
+
+.stg-tier-tile-headline {
+  font-family: var(--font-shout);
+  font-size: 14px;
+  color: var(--color-ink);
+  line-height: 1.05;
+  letter-spacing: -0.05px;
+  margin-top: 4px;
+}
+
+.stg-tier-tile-headline-meta {
+  font-family: var(--font-slab);
+  font-size: 10px;
+  color: var(--color-text-muted);
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+.stg-tier-tile-headline-price {
+  font-family: var(--font-display);
+  font-size: 12px;
+  color: var(--color-brick);
+}
+
+/* ==========================================================================
+   CHEAPEST — Spreads (cheapest-vs-priciest seller bars)
+   ========================================================================== */
+
+.stg-spread-list {
+  display: flex;
+  flex-direction: column;
+  border-top: 0.5px solid var(--line-soft);
+}
+
+.stg-spread-row {
+  display: grid;
+  grid-template-columns: 38px 1fr 100px;
+  gap: 14px;
+  align-items: center;
+  padding: 16px 4px;
+  border-bottom: 0.5px solid var(--line-faint);
+  transition: opacity 0.18s;
+  text-decoration: none;
+  color: inherit;
+}
+
+.stg-spread-row:hover { opacity: 0.7; }
+
+.stg-spread-rank {
+  font-family: var(--font-display);
+  font-size: 16px;
+  color: var(--color-text-faint);
+  text-align: center;
+}
+
+.stg-spread-body { min-width: 0; }
+
+.stg-spread-title {
+  font-family: var(--font-shout);
+  font-size: 16px;
+  color: var(--color-ink);
+  letter-spacing: -0.1px;
+  line-height: 1.1;
+}
+
+.stg-spread-meta {
+  font-family: var(--font-slab);
+  font-size: 10px;
+  color: var(--color-text-muted);
+  margin-top: 4px;
+}
+
+.stg-spread-bar { margin-top: 10px; }
+
+.stg-spread-bar-track {
+  height: 5px;
+  background: rgba(28, 26, 23, 0.06);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.stg-spread-bar-fill {
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    rgba(163, 50, 42, 0.85) 0%,
+    rgba(163, 50, 42, 0.4) 100%
+  );
+  border-radius: 2px;
+}
+
+.stg-spread-bar-ends {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--font-sans);
+  font-size: 9px;
+  letter-spacing: 0.8px;
+  color: var(--color-text-muted);
+  margin-top: 5px;
+}
+
+.stg-spread-bar-ends b {
+  color: var(--color-ink);
+  font-weight: 700;
+}
+
+.stg-spread-stat {
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.stg-spread-stat-lbl {
+  font-family: var(--font-sans);
+  font-size: 8px;
+  letter-spacing: 1.4px;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+}
+
+.stg-spread-stat-val {
+  font-family: var(--font-display);
+  font-size: 22px;
+  color: var(--color-brick);
+  line-height: 1;
+  margin-top: 4px;
+}
+
+.stg-spread-stat-pct {
+  font-family: var(--font-slab);
+  font-size: 10px;
+  color: var(--color-text-muted);
+  letter-spacing: 1px;
+  margin-top: 3px;
+}
+
+/* ==========================================================================
+   CHEAPEST — Closing Soon (urgent rows)
+   ========================================================================== */
+
+.stg-urgent-list {
+  display: flex;
+  flex-direction: column;
+  border-top: 0.5px solid var(--line-soft);
+}
+
+.stg-urgent-row {
+  display: grid;
+  grid-template-columns: 80px 1fr auto;
+  gap: 18px;
+  align-items: center;
+  padding: 14px 4px;
+  border-bottom: 0.5px solid var(--line-faint);
+  transition: opacity 0.18s;
+  text-decoration: none;
+  color: inherit;
+}
+
+.stg-urgent-row:hover { opacity: 0.7; }
+
+.stg-urgent-badge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 10px;
+  border: 0.5px solid var(--line-strong);
+  border-radius: 3px;
+}
+
+.stg-urgent-badge.critical {
+  border-color: var(--color-brick);
+  background: rgba(163, 50, 42, 0.06);
+}
+
+.stg-urgent-badge-num {
+  font-family: var(--font-display);
+  font-size: 22px;
+  color: var(--color-ink);
+  line-height: 1;
+}
+
+.stg-urgent-badge.critical .stg-urgent-badge-num {
+  color: var(--color-brick);
+}
+
+.stg-urgent-badge-lbl {
+  font-family: var(--font-sans);
+  font-size: 8px;
+  letter-spacing: 1.2px;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  margin-top: 4px;
+  text-align: center;
+}
+
+.stg-urgent-body { min-width: 0; }
+
+.stg-urgent-title {
+  font-family: var(--font-shout);
+  font-size: 17px;
+  color: var(--color-ink);
+  letter-spacing: -0.1px;
+  line-height: 1.1;
+}
+
+.stg-urgent-meta {
+  font-family: var(--font-slab);
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-top: 4px;
+}
+
+.stg-urgent-price {
+  text-align: right;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.stg-urgent-price-lbl {
+  font-family: var(--font-sans);
+  font-size: 8px;
+  letter-spacing: 1.4px;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+}
+
+.stg-urgent-price-num {
+  font-family: var(--font-display);
+  font-size: 20px;
+  color: var(--color-brick);
+  margin-top: 3px;
+  line-height: 1;
+}
+
+/* ==========================================================================
+   CHEAPEST — Opening Soon (preview cards)
+   ========================================================================== */
+
+.stg-opening-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.stg-opening-card {
+  display: flex;
+  flex-direction: column;
+  padding: 16px 18px;
+  background: var(--color-paper-warm);
+  border: 0.5px solid var(--line-soft);
+  border-radius: 3px;
+  min-height: 200px;
+  transition: border-color 0.18s;
+  text-decoration: none;
+  color: inherit;
+}
+
+.stg-opening-card:hover { border-color: rgba(163, 50, 42, 0.5); }
+
+.stg-opening-when {
+  font-family: var(--font-slab);
+  font-size: 10px;
+  letter-spacing: 1.6px;
+  color: var(--color-brick);
+}
+
+.stg-opening-date {
+  font-family: var(--font-display);
+  font-size: 15px;
+  color: var(--color-ink);
+  margin-top: 4px;
+  letter-spacing: 0.5px;
+}
+
+.stg-opening-title {
+  font-family: var(--font-shout);
+  font-size: 18px;
+  color: var(--color-ink);
+  letter-spacing: -0.15px;
+  line-height: 1.1;
+  margin-top: 14px;
+}
+
+.stg-opening-venue {
+  font-family: var(--font-slab);
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-top: 5px;
+}
+
+.stg-opening-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  margin-top: auto;
+  padding-top: 14px;
+  gap: 12px;
+}
+
+.stg-opening-price-lbl {
+  display: block;
+  font-family: var(--font-sans);
+  font-size: 8px;
+  letter-spacing: 1.4px;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+}
+
+.stg-opening-price-num {
+  display: block;
+  font-family: var(--font-display);
+  font-size: 22px;
+  color: var(--color-brick);
+  margin-top: 3px;
+  line-height: 1;
+}
+
+.stg-opening-savings {
+  font-family: var(--font-sans);
+  font-size: 9px;
+  letter-spacing: 0.8px;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  text-align: right;
+  line-height: 1.35;
+  max-width: 110px;
+}
+
+/* ==========================================================================
+   WHEN — Day-of-week heatmap
+   ========================================================================== */
+
+.stg-dow-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.stg-dow-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 14px 0 12px;
+  background: var(--color-paper-warm);
+  border: 0.5px solid var(--line-soft);
+  border-radius: 3px;
+  min-height: 200px;
+  position: relative;
+}
+
+.stg-dow-cell.min {
+  background: rgba(163, 50, 42, 0.07);
+  border-color: rgba(163, 50, 42, 0.45);
+}
+
+.stg-dow-cell.max::after {
+  content: 'PRICIEST';
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  font-family: var(--font-sans);
+  font-size: 7px;
+  letter-spacing: 1.2px;
+  color: var(--color-text-faint);
+}
+
+.stg-dow-cell.min::after {
+  content: 'CHEAPEST';
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  font-family: var(--font-sans);
+  font-size: 7px;
+  letter-spacing: 1.2px;
+  color: var(--color-brick);
+}
+
+.stg-dow-cell-dow {
+  font-family: var(--font-slab);
+  font-size: 11px;
+  letter-spacing: 1.8px;
+  color: var(--color-text-muted);
+}
+
+.stg-dow-cell-bar-wrap {
+  flex: 1;
+  width: 40%;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  margin: 12px 0 10px;
+}
+
+.stg-dow-cell-bar {
+  width: 100%;
+  background: linear-gradient(
+    180deg,
+    rgba(163, 50, 42, 0.55) 0%,
+    rgba(163, 50, 42, 0.85) 100%
+  );
+  border-radius: 2px 2px 0 0;
+  min-height: 14px;
+}
+
+.stg-dow-cell-bar.zero {
+  background: rgba(28, 26, 23, 0.06);
+  min-height: 6px;
+  height: 6px !important;
+}
+
+.stg-dow-cell-price {
+  font-family: var(--font-display);
+  font-size: 18px;
+  color: var(--color-brick);
+  line-height: 1;
+}
+
+.stg-dow-cell.dark .stg-dow-cell-price { color: var(--color-text-faint); }
+
+.stg-dow-cell-count {
+  font-family: var(--font-sans);
+  font-size: 8px;
+  letter-spacing: 1.2px;
+  color: var(--color-text-muted);
+  margin-top: 4px;
+}
+
+/* ==========================================================================
+   WHEN — Long calendar (90-day strip)
+   ========================================================================== */
+
+.stg-longcal { margin-bottom: 18px; }
+
+.stg-longcal-strip {
+  display: grid;
+  grid-template-columns: repeat(45, 1fr);
+  gap: 2px;
+  align-items: end;
+  height: 90px;
+  padding: 8px 0 4px;
+  border-bottom: 0.5px solid var(--line-faint);
+}
+
+.stg-longcal-cell {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: stretch;
+  position: relative;
+  min-width: 0;
+  text-decoration: none;
+  color: inherit;
+  transition: opacity 0.15s;
+}
+
+.stg-longcal-cell:hover { opacity: 0.65; }
+
+.stg-longcal-cell-bar {
+  width: 100%;
+  border-radius: 1px;
+  display: block;
+}
+
+.stg-longcal-cell.bucket-1 .stg-longcal-cell-bar { background: rgba(163, 50, 42, 0.85); height: 60px; }
+.stg-longcal-cell.bucket-2 .stg-longcal-cell-bar { background: rgba(163, 50, 42, 0.6);  height: 50px; }
+.stg-longcal-cell.bucket-3 .stg-longcal-cell-bar { background: rgba(163, 50, 42, 0.4);  height: 38px; }
+.stg-longcal-cell.bucket-4 .stg-longcal-cell-bar { background: rgba(163, 50, 42, 0.22); height: 28px; }
+.stg-longcal-cell.bucket-5 .stg-longcal-cell-bar { background: rgba(28, 26, 23, 0.12);  height: 18px; }
+.stg-longcal-cell.dark   .stg-longcal-cell-bar  { background: rgba(28, 26, 23, 0.05);  height: 6px; }
+
+.stg-longcal-cell.weekend .stg-longcal-cell-bar {
+  outline: 0.5px solid rgba(28, 26, 23, 0.18);
+  outline-offset: -0.5px;
+}
+
+.stg-longcal-cell.today .stg-longcal-cell-bar {
+  outline: 1px solid var(--color-ink);
+  outline-offset: -1px;
+}
+
+.stg-longcal-cell-dom {
+  display: none;
+}
+
+.stg-longcal-axis {
+  position: relative;
+  height: 18px;
+  margin-top: 4px;
+  border-bottom: 0.5px solid var(--line-faint);
+}
+
+.stg-longcal-axis-tick {
+  position: absolute;
+  top: 0;
+  font-family: var(--font-slab);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: var(--color-text-muted);
+  padding: 0 4px;
+  background: var(--color-paper);
+  transform: translateX(-2px);
+}
+
+.stg-longcal-legend {
+  display: flex;
+  gap: 18px;
+  align-items: center;
+  justify-content: flex-end;
+  margin-top: 14px;
+  font-family: var(--font-slab);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: var(--color-text-muted);
+}
+
+.stg-longcal-legend-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.stg-longcal-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 1px;
+}
+
+.stg-longcal-swatch.bucket-1 { background: rgba(163, 50, 42, 0.85); }
+.stg-longcal-swatch.bucket-5 { background: rgba(28, 26, 23, 0.12); }
+.stg-longcal-swatch.dark     { background: rgba(28, 26, 23, 0.05); }
+
+.stg-when-hint {
+  font-family: var(--font-slab);
+  font-style: italic;
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 0.5px solid var(--line-faint);
+}
+
+.stg-when-hint code {
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  font-style: normal;
+  color: var(--color-ink);
+  background: rgba(28, 26, 23, 0.05);
+  padding: 1px 6px;
+  border-radius: 2px;
+}
+
+/* ==========================================================================
+   WHEN-DATE — per-date listing (uses .stg-search-* rows + sort buttons,
+   already styled in index.css. No new visuals needed beyond container.)
+   ========================================================================== */
+
+.stg-whendate .stg-search-controls {
+  justify-content: flex-end;
+}
+
+.stg-state code {
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--color-ink);
+  background: rgba(28, 26, 23, 0.05);
+  padding: 1px 6px;
+  border-radius: 2px;
+}
+
+/* ==========================================================================
+   SHOWS — Filter chips
+   ========================================================================== */
+
+.stg-chip-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.stg-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: var(--color-paper-warm);
+  border: 0.5px solid var(--line-soft);
+  border-radius: 100px;
+  font-family: var(--font-slab);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  transition: all 0.18s;
+}
+
+.stg-chip:hover {
+  border-color: rgba(163, 50, 42, 0.5);
+  color: var(--color-ink);
+}
+
+.stg-chip.active {
+  background: var(--color-ink);
+  border-color: var(--color-ink);
+  color: var(--color-paper);
+}
+
+.stg-chip-lbl { font-weight: 500; }
+
+.stg-chip-count {
+  font-family: var(--font-display);
+  font-size: 11px;
+  color: var(--color-brick);
+  letter-spacing: 0;
+}
+
+.stg-chip.active .stg-chip-count {
+  color: var(--color-gold-light, #e6c876);
+}
+
+/* ==========================================================================
+   VENUES — Grid + cards
+   ========================================================================== */
+
+.stg-venue-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.stg-venue-card {
+  display: flex;
+  flex-direction: column;
+  padding: 14px 16px;
+  background: var(--color-paper-warm);
+  border: 0.5px solid var(--line-soft);
+  border-radius: 3px;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.18s, opacity 0.18s;
+  min-height: 110px;
+}
+
+.stg-venue-card:hover { border-color: rgba(163, 50, 42, 0.5); }
+.stg-venue-card.inactive { opacity: 0.55; }
+
+.stg-venue-name {
+  font-family: var(--font-shout);
+  font-size: 15px;
+  color: var(--color-ink);
+  letter-spacing: -0.05px;
+  line-height: 1.1;
+}
+
+.stg-venue-counts {
+  display: flex;
+  gap: 14px;
+  margin-top: 8px;
+  font-family: var(--font-slab);
+  font-size: 10px;
+  color: var(--color-text-muted);
+  letter-spacing: 0.5px;
+}
+
+.stg-venue-counts b {
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 13px;
+  color: var(--color-ink);
+}
+
+.stg-venue-foot {
+  margin-top: auto;
+  padding-top: 10px;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.stg-venue-floor-lbl {
+  font-family: var(--font-sans);
+  font-size: 8px;
+  letter-spacing: 1.4px;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+}
+
+.stg-venue-floor-lbl.dim {
+  color: var(--color-text-faint);
+}
+
+.stg-venue-floor-val {
+  font-family: var(--font-display);
+  font-size: 18px;
+  color: var(--color-brick);
+}
+
+.stg-venue-empty {
+  grid-column: 1 / -1;
+}
+
+/* ==========================================================================
+   DATA — Methodology page
+   ========================================================================== */
+
+.stg-coverage-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.stg-coverage-row {
+  display: grid;
+  grid-template-columns: 90px 1fr 50px;
+  align-items: center;
+  gap: 14px;
+}
+
+.stg-coverage-lbl {
+  font-family: var(--font-slab);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  color: var(--color-text-muted);
+}
+
+.stg-coverage-bar-wrap {
+  height: 14px;
+  background: rgba(28, 26, 23, 0.04);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.stg-coverage-bar {
+  height: 100%;
+  border-radius: 2px;
+  min-width: 4px;
+}
+
+.stg-coverage-bar.bucket-1 { background: rgba(163, 50, 42, 0.85); }
+.stg-coverage-bar.bucket-2 { background: rgba(163, 50, 42, 0.6); }
+.stg-coverage-bar.bucket-3 { background: rgba(163, 50, 42, 0.4); }
+.stg-coverage-bar.bucket-4 { background: rgba(163, 50, 42, 0.22); }
+.stg-coverage-bar.bucket-5 { background: rgba(28, 26, 23, 0.12); }
+
+.stg-coverage-num {
+  font-family: var(--font-display);
+  font-size: 16px;
+  color: var(--color-ink);
+  text-align: right;
+}
+
+.stg-data-note {
+  font-family: var(--font-slab);
+  font-style: italic;
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 0.5px solid var(--line-faint);
+  line-height: 1.5;
+  max-width: 640px;
+}
+
+.stg-data-seller-list {
+  display: flex;
+  flex-direction: column;
+  border-top: 0.5px solid var(--line-soft);
+}
+
+.stg-data-seller-row {
+  display: grid;
+  grid-template-columns: 1fr 120px 120px;
+  gap: 14px;
+  align-items: baseline;
+  padding: 12px 4px;
+  border-bottom: 0.5px solid var(--line-faint);
+}
+
+.stg-data-seller-name {
+  font-family: var(--font-shout);
+  font-size: 15px;
+  color: var(--color-ink);
+  letter-spacing: -0.05px;
+}
+
+.stg-data-seller-count {
+  font-family: var(--font-display);
+  font-size: 16px;
+  color: var(--color-brick);
+}
+
+.stg-data-seller-count-lbl {
+  font-family: var(--font-sans);
+  font-size: 9px;
+  letter-spacing: 1.2px;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  margin-left: 4px;
+}
+
+.stg-data-seller-when {
+  font-family: var(--font-slab);
+  font-size: 11px;
+  color: var(--color-text-muted);
+  text-align: right;
+}
+
+.stg-data-stages {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.stg-data-stage {
+  padding: 16px 18px;
+  background: var(--color-paper-warm);
+  border: 0.5px solid var(--line-soft);
+  border-radius: 3px;
+}
+
+.stg-data-stage-num {
+  font-family: var(--font-display);
+  font-size: 30px;
+  color: var(--color-ink);
+  line-height: 1;
+}
+
+.stg-data-stage-lbl {
+  font-family: var(--font-slab);
+  font-size: 10px;
+  letter-spacing: 1.6px;
+  color: var(--color-brick);
+  margin-top: 8px;
+}
+
+.stg-data-stage-sub {
+  font-family: var(--font-slab);
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-top: 6px;
+  line-height: 1.5;
+}
+
+.stg-data-prose .stg-data-paragraphs {
+  max-width: 720px;
+}
+
+.stg-data-paragraphs p {
+  font-family: var(--font-slab);
+  font-size: 13px;
+  color: var(--color-text);
+  line-height: 1.65;
+  margin: 0 0 14px;
+}
+
+.stg-data-paragraphs p:last-child { margin-bottom: 0; }
+
+.stg-data-paragraphs b {
+  font-family: var(--font-slab);
+  color: var(--color-brick);
+  font-weight: 700;
+}
+
+/* ==========================================================================
+   RESPONSIVE — Tighten dense grids on narrow viewports
+   ========================================================================== */
+
+@media (max-width: 900px) {
+  .stg-weekend-grid.cards-3,
+  .stg-weekend-grid.cards-2 {
+    grid-template-columns: 1fr;
+  }
+  .stg-tier-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .stg-opening-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .stg-data-stages {
+    grid-template-columns: 1fr;
+  }
+  .stg-spread-row {
+    grid-template-columns: 30px 1fr 80px;
+    gap: 10px;
+  }
+  .stg-matinee-row {
+    grid-template-columns: 70px 1fr 60px;
+    gap: 12px;
+  }
+  .stg-matinee-vs { display: none; }
+  .stg-urgent-row {
+    grid-template-columns: 60px 1fr auto;
+    gap: 12px;
+  }
+  .stg-dow-grid {
+    grid-template-columns: repeat(7, 1fr);
+    gap: 2px;
+  }
+  .stg-dow-cell { min-height: 140px; }
+  .stg-dow-cell-bar-wrap { width: 60%; }
+}
+
+@media (max-width: 640px) {
+  .stg-tier-grid { grid-template-columns: 1fr; }
+  .stg-opening-grid { grid-template-columns: 1fr; }
+  .stg-venue-grid { grid-template-columns: 1fr; }
+  .stg-longcal-strip {
+    grid-template-columns: repeat(30, 1fr);
+    height: 70px;
+  }
+  .stg-coverage-row {
+    grid-template-columns: 60px 1fr 40px;
+    gap: 10px;
+  }
+  .stg-data-seller-row {
+    grid-template-columns: 1fr 80px;
+    grid-template-rows: auto auto;
+    gap: 4px;
+  }
+  .stg-data-seller-when {
+    grid-column: 1 / -1;
+    text-align: left;
+  }
+}

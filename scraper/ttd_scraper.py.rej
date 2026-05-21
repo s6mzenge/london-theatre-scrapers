@@ -1,0 +1,219 @@
+diff a/scraper/ttd_scraper.py b/scraper/ttd_scraper.py	(rejected hunks)
+@@ -528,6 +590,197 @@
+     return twice.strip() or None
+ 
+ 
++def _clean_book_url(url: str | None) -> str | None:
++    """Strip the query string and fragment from a /shows/seats/... URL.
++
++    TTD's JSON-LD `offers.url` carries a tracking parameter (`?m=cmst`)
++    that the visible "Next Performances" tab links do NOT include. This
++    is a hygiene measure to keep the URLs we record canonical and
++    consistent across both extraction sources (JSON-LD and visible
++    links) — the tracking flag isn't load-bearing in the URL we store.
++
++    Note: stripping this does NOT make the booking flow work for
++    external arrivals on a /0 placeholder URL. TTD's JS on the
++    seat-plan page re-adds ?m=cmst on page load whenever it can't
++    detect an internal-navigation session, and then refuses /0. The
++    actual fix for the broken booking link is to substitute a real
++    performance ID via the bindcalendar AJAX resolver below; this
++    helper just removes upstream noise from the stored URL.
++
++    Only operates on TTD seat-plan URLs (path contains /shows/seats/);
++    other URLs are returned unchanged."""
++    if not url:
++        return url
++    if "/shows/seats/" not in url:
++        return url
++    # Split once on '?' or '#', whichever comes first.
++    for sep in ("?", "#"):
++        i = url.find(sep)
++        if i != -1:
++            url = url[:i]
++    return url
++
++
++def _year_months_from_perfs(perfs: list[dict]) -> list[tuple[int, int]]:
++    """Return the unique (year, month) pairs covered by a performance
++    list, in first-occurrence order. Used to decide which calendar
++    months we need to fetch for a show.
++
++    Performances without a parseable date are skipped (they don't
++    contribute a month we could fetch anyway). The result is capped at
++    BINDCAL_MAX_MONTHS_PER_SHOW so a malformed input can't make us
++    fan out unbounded calendar calls.
++    """
++    seen: set[tuple[int, int]] = set()
++    out: list[tuple[int, int]] = []
++    for p in perfs:
++        date = p.get("date")
++        if not isinstance(date, str) or len(date) < 7:
++            continue
++        try:
++            y = int(date[:4])
++            m = int(date[5:7])
++        except ValueError:
++            continue
++        key = (y, m)
++        if key in seen:
++            continue
++        seen.add(key)
++        out.append(key)
++        if len(out) >= BINDCAL_MAX_MONTHS_PER_SHOW:
++            break
++    return out
++
++
++def _extract_perf_ids_from_calendar(text: str, show_id: int) -> dict:
++    """Walk a calendar response body (HTML fragment or JSON, doesn't
++    matter — we regex over the raw text) and build a lookup mapping
++
++        (date_iso, time_str) -> perf_id (int)
++
++    for every seat-plan URL that carries a non-zero performance ID and
++    matches our show. Multiple URLs with the same (date, time) but
++    different perf IDs (shouldn't happen) are resolved last-write-wins.
++    """
++    out: dict[tuple[str, str], int] = {}
++    for m in _CAL_PERF_URL_RE.finditer(text):
++        sid, y, mo, d, _qty, hh, mm, pid_str = m.groups()
++        try:
++            if int(sid) != show_id:
++                continue
++            pid = int(pid_str)
++            if pid == 0:
++                # Calendar can include /0 entries too (e.g. for the
++                # "current day" cell which mirrors the show page).
++                # They tell us nothing new; skip.
++                continue
++            date = f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
++            time = f"{int(hh):02d}:{mm}"
++        except ValueError:
++            continue
++        out[(date, time)] = pid
++    return out
++
++
++def _patch_booking_urls(perfs: list[dict], perf_id_map: dict) -> int:
++    """Replace `/0` placeholder perf IDs in each performance dict's
++    book_url with the real ID from perf_id_map. Mutates `perfs` in
++    place. Returns the number of URLs patched.
++
++    No-op for performances whose book_url doesn't have the placeholder
++    (e.g. the rare case where TTD has already given us a real ID).
++    Performances whose (date, time) isn't covered by the calendar
++    response are left untouched — downstream code falls back to the
++    show URL via the dedupe-layer guard added alongside this resolver.
++    """
++    if not perf_id_map:
++        return 0
++    patched = 0
++    for p in perfs:
++        url = p.get("book_url")
++        if not url or "/shows/seats/" not in url:
++            continue
++        if not _PLACEHOLDER_RE.search(url):
++            continue
++        key = (p.get("date"), p.get("time"))
++        pid = perf_id_map.get(key)
++        if pid is None:
++            continue
++        new_url = _PLACEHOLDER_RE.sub(f"/{pid}\\1", url)
++        if new_url != url:
++            p["book_url"] = new_url
++            patched += 1
++    return patched
++
++
++async def _fetch_calendar_month(
++    client: "httpx.AsyncClient", show_id: int, year: int, month: int, referer: str,
++) -> dict:
++    """Fetch one calendar month for one show and return the per-perf
++    ID map. Returns an empty dict on any failure — calendar enrichment
++    is best-effort and must never break the scrape.
++    """
++    headers = {
++        "X-Requested-With": "XMLHttpRequest",
++        "Referer": referer,
++        "Accept": "text/html, */*; q=0.01",
++    }
++    url = f"{BASE}{BINDCAL_URL_PATH}"
++    try:
++        if BINDCAL_METHOD == "POST":
++            resp = await client.post(
++                url,
++                data=_bindcal_form(show_id, year, month),
++                headers=headers,
++                timeout=BINDCAL_TIMEOUT_S,
++            )
++        else:
++            resp = await client.get(
++                url,
++                params=_bindcal_form(show_id, year, month),
++                headers=headers,
++                timeout=BINDCAL_TIMEOUT_S,
++            )
++    except httpx.HTTPError as e:
++        log.warning("bindcalendar %s %d/%d: %s: %s",
++                    show_id, year, month, type(e).__name__, e)
++        return {}
++    if resp.status_code >= 400:
++        log.warning("bindcalendar %s %d/%d: HTTP %d",
++                    show_id, year, month, resp.status_code)
++        return {}
++    return _extract_perf_ids_from_calendar(resp.text, show_id)
++
++
++async def _resolve_perf_ids(
++    client: "httpx.AsyncClient", show_id: int, referer: str, perfs: list[dict],
++) -> int:
++    """Top-level orchestrator: figures out which calendar months are
++    needed, fetches them concurrently, builds a unified perf-ID map,
++    and patches each performance's book_url in place. Returns the
++    number of URLs patched (for logging).
++
++    Errors and partial coverage are silent and logged at warning level
++    — the scraper produces useful output either way; downstream code
++    falls back to the show URL when book_url still has /0.
++    """
++    ym_pairs = _year_months_from_perfs(perfs)
++    if not ym_pairs:
++        return 0
++    tasks = [
++        _fetch_calendar_month(client, show_id, y, m, referer)
++        for (y, m) in ym_pairs
++    ]
++    results = await asyncio.gather(*tasks, return_exceptions=True)
++    perf_id_map: dict[tuple[str, str], int] = {}
++    for res in results:
++        if isinstance(res, dict):
++            perf_id_map.update(res)
++        # Exceptions: already logged inside _fetch_calendar_month; the
++        # `return_exceptions=True` here is belt-and-braces.
++    return _patch_booking_urls(perfs, perf_id_map)
++
++
+ def _to_float(s) -> float | None:
+     """Coerce to float; treat empty string as None. The site's
+     AggregateOffer.highPrice is consistently '' rather than missing."""
+@@ -906,7 +1159,9 @@
+         offers = block.get("offers") or {}
+         if not isinstance(offers, dict):
+             offers = {}
+-        book_url = _decode(offers.get("url")) or _decode(block.get("url"))
++        book_url = _clean_book_url(
++            _decode(offers.get("url")) or _decode(block.get("url"))
++        )
+ 
+         out.append(Performance(
+             iso=iso,
+@@ -969,7 +1224,7 @@
+             price=None,
+             currency=None,
+             availability=None,
+-            book_url=href,
++            book_url=_clean_book_url(href),
+             source="next_perf_link",
+         ))
+     return out

@@ -12,6 +12,7 @@
 import {
   addDaysISO,
   dayOfMonth,
+  dowMondayFirst,
   dowShort,
   formatShortDate,
   monthLabel,
@@ -25,7 +26,7 @@ import {
 // CORS preflight, no dependency on external caches — the data ships
 // with the bundle, and a Pages redeploy after every scrape is what
 // makes it fresh.
-const DATA_URL = `${import.meta.env.BASE_URL || '/'}data/unified.json.gz`
+const DATA_URL = `${(import.meta.env && import.meta.env.BASE_URL) || '/'}data/unified.json.gz`
 
 export async function loadUnifiedData() {
   const r = await fetch(DATA_URL, { cache: 'default' })
@@ -238,7 +239,13 @@ export function computeAggregations(data, today) {
   const showFuturePrices = buildShowFuturePrices(data, today)
   return {
     tonight: aggregateTonight(data, today),
+    weekend: aggregateWeekend(data, today),
+    matinees: aggregateMatineesWeek(data, today),
     week: aggregateWeek(data, today, showFuturePrices),
+    tiers: aggregatePriceTiers(data, today),
+    spreads: aggregateSpreads(data, today),
+    closingSoon: aggregateClosingSoon(data, today),
+    openingSoon: aggregateOpeningSoon(data, today),
     month: aggregateMonth(data, today, showFuturePrices),
   }
 }
@@ -611,5 +618,799 @@ function aggregateMonth(data, today, showFuturePrices) {
     weeks,
     monthFloor,
     insights,
+  }
+}
+
+// =============================================================
+// Weekend: the next Fri+Sat+Sun within the 7-day window.
+// On a Friday morning all three nights are ahead; on a Sunday
+// only Sun itself remains. We show whatever's still upcoming so
+// the section silently degrades from "three cards" down to "one".
+// On a Mon-Thu morning we show the coming weekend.
+// =============================================================
+
+function aggregateWeekend(data, today) {
+  // JS getDay() : 0 = Sun .. 6 = Sat. We want Fri=5, Sat=6, Sun=0.
+  const todayJsDow = parseISO(today).getDay()
+  // Days until next Friday (0 if today is Friday).
+  const daysToFri = (5 - todayJsDow + 7) % 7
+  // If we're already past Friday in the current week (Sat=6 or Sun=0),
+  // pick *this* weekend's remaining days rather than next Friday.
+  let weekendIsos
+  if (todayJsDow === 0) {
+    weekendIsos = [today] // Sunday — Sat is past, Fri is past
+  } else if (todayJsDow === 6) {
+    weekendIsos = [today, addDaysISO(today, 1)] // Sat + Sun
+  } else if (todayJsDow === 5) {
+    weekendIsos = [today, addDaysISO(today, 1), addDaysISO(today, 2)]
+  } else {
+    const friIso = addDaysISO(today, daysToFri)
+    weekendIsos = [friIso, addDaysISO(friIso, 1), addDaysISO(friIso, 2)]
+  }
+
+  const byIso = Object.fromEntries(
+    weekendIsos.map((iso) => [iso, { iso, perfs: [], floor: null }]),
+  )
+
+  for (const show of data.shows) {
+    for (const perf of show.performances || []) {
+      if (!byIso[perf.date]) continue
+      const eff = effectiveCheapest(perf)
+      if (!eff) continue
+      byIso[perf.date].perfs.push({ show, perf, effPrice: eff.price })
+    }
+  }
+
+  const days = weekendIsos.map((iso) => {
+    const slot = byIso[iso]
+    if (slot.perfs.length === 0) {
+      return {
+        iso,
+        dow: dowShort(iso),
+        dayOfMonth: dayOfMonth(iso),
+        isDark: true,
+        floor: null,
+        topShows: [],
+      }
+    }
+    slot.perfs.sort((a, b) => a.effPrice - b.effPrice)
+    const dedupedByShow = new Map()
+    for (const item of slot.perfs) {
+      if (!dedupedByShow.has(item.show.id)) {
+        dedupedByShow.set(item.show.id, item)
+      }
+    }
+    const top = [...dedupedByShow.values()].slice(0, 3).map((item) => ({
+      show: {
+        id: item.show.id,
+        title: item.show.title,
+        venue: item.show.venue,
+      },
+      time: item.perf.time || '',
+      price: item.effPrice,
+    }))
+    return {
+      iso,
+      dow: dowShort(iso),
+      dayOfMonth: dayOfMonth(iso),
+      isDark: false,
+      floor: slot.perfs[0].effPrice,
+      topShows: top,
+      showCount: dedupedByShow.size,
+    }
+  })
+
+  const litFloors = days.filter((d) => !d.isDark).map((d) => d.floor)
+  const weekendFloor =
+    litFloors.length > 0 ? Math.min(...litFloors) : null
+
+  return { days, weekendFloor }
+}
+
+// =============================================================
+// Matinées: cheapest afternoon performances over the next 7 days.
+// Defined as a performance whose start time is before 17:00.
+// We also compute, per show, the cheapest *evening* performance
+// across the same window so the card can show "save vs evening".
+// =============================================================
+
+function aggregateMatineesWeek(data, today) {
+  const windowEnd = addDaysISO(today, 7)
+  const matineeRows = []
+  const eveningByShow = new Map()
+
+  for (const show of data.shows) {
+    let cheapestMat = null
+    for (const perf of show.performances || []) {
+      if (perf.date < today || perf.date >= windowEnd) continue
+      const eff = effectiveCheapest(perf)
+      if (!eff) continue
+      const hour = perf.time ? parseInt(perf.time.split(':')[0], 10) : null
+      if (hour == null) continue
+      if (hour < 17) {
+        if (!cheapestMat || eff.price < cheapestMat.price) {
+          cheapestMat = {
+            show,
+            perf,
+            price: eff.price,
+            seller: eff.seller,
+          }
+        }
+      } else {
+        const prev = eveningByShow.get(show.id)
+        if (!prev || eff.price < prev) {
+          eveningByShow.set(show.id, eff.price)
+        }
+      }
+    }
+    if (cheapestMat) {
+      matineeRows.push(cheapestMat)
+    }
+  }
+
+  matineeRows.sort((a, b) => a.price - b.price)
+
+  // Aggregate stats — total matinée performances in the window
+  // (counted across shows) and the absolute floor.
+  let totalMatPerfs = 0
+  let floor = null
+  for (const show of data.shows) {
+    for (const perf of show.performances || []) {
+      if (perf.date < today || perf.date >= windowEnd) continue
+      const hour = perf.time ? parseInt(perf.time.split(':')[0], 10) : null
+      if (hour == null || hour >= 17) continue
+      const eff = effectiveCheapest(perf)
+      if (!eff) continue
+      totalMatPerfs++
+      if (floor == null || eff.price < floor) floor = eff.price
+    }
+  }
+
+  return {
+    rows: matineeRows.slice(0, 8).map((r) => {
+      const evening = eveningByShow.get(r.show.id) ?? null
+      const savings =
+        evening != null && evening > r.price
+          ? Math.round(evening - r.price)
+          : null
+      return {
+        show: {
+          id: r.show.id,
+          title: r.show.title,
+          venue: r.show.venue,
+        },
+        date: r.perf.date,
+        dayLabel: formatShortDate(r.perf.date).toUpperCase(),
+        time: r.perf.time || '',
+        price: r.price,
+        eveningPrice: evening,
+        savings,
+      }
+    }),
+    totalPerfs: totalMatPerfs,
+    floor,
+  }
+}
+
+// =============================================================
+// Price tiers: a 4-tile budget breakdown over the next 30 days.
+// For each tier we count distinct shows that have at least one
+// performance with an effective floor inside that band, and pick
+// one headline show (the cheapest sub-floor of each tier).
+// =============================================================
+
+const TIER_DEFS = [
+  { id: 'under20', label: 'UNDER £20', min: 0, max: 20 },
+  { id: '20to30', label: '£20–£30', min: 20, max: 30 },
+  { id: '30to40', label: '£30–£40', min: 30, max: 40 },
+  { id: '40plus', label: 'OVER £40', min: 40, max: Infinity },
+]
+
+function aggregatePriceTiers(data, today) {
+  const windowEnd = addDaysISO(today, 30)
+  // Per show, the cheapest effective price in the window.
+  const showBest = new Map()
+  for (const show of data.shows) {
+    let best = Infinity
+    let bestPerf = null
+    for (const perf of show.performances || []) {
+      if (perf.date < today || perf.date >= windowEnd) continue
+      const eff = effectiveCheapest(perf)
+      if (!eff) continue
+      if (eff.price < best) {
+        best = eff.price
+        bestPerf = perf
+      }
+    }
+    if (best < Infinity) {
+      showBest.set(show.id, { show, price: best, perf: bestPerf })
+    }
+  }
+
+  const tiers = TIER_DEFS.map((def) => {
+    const inTier = []
+    for (const entry of showBest.values()) {
+      if (entry.price >= def.min && entry.price < def.max) {
+        inTier.push(entry)
+      }
+    }
+    inTier.sort((a, b) => a.price - b.price)
+    const top = inTier[0]
+    return {
+      id: def.id,
+      label: def.label,
+      count: inTier.length,
+      headline: top
+        ? {
+            show: {
+              id: top.show.id,
+              title: top.show.title,
+              venue: top.show.venue,
+            },
+            price: top.price,
+            dayLabel: formatShortDate(top.perf.date).toUpperCase(),
+          }
+        : null,
+    }
+  })
+
+  return { tiers, windowDays: 30 }
+}
+
+// =============================================================
+// Widest spreads: performances where the gap between the cheapest
+// seller and the most expensive seller is largest, *in absolute £*.
+// Each row is one performance with multiple sellers in agreement
+// on the date+time but different on the price. This is the
+// editorial "where shopping around pays off" surface.
+//
+// We restrict to next 30 days so the section stays relevant, and
+// dedupe by show so one show with many wide-spread performances
+// only appears once (with its widest spread surfaced).
+// =============================================================
+
+function aggregateSpreads(data, today) {
+  const windowEnd = addDaysISO(today, 30)
+  const perShowBest = new Map()
+
+  for (const show of data.shows) {
+    for (const perf of show.performances || []) {
+      if (perf.date < today || perf.date >= windowEnd) continue
+      if (!perf.sources) continue
+      const sellers = []
+      for (const [sid, info] of Object.entries(perf.sources)) {
+        if (info && validPrice(info.price_from)) {
+          sellers.push({ sellerId: sid, price: info.price_from })
+        }
+      }
+      if (sellers.length < 2) continue
+      sellers.sort((a, b) => a.price - b.price)
+      const cheap = sellers[0]
+      const dear = sellers[sellers.length - 1]
+      const spread = dear.price - cheap.price
+      if (spread < 5) continue // ignore noise
+      const prev = perShowBest.get(show.id)
+      if (!prev || spread > prev.spread) {
+        perShowBest.set(show.id, {
+          show,
+          perf,
+          spread,
+          cheap,
+          dear,
+          sellersCount: sellers.length,
+          pct: dear.price > 0 ? Math.round((spread / dear.price) * 100) : 0,
+        })
+      }
+    }
+  }
+
+  const rows = [...perShowBest.values()]
+    .sort((a, b) => b.spread - a.spread)
+    .slice(0, 8)
+    .map((r) => ({
+      show: { id: r.show.id, title: r.show.title, venue: r.show.venue },
+      dayLabel: formatShortDate(r.perf.date).toUpperCase(),
+      time: r.perf.time || '',
+      cheap: r.cheap,
+      dear: r.dear,
+      spread: r.spread,
+      pct: r.pct,
+      sellersCount: r.sellersCount,
+    }))
+
+  return { rows }
+}
+
+// =============================================================
+// Closing soon: shows whose last future performance falls within
+// `days` days from today. Sorted by remaining days ascending so
+// the most urgent show is first.
+// =============================================================
+
+function aggregateClosingSoon(data, today, days = 30) {
+  const horizon = addDaysISO(today, days)
+  const rows = []
+  for (const show of data.shows) {
+    const future = (show.performances || []).filter(
+      (p) => p.date >= today,
+    )
+    if (future.length === 0) continue
+    const lastIso = future.reduce(
+      (acc, p) => (p.date > acc ? p.date : acc),
+      future[0].date,
+    )
+    if (lastIso > horizon) continue
+    const remaining = future.length
+    let floor = null
+    for (const p of future) {
+      const eff = effectiveCheapest(p)
+      if (eff && (floor == null || eff.price < floor)) floor = eff.price
+    }
+    const daysLeft = Math.max(
+      0,
+      Math.round((parseISO(lastIso) - parseISO(today)) / (24 * 3600 * 1000)),
+    )
+    rows.push({
+      show: {
+        id: show.id,
+        title: show.title,
+        venue: show.venue,
+      },
+      lastIso,
+      lastLabel: formatShortDate(lastIso).toUpperCase(),
+      daysLeft,
+      remaining,
+      floor,
+    })
+  }
+  rows.sort((a, b) => a.daysLeft - b.daysLeft)
+  return { rows: rows.slice(0, 8), totalCount: rows.length, windowDays: days }
+}
+
+// =============================================================
+// Opening soon: shows whose first future performance is within
+// `days` days from today AND is later than today (i.e. they
+// aren't already running). The first-week prices are typically
+// previews — we surface that price specifically.
+// =============================================================
+
+function aggregateOpeningSoon(data, today, days = 21) {
+  const horizon = addDaysISO(today, days)
+  const rows = []
+  for (const show of data.shows) {
+    const future = (show.performances || []).filter(
+      (p) => p.date >= today,
+    )
+    if (future.length === 0) continue
+    const firstIso = future.reduce(
+      (acc, p) => (p.date < acc ? p.date : acc),
+      future[0].date,
+    )
+    // Skip shows that are already in progress (first future perf is today).
+    if (firstIso <= today) continue
+    if (firstIso > horizon) continue
+
+    // Floor across first-week previews (first 7 days of the run).
+    const previewEnd = addDaysISO(firstIso, 7)
+    let previewFloor = null
+    let runFloor = null
+    for (const p of future) {
+      const eff = effectiveCheapest(p)
+      if (!eff) continue
+      if (runFloor == null || eff.price < runFloor) runFloor = eff.price
+      if (p.date < previewEnd) {
+        if (previewFloor == null || eff.price < previewFloor) {
+          previewFloor = eff.price
+        }
+      }
+    }
+    const daysOut = Math.max(
+      0,
+      Math.round((parseISO(firstIso) - parseISO(today)) / (24 * 3600 * 1000)),
+    )
+    rows.push({
+      show: {
+        id: show.id,
+        title: show.title,
+        venue: show.venue,
+      },
+      firstIso,
+      firstLabel: formatShortDate(firstIso).toUpperCase(),
+      daysOut,
+      previewFloor,
+      runFloor,
+      previewSavings:
+        previewFloor != null && runFloor != null && runFloor > previewFloor
+          ? Math.round(runFloor - previewFloor)
+          : null,
+    })
+  }
+  rows.sort((a, b) => a.daysOut - b.daysOut)
+  return { rows: rows.slice(0, 6), totalCount: rows.length, windowDays: days }
+}
+
+// =============================================================
+// VENUES — show count and floor price per venue. The grouping key
+// is `venue_norm` (from dedupe), which collapses "Sondheim" /
+// "The Sondheim" / "Sondheim Theatre" into one row; we use the
+// most-common original `venue` string as the display name.
+// =============================================================
+
+export function computeVenues(data, today) {
+  const byNorm = new Map()
+  for (const show of data.shows) {
+    const key = show.venue_norm || show.venue || '__unknown'
+    let entry = byNorm.get(key)
+    if (!entry) {
+      entry = {
+        key,
+        venueNorm: show.venue_norm || null,
+        displayNames: new Map(),
+        shows: [],
+      }
+      byNorm.set(key, entry)
+    }
+    if (show.venue) {
+      entry.displayNames.set(
+        show.venue,
+        (entry.displayNames.get(show.venue) || 0) + 1,
+      )
+    }
+    entry.shows.push(show)
+  }
+
+  const venues = []
+  for (const entry of byNorm.values()) {
+    // Pick the most-common original spelling as the canonical name.
+    let displayName = entry.venueNorm || 'Unknown venue'
+    let bestCount = -1
+    for (const [name, count] of entry.displayNames) {
+      if (count > bestCount) {
+        bestCount = count
+        displayName = name
+      }
+    }
+
+    let floor = null
+    let showsWithUpcoming = 0
+    let perfsThisWeek = 0
+    const weekEnd = addDaysISO(today, 7)
+
+    for (const show of entry.shows) {
+      let hasFuture = false
+      for (const perf of show.performances || []) {
+        if (perf.date < today) continue
+        hasFuture = true
+        const eff = effectiveCheapest(perf)
+        if (eff && (floor == null || eff.price < floor)) floor = eff.price
+        if (perf.date < weekEnd) perfsThisWeek++
+      }
+      if (hasFuture) showsWithUpcoming++
+    }
+
+    venues.push({
+      slug: slugifyVenue(displayName),
+      venueNorm: entry.venueNorm,
+      displayName,
+      showCount: entry.shows.length,
+      showsWithUpcoming,
+      floor,
+      perfsThisWeek,
+      shows: entry.shows,
+    })
+  }
+
+  venues.sort((a, b) => {
+    // Active venues first (any upcoming shows), then by show count desc.
+    if ((b.showsWithUpcoming > 0) !== (a.showsWithUpcoming > 0)) {
+      return b.showsWithUpcoming > 0 ? 1 : -1
+    }
+    if (b.showCount !== a.showCount) return b.showCount - a.showCount
+    return a.displayName.localeCompare(b.displayName)
+  })
+
+  return venues
+}
+
+export function slugifyVenue(name) {
+  return name
+    .toLowerCase()
+    .replace(/['']/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+}
+
+// Per-venue detail: every show at this venue, with its floor and run window.
+export function computeVenueDetail(venue, today) {
+  const showsWithMeta = venue.shows
+    .map((show) => {
+      const future = (show.performances || []).filter((p) => p.date >= today)
+      if (future.length === 0) {
+        return {
+          show,
+          isPast: true,
+          floor: null,
+          firstIso: null,
+          lastIso: null,
+        }
+      }
+      let floor = null
+      let firstIso = future[0].date
+      let lastIso = future[0].date
+      for (const p of future) {
+        if (p.date < firstIso) firstIso = p.date
+        if (p.date > lastIso) lastIso = p.date
+        const eff = effectiveCheapest(p)
+        if (eff && (floor == null || eff.price < floor)) floor = eff.price
+      }
+      return {
+        show,
+        isPast: false,
+        floor,
+        firstIso,
+        lastIso,
+        runLength: future.length,
+      }
+    })
+    .filter((row) => !row.isPast)
+    .sort((a, b) => {
+      // Cheapest first, fall back to alphabetical
+      const ap = a.floor == null ? Infinity : a.floor
+      const bp = b.floor == null ? Infinity : b.floor
+      if (ap !== bp) return ap - bp
+      return a.show.title.localeCompare(b.show.title)
+    })
+
+  return showsWithMeta
+}
+
+// =============================================================
+// WHEN — three planning surfaces.
+// =============================================================
+
+// Average floor by day-of-week over the next N days. Returns a 7-cell
+// array Mon..Sun with average + sample count per cell. We use the
+// median rather than the mean because the floor distribution has a
+// long right tail (one premium night skews the average up).
+export function computeDayOfWeekHeatmap(data, today, days = 60) {
+  const buckets = [[], [], [], [], [], [], []] // 0 = Mon ... 6 = Sun
+  const horizon = addDaysISO(today, days)
+  const dayFloors = new Map()
+
+  for (const show of data.shows) {
+    for (const perf of show.performances || []) {
+      if (perf.date < today || perf.date >= horizon) continue
+      const eff = effectiveCheapest(perf)
+      if (!eff) continue
+      const existing = dayFloors.get(perf.date)
+      if (existing == null || eff.price < existing) {
+        dayFloors.set(perf.date, eff.price)
+      }
+    }
+  }
+
+  for (const [iso, floor] of dayFloors) {
+    const dowMonFirst = dowMondayFirst(iso)
+    buckets[dowMonFirst].push(floor)
+  }
+
+  const names = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
+  const cells = buckets.map((arr, i) => {
+    if (arr.length === 0) {
+      return { dow: names[i], median: null, count: 0 }
+    }
+    const sorted = [...arr].sort((a, b) => a - b)
+    const median = sorted[Math.floor(sorted.length / 2)]
+    return { dow: names[i], median, count: arr.length }
+  })
+
+  // Find min/max for ranking + bar widths
+  const valid = cells.filter((c) => c.median != null).map((c) => c.median)
+  const min = valid.length ? Math.min(...valid) : null
+  const max = valid.length ? Math.max(...valid) : null
+  // Cheapest and priciest weekday for the editorial line
+  let cheapest = null
+  let priciest = null
+  for (const c of cells) {
+    if (c.median == null) continue
+    if (!cheapest || c.median < cheapest.median) cheapest = c
+    if (!priciest || c.median > priciest.median) priciest = c
+  }
+
+  return { cells, min, max, cheapest, priciest, windowDays: days }
+}
+
+// 90-day calendar: per-day floor as a list, for a long horizontal strip.
+export function computeLongCalendar(data, today, days = 90) {
+  const horizon = addDaysISO(today, days)
+  const dayFloors = new Map()
+  for (const show of data.shows) {
+    for (const perf of show.performances || []) {
+      if (perf.date < today || perf.date >= horizon) continue
+      const eff = effectiveCheapest(perf)
+      if (!eff) continue
+      const slot = dayFloors.get(perf.date) || { floor: Infinity, count: 0 }
+      slot.floor = Math.min(slot.floor, eff.price)
+      slot.count++
+      dayFloors.set(perf.date, slot)
+    }
+  }
+  const floors = [...dayFloors.values()]
+    .map((s) => s.floor)
+    .filter((p) => Number.isFinite(p))
+  const percentiles = computePercentiles(floors)
+
+  const cells = []
+  for (let i = 0; i < days; i++) {
+    const iso = addDaysISO(today, i)
+    const slot = dayFloors.get(iso)
+    const d = parseISO(iso)
+    cells.push({
+      iso,
+      dow: dowShort(iso),
+      dayOfMonth: d.getDate(),
+      month: d.getMonth(),
+      monthShort: d
+        .toLocaleDateString('en-GB', { month: 'short' })
+        .toUpperCase(),
+      isToday: iso === today,
+      isWeekend: d.getDay() === 0 || d.getDay() === 6,
+      isFirstOfMonth: d.getDate() === 1 || i === 0,
+      isDark: !slot,
+      floor: slot ? slot.floor : null,
+      showCount: slot ? slot.count : 0,
+      bucket: slot ? priceBucket(slot.floor, percentiles) : null,
+    })
+  }
+
+  return { cells, windowDays: days }
+}
+
+// Per-date drill: every show on a specific ISO date, sorted cheapest first.
+export function computeForDate(data, dateIso) {
+  const items = []
+  for (const show of data.shows) {
+    for (const perf of show.performances || []) {
+      if (perf.date !== dateIso) continue
+      const eff = effectiveCheapest(perf)
+      if (!eff) continue
+      const max = validPrice(perf.max_price) ? perf.max_price : null
+      items.push({
+        show: {
+          id: show.id,
+          title: show.title,
+          venue: show.venue,
+        },
+        time: perf.time || '',
+        price: eff.price,
+        maxPrice: max,
+        cheapestSeller: eff.seller,
+        sellerCount: eff.sellerCount,
+      })
+    }
+  }
+  items.sort((a, b) => {
+    if (a.price !== b.price) return a.price - b.price
+    return a.time.localeCompare(b.time)
+  })
+  return items
+}
+
+// =============================================================
+// SHOWS filter chips — curated catalogue slices
+// Each returns a Set of show.id values; the Search component
+// filters its full list against the active set.
+// =============================================================
+
+export function computeShowFilters(data, today) {
+  const closingSoonDays = 30
+  const openingSoonDays = 21
+  const limitedThreshold = 30 // <30 future perfs = limited engagement
+  const horizonClose = addDaysISO(today, closingSoonDays)
+  const horizonOpen = addDaysISO(today, openingSoonDays)
+
+  const closingSoon = new Set()
+  const openingSoon = new Set()
+  const limited = new Set()
+  const exclusives = new Set()
+  const hiddenGems = new Set()
+
+  for (const show of data.shows) {
+    const future = (show.performances || []).filter((p) => p.date >= today)
+    if (future.length === 0) continue
+
+    let firstIso = future[0].date
+    let lastIso = future[0].date
+    let floor = null
+    let perfsWithSellers = 0
+    let perfsWithSingleSeller = 0
+
+    for (const perf of future) {
+      if (perf.date < firstIso) firstIso = perf.date
+      if (perf.date > lastIso) lastIso = perf.date
+      const eff = effectiveCheapest(perf)
+      if (!eff) continue
+      if (floor == null || eff.price < floor) floor = eff.price
+      perfsWithSellers++
+      if (eff.sellerCount === 1) perfsWithSingleSeller++
+    }
+
+    // Closing soon: last future perf is within window.
+    if (lastIso <= horizonClose) closingSoon.add(show.id)
+
+    // Opening soon: first future perf is in the future (not today) and within window.
+    if (firstIso > today && firstIso <= horizonOpen) openingSoon.add(show.id)
+
+    // Limited engagement: fewer than threshold remaining performances.
+    if (future.length < limitedThreshold) limited.add(show.id)
+
+    // Exclusives: every performance with priced sellers has only one seller.
+    if (perfsWithSellers > 0 && perfsWithSingleSeller === perfsWithSellers) {
+      exclusives.add(show.id)
+    }
+
+    // Hidden gems: cheap (floor under £25) AND low coverage (source_count <= 2).
+    if (floor != null && floor <= 25 && (show.source_count || 0) <= 2) {
+      hiddenGems.add(show.id)
+    }
+  }
+
+  return {
+    closingSoon,
+    openingSoon,
+    limited,
+    exclusives,
+    hiddenGems,
+  }
+}
+
+// =============================================================
+// DATA / METHODOLOGY — coverage breakdown, scrape timings, dedupe stats.
+// =============================================================
+
+export function computeMethodology(data) {
+  const coverage = data.coverage_distribution || {}
+  const stages = data.stages || {}
+  const summary = data.source_summary || {}
+
+  const coverageRows = Object.entries(coverage)
+    .map(([k, v]) => ({ sellers: parseInt(k, 10), count: v }))
+    .sort((a, b) => b.sellers - a.sellers)
+
+  const totalShowsInCoverage = coverageRows.reduce((s, r) => s + r.count, 0)
+  const wellCoveredCount = coverageRows
+    .filter((r) => r.sellers >= 3)
+    .reduce((s, r) => s + r.count, 0)
+
+  const sellerRows = Object.entries(summary)
+    .map(([id, info]) => ({
+      sellerId: id,
+      showCount: info.show_count ?? null,
+      scrapedAt: info.scraped_at ?? null,
+    }))
+    .sort((a, b) => (b.showCount || 0) - (a.showCount || 0))
+
+  const fuzzyMerges = Array.isArray(stages.stage_3_fuzzy_merges)
+    ? stages.stage_3_fuzzy_merges
+    : []
+  const normClusters = stages.stage_1_2_normalization_and_registry_clusters
+
+  // PRICE TBC = shows whose all sources had invalid prices (no valid floor).
+  let priceTbcCount = 0
+  for (const show of data.shows) {
+    if (!validPrice(show.min_price_gbp)) priceTbcCount++
+  }
+
+  return {
+    coverageRows,
+    totalShowsInCoverage,
+    wellCoveredCount,
+    sellerRows,
+    fuzzyMergesCount: fuzzyMerges.length,
+    normClusters: typeof normClusters === 'number' ? normClusters : null,
+    priceTbcCount,
+    showCount: data.show_count ?? data.shows.length,
+    performanceCount: data.performance_count ?? null,
+    generatedAt: data.generated_at,
   }
 }

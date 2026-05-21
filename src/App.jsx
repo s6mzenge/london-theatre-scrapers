@@ -2,8 +2,12 @@ import { useState, useEffect, useCallback } from 'react'
 import Curtain from './components/Curtain.jsx'
 import Sidebar from './components/Sidebar.jsx'
 import Cheapest from './components/Cheapest.jsx'
+import When from './components/When.jsx'
+import WhenDate from './components/WhenDate.jsx'
 import Search from './components/Search.jsx'
+import Venues, { VenueDetail } from './components/Venues.jsx'
 import Sellers from './components/Sellers.jsx'
+import Data from './components/Data.jsx'
 import ShowDetail from './components/ShowDetail.jsx'
 import { loadUnifiedData } from './lib/data.js'
 import { useRoute } from './lib/router.jsx'
@@ -116,9 +120,25 @@ export default function App() {
 
         {data && route.name === 'cheapest' && <Cheapest data={data} />}
 
-        {data && route.name === 'shows' && <Search data={data} />}
+        {data && route.name === 'when' && <When data={data} />}
+
+        {data && route.name === 'when-date' && (
+          <WhenDate data={data} dateIso={route.date} />
+        )}
+
+        {data && route.name === 'shows' && (
+          <Search data={data} filter={route.filter} />
+        )}
+
+        {data && route.name === 'venues' && <Venues data={data} />}
+
+        {data && route.name === 'venue' && (
+          <VenueDetail data={data} slug={route.slug} />
+        )}
 
         {data && route.name === 'sellers' && <Sellers data={data} />}
+
+        {data && route.name === 'data' && <Data data={data} />}
       </main>
     </div>
   )

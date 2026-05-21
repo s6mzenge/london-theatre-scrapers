@@ -8,17 +8,22 @@ import { Link } from '../lib/router.jsx'
 // intercepted for SPA pushState navigation.
 const TABS = [
   { id: 'cheapest', href: '/', label: 'CHEAPEST' },
+  { id: 'when', href: '/when', label: 'WHEN' },
   { id: 'shows', href: '/shows', label: 'SHOWS' },
+  { id: 'venues', href: '/venues', label: 'VENUES' },
   { id: 'sellers', href: '/sellers', label: 'SELLERS' },
 ]
 
 // A tab counts as "active" when the current route lives under it. The
 // SHOWS tab stays lit for the /shows/:id detail page too, because the
-// detail page logically belongs under the catalogue. Without this, a
-// user on /shows/hamilton would see no nav tab highlighted.
+// detail page logically belongs under the catalogue. WHEN owns the
+// per-date pages /when/:date; VENUES owns the per-venue pages
+// /venues/:slug. Without this, deep-linking would leave no tab lit.
 function isTabActive(tabId, route) {
   if (route.name === tabId) return true
   if (tabId === 'shows' && route.name === 'show') return true
+  if (tabId === 'when' && route.name === 'when-date') return true
+  if (tabId === 'venues' && route.name === 'venue') return true
   return false
 }
 
@@ -57,6 +62,14 @@ export default function Sidebar({ activeRoute, lastScrapedAt }) {
         ) : (
           <>London &middot; nightly</>
         )}
+        <Link
+          href="/data"
+          className={`stg-sb-foot-link ${
+            activeRoute.name === 'data' ? 'active' : ''
+          }`}
+        >
+          DATA &amp; METHODOLOGY
+        </Link>
       </div>
     </aside>
   )
