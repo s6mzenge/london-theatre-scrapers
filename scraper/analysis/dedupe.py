@@ -553,24 +553,18 @@ PERF_SCHEMAS: dict[str, dict[str, Any]] = {
     "seatplan": {
         "date":       lambda p: p.get("date"),
         "time":       lambda p: p.get("time"),
-        # Prefer the verified bookable price from the normal-prices
-        # endpoint over the JSON-LD lowPrice, which SeatPlan themselves
-        # consider unreliable (see _enrich_with_availability in
-        # seatplan_scraper.py). Fall back to JSON-LD when enrichment
-        # didn't run for this perf.
-        "price_from": lambda p: p.get("available_from") or p.get("low_price"),
-        "price_to":   lambda p: p.get("available_to"),
+        # Use the helpers defined above. JSON-LD lowPrice is a SHOW-WIDE
+        # floor (lottery seats, restricted-view standing, etc.) that leaks
+        # onto every perf in the seatplan_scraper.py output. The per-perf
+        # truth is `verified_min_price`, set by seatplan_availability.py
+        # from the ticketing page's fireCrmEvent payload. The helpers
+        # encapsulate the verified_price_source semantics — wire them in
+        # rather than reimplementing the priority order inline.
+        "price_from": _seatplan_price_from,
+        "price_to":   _seatplan_price_to,
         "currency":   lambda p: p.get("currency"),
         "book_url":   lambda p: p.get("book_url"),
-        # Use the explicit sold_out signal when present, otherwise fall
-        # back to the schema.org InStock string from JSON-LD.
-        "available":  lambda p: (
-            False if p.get("price_source") == "sold_out"
-            else (p.get("available_seats", 0) > 0)
-            if isinstance(p.get("available_seats"), int)
-            else (("InStock" in (p.get("availability") or ""))
-                  if p.get("availability") else None)
-        ),
+        "available":  _seatplan_available,
     },
     "ttd": {
         "date":       lambda p: p.get("date"),
