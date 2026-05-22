@@ -563,6 +563,15 @@
   color: var(--color-brick);
 }
 
+/* "FINAL DAY" badge — last-performance-is-today state. The word
+   "FINAL" is wider than a single digit, so we shrink the display
+   text a touch so it fits the 60px badge column on mobile without
+   wrapping or overflowing. */
+.stg-urgent-badge.final .stg-urgent-badge-num {
+  font-size: 16px;
+  letter-spacing: 0.5px;
+}
+
 .stg-urgent-badge-lbl {
   font-family: var(--font-sans);
   font-size: 8px;
