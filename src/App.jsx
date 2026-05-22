@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import Curtain from './components/Curtain.jsx'
 import Sidebar from './components/Sidebar.jsx'
 import Cheapest from './components/Cheapest.jsx'
+import Today from './components/Today.jsx'
 import When from './components/When.jsx'
 import WhenDate from './components/WhenDate.jsx'
 import Search from './components/Search.jsx'
@@ -119,6 +120,8 @@ export default function App() {
         )}
 
         {data && route.name === 'cheapest' && <Cheapest data={data} />}
+
+        {data && route.name === 'today' && <Today data={data} />}
 
         {data && route.name === 'when' && <When data={data} />}
 
