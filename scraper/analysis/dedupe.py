@@ -390,6 +390,17 @@ SHOW_SCHEMAS: dict[str, dict[str, Any]] = {
 # ticketing page's inline fireCrmEvent payload — that's the real
 # currently-available range and we prefer it whenever it's present.
 #
+# As of the chip-pass extension, suspect rows (yard-tier phantoms,
+# fireCrmEvent default-tier outliers) also carry verified_chip_min /
+# verified_chip_max scraped from the booking page's rendered price
+# chips — that's a stricter extraction than fireCrmEvent and wins
+# whenever it's present.
+#
+# Priority (highest first):
+#   verified_chip_min   — chip pass extracted real chips
+#   verified_min_price  — fireCrmEvent extracted a value
+#   low_price           — JSON-LD "from £X" (marketing; often stale)
+#
 # verified_price_source semantics (set by seatplan_availability.py):
 #   "ticketing_page" — verified successfully; trust verified_min_price
 #   "no_seats"       — page loaded but no fireCrmEvent → not on sale
@@ -399,6 +410,11 @@ SHOW_SCHEMAS: dict[str, dict[str, Any]] = {
 #   "skipped"        — perf wasn't checked → fall back to low_price
 #   (missing field)  — availability pass never ran → fall back to low_price
 def _seatplan_price_from(p: dict) -> float | None:
+    # Chip pass wins when it successfully extracted chip data.
+    if p.get("verified_chip_source") == "chips":
+        chip_min = p.get("verified_chip_min")
+        if chip_min is not None:
+            return chip_min
     source = p.get("verified_price_source")
     if source == "no_seats":
         return None
@@ -409,6 +425,12 @@ def _seatplan_price_from(p: dict) -> float | None:
 
 
 def _seatplan_price_to(p: dict) -> float | None:
+    # Chip pass wins for max as well — chips give us the real upper
+    # tier where fireCrmEvent often omits or undercounts it.
+    if p.get("verified_chip_source") == "chips":
+        chip_max = p.get("verified_chip_max")
+        if chip_max is not None:
+            return chip_max
     if p.get("verified_price_source") == "no_seats":
         return None
     return p.get("verified_max_price")
