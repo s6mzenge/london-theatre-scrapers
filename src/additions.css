@@ -1361,6 +1361,12 @@
 
 /* Drill-down panel — sits flush below the tier grid */
 .stg-tier-drill {
+  /* Drill is rendered inside .stg-tier-grid so it can sit immediately
+     under the tile that triggered it on mobile (1-col layout). On
+     desktop/tablet we need it to claim the full row instead of one
+     grid cell — `1 / -1` spans from the first to the last column line
+     regardless of the active breakpoint's column count. */
+  grid-column: 1 / -1;
   margin-top: 18px;
   padding-top: 16px;
   border-top: 0.5px solid var(--line-strong);
