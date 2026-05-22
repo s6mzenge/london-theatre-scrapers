@@ -959,6 +959,13 @@ function aggregateClosingSoon(data, today, days = 30) {
       const eff = effectiveCheapest(p)
       if (eff && (floor == null || eff.price < floor)) floor = eff.price
     }
+    // Skip rows we have no price for. The "Closing Soon" dashboard
+    // section is a pricing surface — "buy now before it ends" — so a
+    // row without a from-price is just noise. The /shows?filter=
+    // closing-soon catalogue slice uses a different code path (the
+    // filterSets in computeAggregations) and still lists everything,
+    // so the comprehensive view is unaffected.
+    if (floor == null) continue
     const daysLeft = Math.max(
       0,
       Math.round((parseISO(lastIso) - parseISO(today)) / (24 * 3600 * 1000)),
