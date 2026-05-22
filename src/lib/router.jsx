@@ -27,6 +27,7 @@ import { useState, useEffect } from 'react'
 
 // Route shape:
 //   { name: 'cheapest' }
+//   { name: 'today' }
 //   { name: 'when' }
 //   { name: 'when-date', date: 'YYYY-MM-DD' }
 //   { name: 'shows', filter?: string }
@@ -43,6 +44,7 @@ import { useState, useEffect } from 'react'
 function parsePath(pathname, search) {
   const p = pathname.replace(/\/+$/, '') || '/'
   if (p === '/') return { name: 'cheapest' }
+  if (p === '/today') return { name: 'today' }
   if (p === '/when') return { name: 'when' }
   const whenDate = p.match(/^\/when\/(\d{4}-\d{2}-\d{2})$/)
   if (whenDate) return { name: 'when-date', date: whenDate[1] }
