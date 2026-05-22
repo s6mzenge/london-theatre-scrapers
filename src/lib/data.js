@@ -104,14 +104,25 @@ export function validPrice(p) {
 }
 
 // Recompute the effective cheapest price + seller for a performance,
-// ignoring sources with invalid prices. Returns null when no seller has
-// usable data, in which case the performance should be skipped entirely.
+// ignoring sources with invalid prices OR with availability explicitly
+// reported as false (e.g. seats sold out, calendar removal, ticket-page
+// "Tickets not available"). Sources with `available: null` mean
+// "unknown" — we keep those, since they generally come from an
+// availability probe that hasn't run yet, not from a positive sold-out
+// signal, and dropping them would over-prune the listing.
+// Returns null when no seller has usable data, in which case the
+// performance should be skipped entirely.
 export function effectiveCheapest(perf) {
   if (!perf.sources) return null
   let best = null
   let sellerCount = 0
   for (const [sid, info] of Object.entries(perf.sources)) {
-    if (info && validPrice(info.price_from)) {
+    if (!info) continue
+    // Hard-skip sources that the availability layer explicitly marked
+    // unavailable. `=== false` is the right check: null/undefined mean
+    // "unknown" and shouldn't drop the source.
+    if (info.available === false) continue
+    if (validPrice(info.price_from)) {
       sellerCount++
       if (!best || info.price_from < best.price) {
         best = { seller: sid, price: info.price_from }
@@ -251,15 +262,58 @@ export function computeAggregations(data, today) {
 }
 
 // =============================================================
-// Tonight: all performances for `today`, sorted ascending by effective
+// Tonight: today's performances sorted by effective cheapest seller
 // min price. Performances with no valid seller data are dropped.
+//
+// Same-day cutoff: even after the periodic availability-refresh
+// workflow (.github/workflows/availability-refresh.yml) patches
+// `available: false` onto perfs the booking sites have pulled, there
+// is still a 0–30 minute staleness window between refreshes. Inside
+// that window the unified.json can be advertising a 14:00 perf at
+// 13:55 — by which time every booking page has closed sales. Drop
+// performances starting within `SAME_DAY_CUTOFF_MINUTES` of "now" as
+// a belt-and-braces guard. (Performances on tomorrow or later are
+// unaffected; only same-day, imminent-start rows are dropped.)
 // =============================================================
+
+const SAME_DAY_CUTOFF_MINUTES = 20
+
+// Convert "HH:MM" → minutes-from-midnight. Returns null for malformed
+// or missing strings — those should NOT be cutoff-filtered.
+function timeStrToMinutes(t) {
+  if (typeof t !== 'string') return null
+  const m = /^(\d{1,2}):(\d{2})/.exec(t)
+  if (!m) return null
+  const h = parseInt(m[1], 10)
+  const mins = parseInt(m[2], 10)
+  if (!Number.isFinite(h) || !Number.isFinite(mins)) return null
+  if (h < 0 || h > 23 || mins < 0 || mins > 59) return null
+  return h * 60 + mins
+}
+
+// True if `perf.time` is in the past or starts within
+// SAME_DAY_CUTOFF_MINUTES of `now`. Only meaningful for today's
+// performances — callers must filter on date themselves before calling.
+// Returns false (= "keep this perf") when the time string is missing
+// or unparseable, so a malformed perf still shows up rather than
+// silently disappearing.
+function isImminentOrPast(perfTime, now = new Date()) {
+  const perfMins = timeStrToMinutes(perfTime)
+  if (perfMins == null) return false
+  const nowMins = now.getHours() * 60 + now.getMinutes()
+  return perfMins < nowMins + SAME_DAY_CUTOFF_MINUTES
+}
 
 function aggregateTonight(data, today) {
   const items = []
+  const now = new Date()
   for (const show of data.shows) {
     for (const perf of show.performances || []) {
       if (perf.date !== today) continue
+      // Booking windows close minutes-to-hours before showtime across
+      // every source; serving a 14:00 link at 13:55 sends users to
+      // dead URLs. See SAME_DAY_CUTOFF_MINUTES note above.
+      if (isImminentOrPast(perf.time, now)) continue
       const eff = effectiveCheapest(perf)
       if (!eff) continue
       items.push({
