@@ -676,11 +676,17 @@ function aggregateMonth(data, today, showFuturePrices) {
 }
 
 // =============================================================
-// Weekend: the next Fri+Sat+Sun within the 7-day window.
-// On a Friday morning all three nights are ahead; on a Sunday
-// only Sun itself remains. We show whatever's still upcoming so
-// the section silently degrades from "three cards" down to "one".
-// On a Mon-Thu morning we show the coming weekend.
+// Weekend: looks *forward* from today. The "Tonight" section above
+// already covers today's listings, so the weekend overview always
+// skips today itself:
+//   · Mon–Thu: the coming Fri + Sat + Sun (three cards).
+//   · Fri:     Sat + Sun (today is in "Tonight" above).
+//   · Sat:     Sun only.
+//   · Sun:     this weekend is done — jump to *next* weekend's
+//              Fri + Sat + Sun, and flag isNextWeekend so the
+//              section eyebrow can reflect that.
+// The section silently degrades from three cards to one as the
+// weekend is consumed.
 // =============================================================
 
 function aggregateWeekend(data, today) {
@@ -688,16 +694,24 @@ function aggregateWeekend(data, today) {
   const todayJsDow = parseISO(today).getDay()
   // Days until next Friday (0 if today is Friday).
   const daysToFri = (5 - todayJsDow + 7) % 7
-  // If we're already past Friday in the current week (Sat=6 or Sun=0),
-  // pick *this* weekend's remaining days rather than next Friday.
+  // The weekend section always looks *forward* — today is already
+  // shown by "Tonight" above, so we never list today here. See the
+  // table in the section comment above for the per-weekday windows.
   let weekendIsos
-  if (todayJsDow === 0) {
-    weekendIsos = [today] // Sunday — Sat is past, Fri is past
+  let isNextWeekend = false
+  if (todayJsDow === 5) {
+    // Friday — Sat + Sun ahead.
+    weekendIsos = [addDaysISO(today, 1), addDaysISO(today, 2)]
   } else if (todayJsDow === 6) {
-    weekendIsos = [today, addDaysISO(today, 1)] // Sat + Sun
-  } else if (todayJsDow === 5) {
-    weekendIsos = [today, addDaysISO(today, 1), addDaysISO(today, 2)]
+    // Saturday — Sun only.
+    weekendIsos = [addDaysISO(today, 1)]
+  } else if (todayJsDow === 0) {
+    // Sunday — this weekend is over; surface *next* weekend.
+    const friIso = addDaysISO(today, 5)
+    weekendIsos = [friIso, addDaysISO(friIso, 1), addDaysISO(friIso, 2)]
+    isNextWeekend = true
   } else {
+    // Mon–Thu — the coming Fri/Sat/Sun.
     const friIso = addDaysISO(today, daysToFri)
     weekendIsos = [friIso, addDaysISO(friIso, 1), addDaysISO(friIso, 2)]
   }
@@ -758,7 +772,7 @@ function aggregateWeekend(data, today) {
   const weekendFloor =
     litFloors.length > 0 ? Math.min(...litFloors) : null
 
-  return { days, weekendFloor }
+  return { days, weekendFloor, isNextWeekend }
 }
 
 // =============================================================
