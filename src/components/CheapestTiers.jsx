@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { Fragment, useState } from 'react'
 import { SectionHead } from './Cheapest.jsx'
 import { formatPrice } from '../lib/format.js'
 import { ShowLink } from '../lib/router.jsx'
@@ -8,14 +8,17 @@ import { ShowLink } from '../lib/router.jsx'
 // first. Mirrors the SELLERS tab pattern (click card → see what's
 // under it). Only one tier expanded at a time; click an active tile
 // again to collapse.
+//
+// The drill is rendered *inside* the grid, immediately after the
+// active tile, with `grid-column: 1 / -1` in CSS so it spans the full
+// row on multi-column desktops/tablets. On a single-column mobile
+// layout this puts the drill directly under the tapped tile — no more
+// scrolling past every other tile to find it.
 
 export default function CheapestTiers({ tiers }) {
   const [activeId, setActiveId] = useState(null)
   if (!tiers || tiers.tiers.length === 0) return null
   const totalShows = tiers.tiers.reduce((s, t) => s + t.count, 0)
-  const active = activeId
-    ? tiers.tiers.find((t) => t.id === activeId)
-    : null
 
   return (
     <section className="stg-section">
@@ -28,21 +31,23 @@ export default function CheapestTiers({ tiers }) {
       />
 
       <div className="stg-tier-grid">
-        {tiers.tiers.map((tier) => (
-          <TierTile
-            key={tier.id}
-            tier={tier}
-            isActive={activeId === tier.id}
-            onClick={() =>
-              setActiveId(activeId === tier.id ? null : tier.id)
-            }
-          />
-        ))}
+        {tiers.tiers.map((tier) => {
+          const isActive = activeId === tier.id
+          const showDrill = isActive && tier.shows && tier.shows.length > 0
+          return (
+            <Fragment key={tier.id}>
+              <TierTile
+                tier={tier}
+                isActive={isActive}
+                onClick={() =>
+                  setActiveId(isActive ? null : tier.id)
+                }
+              />
+              {showDrill && <TierDrill tier={tier} />}
+            </Fragment>
+          )
+        })}
       </div>
-
-      {active && active.shows && active.shows.length > 0 && (
-        <TierDrill tier={active} />
-      )}
     </section>
   )
 }
