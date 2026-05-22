@@ -157,8 +157,17 @@ a {
   font-family: var(--font-display);
   font-weight: 500;
   font-size: 22px;
-  letter-spacing: 6px;
+  letter-spacing: 0;
   color: var(--color-paper);
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
+}
+
+.stg-brand-svg {
+  height: 1.5em;
+  width: auto;
+  display: block;
 }
 
 .stg-period {
