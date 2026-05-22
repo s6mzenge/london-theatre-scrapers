@@ -836,6 +836,18 @@ function aggregatePriceTiers(data, today) {
     }
     inTier.sort((a, b) => a.price - b.price)
     const top = inTier[0]
+    // Materialise every show in the band, sorted cheapest first — the
+    // drill-down panel below the tiles renders the full list, not just
+    // the headline. The headline lives on the closed tile as a teaser.
+    const shows = inTier.map((e) => ({
+      show: {
+        id: e.show.id,
+        title: e.show.title,
+        venue: e.show.venue,
+      },
+      price: e.price,
+      dayLabel: formatShortDate(e.perf.date).toUpperCase(),
+    }))
     return {
       id: def.id,
       label: def.label,
@@ -851,6 +863,7 @@ function aggregatePriceTiers(data, today) {
             dayLabel: formatShortDate(top.perf.date).toUpperCase(),
           }
         : null,
+      shows,
     }
   })
 
