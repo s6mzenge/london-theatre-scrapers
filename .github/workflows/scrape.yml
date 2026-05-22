@@ -175,19 +175,6 @@ jobs:
     if: needs.setup.outputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # SeatPlan's Cloudflare bot rules block some Azure subnets and not
-    # others, and GH Actions can't pin runner regions, so the seatplan
-    # scrape fails ~1/N of the time when the runner lands on a blocked
-    # subnet (returns a 2031-byte stub page with no show cards). With
-    # `fail-fast: false` the other four scrapers run regardless and
-    # combine/dedupe/publish proceed on the partial input — but the
-    # workflow's overall status went red for cosmetic reasons. This
-    # expression marks ONLY seatplan as a tolerated failure; the other
-    # matrix entries stay strict so a real regression in todaytix /
-    # olt / ttd / lovetheatre still surfaces as a workflow failure.
-    # The long-term fix is to route SeatPlan through the same CF Worker
-    # proxy OLT uses; until that's set up, this is the cosmetic patch.
-    continue-on-error: ${{ matrix.name == 'seatplan' }}
 
     strategy:
       fail-fast: false   # one scraper failing shouldn't cancel the rest
@@ -302,16 +289,22 @@ jobs:
         # the chip pass if it ever misbehaves; fireCrmEvent values
         # will be used for all perfs in that case.
         #
-        # continue-on-error: SeatPlan started instant-403'ing the
-        # /tickets/* sub-path from Azure runner IPs (likely Cloudflare
-        # bot detection), which makes the verifier exit 2 with all
-        # fetch_failed. The seatplan.json was still written with
-        # those fetch_failed flags, and dedupe falls back to the
-        # JSON-LD low_price for any perf without verified data — so
-        # losing this pass is a soft degradation, not a hard failure.
-        # Mirrors how the OLT step handles SeeTickets blocking us.
+        # The fireCrmEvent pass now routes through the same OLT_PROXY_URL
+        # Worker (which has seatplan.com on its ALLOWED_HOSTS list and
+        # forwards via X-Proxy-Target), so the previous "0/386 verified"
+        # failure mode from Azure-IP blocking is fixed. The chip pass
+        # is still direct — it uses Playwright, which doesn't share
+        # the requests-based proxy plumbing; if SeatPlan blocks the
+        # browser-driven chip pass, this step exits 2 but
+        # continue-on-error keeps the pipeline moving (dedupe falls
+        # back to fireCrmEvent values for those rows). That fallback
+        # is acceptable because the chip pass only runs on a small
+        # subset of suspect rows.
         if: steps.gate.outputs.run == 'true' && matrix.name == 'seatplan'
         continue-on-error: true
+        env:
+          OLT_PROXY_URL: ${{ secrets.OLT_PROXY_URL }}
+          OLT_PROXY_TOKEN: ${{ secrets.OLT_PROXY_TOKEN }}
         run: |
           python scraper/seatplan_availability.py \
             --in scraper/data/seatplan.json \
