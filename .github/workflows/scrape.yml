@@ -172,6 +172,22 @@ jobs:
           print(f'shows={d.get(\"show_count\")} perfs={perfs} warnings={warns} failures={fails}')
           "
 
+      - name: Restore SeatPlan chip-pass cache
+        # The chip cache stores prior chip-pass results keyed by
+        # (date|time|book_url) so the next run can skip extraction
+        # for perfs whose catalogue inputs haven't changed. At 15-min
+        # scrape cadence this drops steady-state chip-pass cost from
+        # ~250 extractions to ~5-20 (only the rows that actually
+        # changed inputs since last run). TTL is 24h — even unchanged
+        # rows get re-verified daily to catch source-side drift.
+        if: steps.gate.outputs.run == 'true' && matrix.name == 'seatplan'
+        uses: actions/cache@v4
+        with:
+          path: scraper/data/chip_cache_seatplan.json
+          key: chip-cache-seatplan-${{ github.run_id }}
+          restore-keys: |
+            chip-cache-seatplan-
+
       - name: Verify SeatPlan per-performance prices
         # The fireCrmEvent pass (requests-only) handles ~95% of perfs.
         # The remaining ~5% — yard tiers, premium-default outliers —
@@ -184,7 +200,9 @@ jobs:
         # will be used for all perfs in that case.
         if: steps.gate.outputs.run == 'true' && matrix.name == 'seatplan'
         run: |
-          python scraper/seatplan_availability.py --in scraper/data/seatplan.json
+          python scraper/seatplan_availability.py \
+            --in scraper/data/seatplan.json \
+            --chip-cache scraper/data/chip_cache_seatplan.json
 
       - name: Verify OLT per-performance availability
         if: steps.gate.outputs.run == 'true' && matrix.name == 'olt'
@@ -264,6 +282,19 @@ jobs:
               print("(Beetlejuice show not found — skipping spot-check)")
           PY
 
+      - name: Restore TodayTix chip-pass cache
+        # See the SeatPlan cache step for rationale. Same TTL and
+        # restore-key strategy; separate cache because the cache key
+        # space (date|time|book_url) and input-hash inputs are
+        # source-specific.
+        if: steps.gate.outputs.run == 'true' && matrix.name == 'todaytix'
+        uses: actions/cache@v4
+        with:
+          path: scraper/data/chip_cache_todaytix.json
+          key: chip-cache-todaytix-${{ github.run_id }}
+          restore-keys: |
+            chip-cache-todaytix-
+
       - name: Verify TodayTix per-performance prices
         # Runs the chip-pass second pass over showtimes whose SSR
         # snapshot looks suspect (cheapest band has <3 seats and
@@ -277,7 +308,9 @@ jobs:
         # TodayTix is sensitive to bot detection.
         if: steps.gate.outputs.run == 'true' && matrix.name == 'todaytix'
         run: |
-          python scraper/todaytix_availability.py --in scraper/data/todaytix.json
+          python scraper/todaytix_availability.py \
+            --in scraper/data/todaytix.json \
+            --chip-cache scraper/data/chip_cache_todaytix.json
 
       - name: Verify TTD per-performance prices
         if: steps.gate.outputs.run == 'true' && matrix.name == 'ttd'
