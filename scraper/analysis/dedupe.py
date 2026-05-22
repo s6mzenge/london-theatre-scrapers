@@ -590,12 +590,54 @@ def _ttd_price_to(p: dict) -> float | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# TodayTix per-perf price selection
+# ---------------------------------------------------------------------------
+# todaytix_scraper.py records the cheapest band with seats>0 from the
+# show listing page's __NEXT_DATA__ SSR snapshot, in `low_price_value`.
+# That snapshot lags live inventory — when the cheapest band's last
+# seats sell out between snapshot and a user clicking through, the
+# real booking page shows a higher floor.
+#
+# todaytix_availability.py runs as a second pass and writes verified
+# values onto suspect showtimes (those with seats < N on the cheapest
+# band, within a near-term window). When the chip pass succeeded we
+# prefer its values; otherwise we fall back to the SSR snapshot.
+#
+# verified_price_source semantics (set by todaytix_availability.py):
+#   "chips"           — chip pass extracted live prices; trust these
+#   "no_chips_found"  — page loaded but no chips visible
+#                       (likely sold out / off-sale / lottery-only)
+#                       → fall back to SSR low_price_value
+#   "fetch_failed"    — browser navigation or render error
+#                       → fall back to SSR low_price_value
+#   (missing field)   — chip pass didn't run on this showtime
+#                       (not suspect, or outside window) → SSR value
+
+def _todaytix_price_from(p: dict) -> float | None:
+    if p.get("verified_price_source") == "chips":
+        verified = p.get("verified_min_price")
+        if verified is not None:
+            return verified
+    return p.get("low_price_value")
+
+
+def _todaytix_price_to(p: dict) -> float | None:
+    # The SSR snapshot never carries an upper bound — only the chip
+    # pass gives us one (highest visible chip).
+    if p.get("verified_price_source") == "chips":
+        return p.get("verified_max_price")
+    return None
+
+
 PERF_SCHEMAS: dict[str, dict[str, Any]] = {
     "todaytix": {
         "date":       lambda p: p.get("local_date") or p.get("date"),
         "time":       lambda p: p.get("local_time") or p.get("time"),
-        "price_from": lambda p: p.get("low_price_value"),
-        "price_to":   lambda p: None,
+        # Helpers above — verified chip values win when the chip pass
+        # ran successfully, else fall back to the SSR snapshot.
+        "price_from": _todaytix_price_from,
+        "price_to":   _todaytix_price_to,
         "currency":   lambda p: p.get("currency"),
         "book_url":   lambda p: p.get("booking_url") or p.get("book_url"),
         "available":  lambda p: (p.get("seats_available", 0) > 0)
