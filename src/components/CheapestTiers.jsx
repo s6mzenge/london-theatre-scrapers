@@ -1,34 +1,53 @@
+import { useState } from 'react'
 import { SectionHead } from './Cheapest.jsx'
 import { formatPrice } from '../lib/format.js'
 import { ShowLink } from '../lib/router.jsx'
 
-// Budget tiers: four price-band tiles showing the shape of the
-// catalogue. Each tile shows how many shows have at least one
-// performance in that band, plus the headline (cheapest) show in
-// that band. The intent is the user thinks in budget ("I have £30")
-// not in deciles.
+// Budget tiers: four price-band tiles. Each tile is a button that
+// expands a drill-down listing every show in that band, cheapest
+// first. Mirrors the SELLERS tab pattern (click card → see what's
+// under it). Only one tier expanded at a time; click an active tile
+// again to collapse.
 
 export default function CheapestTiers({ tiers }) {
+  const [activeId, setActiveId] = useState(null)
   if (!tiers || tiers.tiers.length === 0) return null
   const totalShows = tiers.tiers.reduce((s, t) => s + t.count, 0)
+  const active = activeId
+    ? tiers.tiers.find((t) => t.id === activeId)
+    : null
 
   return (
     <section className="stg-section">
       <SectionHead
         eyebrow="BY BUDGET · NEXT 30 DAYS"
-        sub={`${totalShows} shows have at least one performance under that ceiling`}
+        sub={
+          `${totalShows} shows have at least one performance under that ceiling` +
+          ` · click a tile for the full list`
+        }
       />
 
       <div className="stg-tier-grid">
         {tiers.tiers.map((tier) => (
-          <TierTile key={tier.id} tier={tier} />
+          <TierTile
+            key={tier.id}
+            tier={tier}
+            isActive={activeId === tier.id}
+            onClick={() =>
+              setActiveId(activeId === tier.id ? null : tier.id)
+            }
+          />
         ))}
       </div>
+
+      {active && active.shows && active.shows.length > 0 && (
+        <TierDrill tier={active} />
+      )}
     </section>
   )
 }
 
-function TierTile({ tier }) {
+function TierTile({ tier, isActive, onClick }) {
   if (!tier.headline) {
     return (
       <div className="stg-tier-tile empty">
@@ -41,14 +60,21 @@ function TierTile({ tier }) {
     )
   }
   return (
-    <ShowLink id={tier.headline.show.id} className="stg-tier-tile">
+    <button
+      type="button"
+      className={`stg-tier-tile ${isActive ? 'active' : ''}`}
+      onClick={onClick}
+      aria-expanded={isActive}
+    >
       <div className="stg-tier-tile-lbl">{tier.label}</div>
       <div className="stg-tier-tile-count">{tier.count}</div>
       <div className="stg-tier-tile-sub">
         {tier.count === 1 ? 'show' : 'shows'} in this band
       </div>
       <div className="stg-tier-tile-rule" />
-      <div className="stg-tier-tile-headline-lbl">CHEAPEST IN BAND</div>
+      <div className="stg-tier-tile-headline-lbl">
+        {isActive ? 'CLICK TO COLLAPSE' : 'CHEAPEST IN BAND'}
+      </div>
       <div className="stg-tier-tile-headline">{tier.headline.show.title}</div>
       <div className="stg-tier-tile-headline-meta">
         {tier.headline.show.venue} · {tier.headline.dayLabel} ·{' '}
@@ -56,6 +82,43 @@ function TierTile({ tier }) {
           {formatPrice(tier.headline.price)}
         </span>
       </div>
-    </ShowLink>
+    </button>
+  )
+}
+
+// Drill-down mirrors the DayDrill row pattern (rank · body · price)
+// minus the "vs other dates" middle column — every row in this list
+// is already "this show's cheapest in the next 30 days", so a
+// comparison column would be redundant.
+function TierDrill({ tier }) {
+  return (
+    <div className="stg-tier-drill">
+      <div className="stg-tier-drill-head">
+        <div className="stg-tier-drill-eye">
+          ALL {tier.count} SHOWS · <b>{tier.label}</b>
+        </div>
+        <div className="stg-tier-drill-r-lbl">CHEAPEST IN WINDOW</div>
+      </div>
+      {tier.shows.map((row, idx) => (
+        <ShowLink
+          key={row.show.id}
+          id={row.show.id}
+          className="stg-tier-drill-row"
+        >
+          <div className="stg-tier-drill-rank">
+            {String(idx + 1).padStart(2, '0')}
+          </div>
+          <div className="stg-tier-drill-body">
+            <div className="stg-tier-drill-title">{row.show.title}</div>
+            <div className="stg-tier-drill-meta">
+              {row.show.venue} · cheapest on {row.dayLabel}
+            </div>
+          </div>
+          <div className="stg-tier-drill-price">
+            {formatPrice(row.price)}
+          </div>
+        </ShowLink>
+      ))}
+    </div>
   )
 }
