@@ -1186,14 +1186,129 @@ export function computeVenueDetail(venue, today) {
 
 // =============================================================
 // WHEN — three planning surfaces.
+//
+//   1. computeBestNightsPicks — up to four hand-picked cheap nights
+//      spread across the horizon (one near-term, one weekend, one
+//      mid-horizon, one late-term weekday). Each surfaces with a
+//      short editorial tag and deep-links to /when/:date.
+//
+//   2. computeWeekdayDistribution — every individual floor by
+//      weekday (not just the median) so the strip plot can draw
+//      one dot per performance night. Also pre-computes a
+//      cheap/premium split and an editorial sentence.
+//
+//   3. computeMonthlyCalendars — a real calendar grid per month
+//      that the 90-day window touches, with Mon-first weekday
+//      columns. Cells inside the window expose floor + bucket +
+//      show count; dark days surface separately so they're never
+//      confused with the faintest price bucket.
+//
+// computeForDate (below) handles the per-date drill rendered by
+// WhenDate.jsx.
 // =============================================================
 
-// Average floor by day-of-week over the next N days. Returns a 7-cell
-// array Mon..Sun with average + sample count per cell. We use the
-// median rather than the mean because the floor distribution has a
-// long right tail (one premium night skews the average up).
-export function computeDayOfWeekHeatmap(data, today, days = 60) {
-  const buckets = [[], [], [], [], [], [], []] // 0 = Mon ... 6 = Sun
+export function computeBestNightsPicks(data, today, days = 90) {
+  const horizon = addDaysISO(today, days)
+  const dayMap = new Map() // iso -> { floor, count }
+
+  for (const show of data.shows) {
+    for (const perf of show.performances || []) {
+      if (perf.date < today || perf.date >= horizon) continue
+      const eff = effectiveCheapest(perf)
+      if (!eff) continue
+      const slot = dayMap.get(perf.date) || { floor: Infinity, count: 0 }
+      if (eff.price < slot.floor) slot.floor = eff.price
+      slot.count++
+      dayMap.set(perf.date, slot)
+    }
+  }
+
+  const entries = [...dayMap.entries()]
+    .map(([iso, slot]) => ({ iso, floor: slot.floor, count: slot.count }))
+    .sort((a, b) => a.iso.localeCompare(b.iso))
+
+  if (entries.length === 0) return { picks: [], floorFrom: null }
+
+  const cheapestOf = (list) =>
+    list.length === 0
+      ? null
+      : list.reduce((a, b) => (a.floor <= b.floor ? a : b))
+
+  // Pick 1 — cheapest within the next 14 days (the "what can I do soon" pick)
+  const horizon14 = addDaysISO(today, 14)
+  const pick1 = cheapestOf(entries.filter((e) => e.iso < horizon14))
+
+  // Pick 2 — cheapest weekend night within 30 days
+  const horizon30 = addDaysISO(today, 30)
+  const used = new Set([pick1?.iso].filter(Boolean))
+  const pick2 = cheapestOf(
+    entries.filter((e) => {
+      if (used.has(e.iso) || e.iso >= horizon30) return false
+      const dow = dowMondayFirst(e.iso)
+      return dow === 5 || dow === 6
+    }),
+  )
+  if (pick2) used.add(pick2.iso)
+
+  // Pick 3 — cheapest day in the 30–60 day window (the mid-horizon dip)
+  const horizon60 = addDaysISO(today, 60)
+  const pick3 = cheapestOf(
+    entries.filter(
+      (e) => !used.has(e.iso) && e.iso >= horizon30 && e.iso < horizon60,
+    ),
+  )
+  if (pick3) used.add(pick3.iso)
+
+  // Pick 4 — cheapest mid-week night (Mon-Thu) at 30+ days out
+  const pick4 = cheapestOf(
+    entries.filter((e) => {
+      if (used.has(e.iso) || e.iso < horizon30) return false
+      return dowMondayFirst(e.iso) <= 3
+    }),
+  )
+
+  const monthAbbr = (iso) =>
+    parseISO(iso)
+      .toLocaleDateString('en-GB', { month: 'short' })
+      .toUpperCase()
+  const monthYear = (iso) =>
+    parseISO(iso).toLocaleDateString('en-GB', {
+      month: 'short',
+      year: 'numeric',
+    })
+
+  const dowNames = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
+
+  const tagFor = (pick, idx) => {
+    if (!pick) return null
+    if (idx === 0) return 'NEXT CHEAPEST'
+    if (idx === 1) return 'WEEKEND DEAL'
+    if (idx === 2) return `${monthAbbr(pick.iso)} DIP`
+    return `${dowNames[dowMondayFirst(pick.iso)]} DROP`
+  }
+
+  const enrich = (pick, idx) =>
+    pick && {
+      iso: pick.iso,
+      dow: dowShort(pick.iso),
+      dayOfMonth: dayOfMonth(pick.iso),
+      monthYear: monthYear(pick.iso),
+      floor: pick.floor,
+      showCount: pick.count,
+      tag: tagFor(pick, idx),
+      featured: idx === 0,
+    }
+
+  const picks = [pick1, pick2, pick3, pick4].map(enrich).filter(Boolean)
+  const floorFrom = picks.length
+    ? Math.min(...picks.map((p) => p.floor))
+    : null
+
+  return { picks, floorFrom }
+}
+
+export function computeWeekdayDistribution(data, today, days = 60) {
+  const buckets = [[], [], [], [], [], [], []] // 0=Mon ... 6=Sun
   const horizon = addDaysISO(today, days)
   const dayFloors = new Map()
 
@@ -1210,80 +1325,186 @@ export function computeDayOfWeekHeatmap(data, today, days = 60) {
   }
 
   for (const [iso, floor] of dayFloors) {
-    const dowMonFirst = dowMondayFirst(iso)
-    buckets[dowMonFirst].push(floor)
+    buckets[dowMondayFirst(iso)].push(floor)
   }
 
   const names = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
   const cells = buckets.map((arr, i) => {
     if (arr.length === 0) {
-      return { dow: names[i], median: null, count: 0 }
+      return {
+        dow: names[i],
+        prices: [],
+        median: null,
+        min: null,
+        max: null,
+        count: 0,
+        cheap: false,
+      }
     }
     const sorted = [...arr].sort((a, b) => a - b)
     const median = sorted[Math.floor(sorted.length / 2)]
-    return { dow: names[i], median, count: arr.length }
+    return {
+      dow: names[i],
+      prices: sorted,
+      median,
+      min: sorted[0],
+      max: sorted[sorted.length - 1],
+      count: sorted.length,
+      cheap: false, // assigned below
+    }
   })
 
-  // Find min/max for ranking + bar widths
-  const valid = cells.filter((c) => c.median != null).map((c) => c.median)
-  const min = valid.length ? Math.min(...valid) : null
-  const max = valid.length ? Math.max(...valid) : null
-  // Cheapest and priciest weekday for the editorial line
-  let cheapest = null
-  let priciest = null
-  for (const c of cells) {
-    if (c.median == null) continue
-    if (!cheapest || c.median < cheapest.median) cheapest = c
-    if (!priciest || c.median > priciest.median) priciest = c
+  const valid = cells.filter((c) => c.median != null)
+  const minMedian = valid.length
+    ? Math.min(...valid.map((c) => c.median))
+    : null
+  const maxMedian = valid.length
+    ? Math.max(...valid.map((c) => c.median))
+    : null
+
+  // A weekday is "cheap" if its median sits within £2 of the lowest
+  // median. This handles the common case where several weekdays share
+  // an identical floor (e.g. Tue, Fri, Sat, Sun all at £6) without
+  // dropping any that happen to be £1 off the tie.
+  if (minMedian != null) {
+    const cheapCeil = minMedian + 2
+    cells.forEach((c) => {
+      c.cheap = c.median != null && c.median <= cheapCeil
+    })
   }
 
-  return { cells, min, max, cheapest, priciest, windowDays: days }
+  const allPrices = valid.flatMap((c) => c.prices)
+  const minOverall = allPrices.length ? Math.min(...allPrices) : null
+  const maxOverall = allPrices.length ? Math.max(...allPrices) : null
+
+  // Widest-spread day for the editorial line — the one whose ceiling
+  // diverges most from its floor.
+  let widestDay = null
+  for (const c of valid) {
+    const spread = c.max - c.min
+    if (!widestDay || spread > widestDay.max - widestDay.min) widestDay = c
+  }
+
+  const cap = (s) => (s ? s.charAt(0) + s.slice(1).toLowerCase() : s)
+
+  let editorialLine = ''
+  if (minMedian != null && maxMedian != null) {
+    if (minMedian === maxMedian) {
+      editorialLine = `Floor sits at £${Math.round(
+        minMedian,
+      )} across every weekday in the window.`
+    } else {
+      const widestNote = widestDay
+        ? ` ${cap(widestDay.dow)}'s ceiling reaches £${Math.round(
+            widestDay.max,
+          )}.`
+        : ''
+      editorialLine =
+        `Cheap days pile up at the £${Math.round(minMedian)} floor — ` +
+        `premium days hold a tighter £${Math.round(maxMedian)} line.` +
+        widestNote
+    }
+  }
+
+  return {
+    cells,
+    minMedian,
+    maxMedian,
+    minOverall,
+    maxOverall,
+    widestDay,
+    editorialLine,
+    windowDays: days,
+  }
 }
 
-// 90-day calendar: per-day floor as a list, for a long horizontal strip.
-export function computeLongCalendar(data, today, days = 90) {
+export function computeMonthlyCalendars(data, today, days = 90) {
   const horizon = addDaysISO(today, days)
-  const dayFloors = new Map()
+  const dayMap = new Map()
+
   for (const show of data.shows) {
     for (const perf of show.performances || []) {
       if (perf.date < today || perf.date >= horizon) continue
       const eff = effectiveCheapest(perf)
       if (!eff) continue
-      const slot = dayFloors.get(perf.date) || { floor: Infinity, count: 0 }
-      slot.floor = Math.min(slot.floor, eff.price)
+      const slot = dayMap.get(perf.date) || { floor: Infinity, count: 0 }
+      if (eff.price < slot.floor) slot.floor = eff.price
       slot.count++
-      dayFloors.set(perf.date, slot)
+      dayMap.set(perf.date, slot)
     }
   }
-  const floors = [...dayFloors.values()]
+
+  const floors = [...dayMap.values()]
     .map((s) => s.floor)
     .filter((p) => Number.isFinite(p))
   const percentiles = computePercentiles(floors)
 
-  const cells = []
-  for (let i = 0; i < days; i++) {
-    const iso = addDaysISO(today, i)
-    const slot = dayFloors.get(iso)
-    const d = parseISO(iso)
-    cells.push({
-      iso,
-      dow: dowShort(iso),
-      dayOfMonth: d.getDate(),
-      month: d.getMonth(),
-      monthShort: d
-        .toLocaleDateString('en-GB', { month: 'short' })
-        .toUpperCase(),
-      isToday: iso === today,
-      isWeekend: d.getDay() === 0 || d.getDay() === 6,
-      isFirstOfMonth: d.getDate() === 1 || i === 0,
-      isDark: !slot,
-      floor: slot ? slot.floor : null,
-      showCount: slot ? slot.count : 0,
-      bucket: slot ? priceBucket(slot.floor, percentiles) : null,
-    })
+  // Walk months from the one containing today through the one containing
+  // the horizon. parseISO anchors at midday so DST edges don't shift us.
+  const todayD = parseISO(today)
+  const horizonD = parseISO(horizon)
+  const monthKeys = []
+  let y = todayD.getFullYear()
+  let m = todayD.getMonth()
+  while (
+    y < horizonD.getFullYear() ||
+    (y === horizonD.getFullYear() && m <= horizonD.getMonth())
+  ) {
+    monthKeys.push({ year: y, month: m })
+    m++
+    if (m >= 12) {
+      m = 0
+      y++
+    }
   }
 
-  return { cells, windowDays: days }
+  const months = monthKeys.map(({ year, month }) => {
+    const firstDay = new Date(year, month, 1, 12, 0, 0)
+    const lastDay = new Date(year, month + 1, 0, 12, 0, 0)
+    const firstDow = (firstDay.getDay() + 6) % 7 // Mon=0
+    const daysInMonth = lastDay.getDate()
+    const cells = []
+    for (let d = 1; d <= daysInMonth; d++) {
+      const iso = `${year}-${String(month + 1).padStart(2, '0')}-${String(
+        d,
+      ).padStart(2, '0')}`
+      const inWindow = iso >= today && iso < horizon
+      const isToday = iso === today
+      const isPast = iso < today
+      const slot = dayMap.get(iso)
+      cells.push({
+        day: d,
+        iso,
+        isToday,
+        isPast,
+        inWindow,
+        isDark: inWindow && !slot,
+        floor: slot ? slot.floor : null,
+        showCount: slot ? slot.count : 0,
+        bucket: slot ? priceBucket(slot.floor, percentiles) : null,
+      })
+    }
+    return {
+      year,
+      month,
+      label: firstDay
+        .toLocaleDateString('en-GB', { month: 'short' })
+        .toUpperCase(),
+      firstDow,
+      cells,
+    }
+  })
+
+  const darkCount = months.reduce(
+    (sum, mo) => sum + mo.cells.filter((c) => c.isDark).length,
+    0,
+  )
+  const inWindowCount = months.reduce(
+    (sum, mo) => sum + mo.cells.filter((c) => c.inWindow).length,
+    0,
+  )
+
+  return { months, darkCount, inWindowCount, windowDays: days }
 }
 
 // Per-date drill: every show on a specific ISO date, sorted cheapest first.
