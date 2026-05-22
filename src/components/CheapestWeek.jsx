@@ -32,7 +32,7 @@ export default function CheapestWeek({ week }) {
   return (
     <section className="stg-section">
       <SectionHead
-        eyebrow={`THIS WEEK · ${week.label}`}
+        eyebrow={`NEXT SEVEN DAYS · ${week.label}`}
         sub="Floor price across all London shows, by night"
         statLabel="WEEK FLOOR"
         stat={
