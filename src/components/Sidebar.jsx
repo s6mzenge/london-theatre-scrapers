@@ -8,8 +8,21 @@ import Brand from './Brand.jsx'
 // — cmd-click, middle-click, and right-click all behave the way users
 // expect from a real navigation surface. Plain left-clicks are still
 // intercepted for SPA pushState navigation.
+//
+// A tab can carry `subTabs[]`; sub-tabs render indented immediately
+// below their parent and activate independently (the parent does NOT
+// stay lit when a sub-tab is selected — the sub-tab's own visual
+// affordance is the active signal, and the indentation already
+// communicates the grouping).
 const TABS = [
-  { id: 'cheapest', href: '/', label: 'CHEAPEST' },
+  {
+    id: 'cheapest',
+    href: '/',
+    label: 'CHEAPEST',
+    subTabs: [
+      { id: 'today', href: '/today', label: 'TODAY · STACKED' },
+    ],
+  },
   { id: 'when', href: '/when', label: 'WHEN' },
   { id: 'shows', href: '/shows', label: 'SHOWS' },
   { id: 'venues', href: '/venues', label: 'VENUES' },
@@ -106,16 +119,36 @@ export default function Sidebar({ activeRoute, lastScrapedAt }) {
           {TABS.map((tab) => {
             const active = isTabActive(tab.id, activeRoute)
             return (
-              <Link
-                key={tab.id}
-                href={tab.href}
-                className={`stg-tab ${active ? 'active' : ''}`}
-                aria-current={active ? 'page' : undefined}
-                onClick={close}
-              >
-                {active && <span className="stg-tab-mark" />}
-                {tab.label}
-              </Link>
+              <div key={tab.id} className="stg-tab-wrap">
+                <Link
+                  href={tab.href}
+                  className={`stg-tab ${active ? 'active' : ''}`}
+                  aria-current={active ? 'page' : undefined}
+                  onClick={close}
+                >
+                  {active && <span className="stg-tab-mark" />}
+                  {tab.label}
+                </Link>
+                {tab.subTabs && tab.subTabs.length > 0 && (
+                  <div className="stg-subtabs">
+                    {tab.subTabs.map((sub) => {
+                      const subActive = isTabActive(sub.id, activeRoute)
+                      return (
+                        <Link
+                          key={sub.id}
+                          href={sub.href}
+                          className={`stg-subtab ${subActive ? 'active' : ''}`}
+                          aria-current={subActive ? 'page' : undefined}
+                          onClick={close}
+                        >
+                          {subActive && <span className="stg-subtab-mark" />}
+                          {sub.label}
+                        </Link>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
             )
           })}
         </nav>
