@@ -2,11 +2,12 @@ import { SectionHead } from './Cheapest.jsx'
 import { formatPrice } from '../lib/format.js'
 import { ShowLink } from '../lib/router.jsx'
 
-// Weekend: up to three day-cards showing the cheapest shows on Fri,
-// Sat and Sun (whichever of those nights are still ahead). On a
-// Tue–Thu morning we look forward to the coming weekend; on Sat we
-// show Sat + Sun; on Sun we only show Sun. The aggregator handles
-// the windowing — this component just renders what it's given.
+// Weekend: up to three day-cards showing the cheapest shows on the
+// upcoming Fri / Sat / Sun. The aggregator always looks *forward* —
+// today is covered by "Tonight" above, so it's never repeated here.
+// As the weekend is consumed the grid degrades from 3 → 2 → 1 card,
+// and on a Sunday it rolls forward to the *next* weekend (with the
+// eyebrow flipping to "NEXT WEEKEND" so the heading stays honest).
 
 export default function CheapestWeekend({ weekend }) {
   if (!weekend || !weekend.days || weekend.days.length === 0) return null
@@ -17,17 +18,20 @@ export default function CheapestWeekend({ weekend }) {
   if (!anyLit) return null
 
   const dayCount = weekend.days.length
+  const isNextWeekend = !!weekend.isNextWeekend
   const subLabel =
     dayCount === 3
-      ? 'Friday · Saturday · Sunday — cheapest seat per night'
+      ? isNextWeekend
+        ? 'Next Friday · Saturday · Sunday — cheapest seat per night'
+        : 'Friday · Saturday · Sunday — cheapest seat per night'
       : dayCount === 2
-        ? 'Two nights left this weekend'
-        : 'The last night of the weekend'
+        ? 'Saturday + Sunday — what’s left of the weekend'
+        : 'Sunday — the last night of the weekend'
 
   return (
     <section className="stg-section">
       <SectionHead
-        eyebrow="THIS WEEKEND"
+        eyebrow={isNextWeekend ? 'NEXT WEEKEND' : 'THIS WEEKEND'}
         sub={subLabel}
         statLabel="WEEKEND FLOOR"
         stat={
