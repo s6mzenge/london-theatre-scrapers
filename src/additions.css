@@ -1452,3 +1452,223 @@
   color: var(--color-brick);
   text-align: right;
 }
+
+/* ==========================================================================
+   CURTAIN — refinements
+   --------------------------------------------------------------------------
+   Three changes on top of the base curtain in index.css:
+
+   1. The flat .stg-curtain-hem band is hidden. As the curtain rose, the
+      hem's peach highlight + gilt pinstripes travelled with it as a hard
+      horizontal line that read as a seam crossing the page. With the hem
+      gone the curtain bottom is plain velvet, which lifts as a clean
+      sweep.
+
+   2. The valance.s base velvet gradient is replaced. The original
+      ran from --color-velvet at the top to --color-velvet-deep (almost
+      black) at the bottom. Combined with the swag clip-path, this
+      stamped a clearly visible dark "smile" onto the curtain below the
+      gold trim. Replacement: uniform --color-velvet, matching the top of
+
+   3. Gathered side drapes hang from the proscenium with mid-height
+      tiebacks. They stay in place during the main rise (so the rise
+      reads as the centre curtain parting away from a still-standing
+      proscenium frame), then sweep outward in a second beat to clear
+      the page. Width uses clamp() — narrow enough on phones to leave
+      meaningful page room, capped on large screens so they never bulge.
+
+   Animation choreography (relative to first paint):
+       0.00s  Curtain visible. Audience settles.
+       0.35s  Rising panel begins to lift.
+       2.75s  Rising panel fully off-screen. Side drapes alone now.
+       2.85s  Side drapes start parting (the 0.1s overlap reads as
+              continuous motion).
+       3.95s  Side drapes off-screen. Reveal complete.
+       4.05s  onComplete fires (sessionStorage flag set, component
+              unmounts on next render).
+   ========================================================================== */
+
+/* Root container — no longer animates. Just positions full-screen and
+   clips any drape transforms that overshoot the viewport edge. */
+.stg-curtain {
+  animation: none;
+  overflow: hidden;
+}
+
+/* Hide the original flat hem band — source of the dark horizontal line
+   visible during the rise. */
+.stg-curtain-hem {
+  display: none;
+}
+
+/* Rising panel — body, valance, wordmark, centre tassels. Lifts as one
+   block in beat 1 of the animation. 2.4s rise (down from 2.6s) leaves
+   headroom for the side-drape parting beat that follows. */
+.stg-curtain-rise {
+  position: absolute;
+  inset: 0;
+  animation: stg-curtain-rise 2.4s cubic-bezier(0.68, 0.02, 0.28, 1) 0.35s
+    forwards;
+}
+
+/* Re-lay the valance body's background to remove the dark band visible
+   under the gold trim. The original had a peach wash fading to
+   transparent by 70%, so the bottom 30% of the valance had NO peach
+   light. The body underneath has its own peach bloom that IS lit at
+   that same y. The mismatch — dim valance bottom against lit body top
+   — drew a horizontal dark band right under the gold trim.
+
+   Fix: keep peach light all the way down the valance (0.20 at top
+   tapering to 0.08 at bottom — never transparent), so the valance and
+   the body underneath stay at similar brightness throughout. The base
+   velvet is uniform --color-velvet — same as the curtain body's top —
+   so the swag bottom and body top blend seamlessly with no colour jump.
+   The pleats and peach gradient still give the swag a 3D feel. */
+.stg-valance-body {
+  background:
+    linear-gradient(to bottom, rgba(255, 200, 160, 0.20) 0%, rgba(255, 200, 160, 0.08) 100%),
+    repeating-linear-gradient(
+      90deg,
+      rgba(0, 0, 0, 0.36) 0px,
+      rgba(0, 0, 0, 0.20) 4px,
+      rgba(0, 0, 0, 0.10) 8px,
+      rgba(255, 210, 192, 0.10) 16px,
+      rgba(0, 0, 0, 0.10) 24px,
+      rgba(0, 0, 0, 0.20) 28px,
+      rgba(0, 0, 0, 0.36) 32px
+    ),
+    var(--color-velvet);
+}
+
+/* Side drapes — narrower than the first pass so they don't crowd the
+   page. clamp() gives a fluid 10vw width with safe min/max bounds:
+   min 40px so the tieback stays visible on small phones, max 160px so
+   the drapes never bulge to absurd width on huge screens. */
+.stg-side-drape {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: clamp(40px, 10vw, 160px);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.stg-side-drape-left {
+  left: 0;
+  animation: stg-side-drape-out-left 1.1s cubic-bezier(0.55, 0.05, 0.35, 1)
+    2.85s forwards;
+}
+
+.stg-side-drape-right {
+  right: 0;
+  animation: stg-side-drape-out-right 1.1s cubic-bezier(0.55, 0.05, 0.35, 1)
+    2.85s forwards;
+}
+
+/* Body of each side drape — the velvet itself. Vertical gradient
+   darkens at mid-height to suggest the fold/gather where the tieback
+   pinches the fabric. Tighter pleat spacing (26px) than the main
+   curtain (40px) reads as denser/gathered fabric. */
+.stg-side-drape-body {
+  position: absolute;
+  inset: 0;
+  background:
+    /* Inner-edge shadow — darker on the page-centre side */
+    linear-gradient(to right, transparent 0%, transparent 60%, rgba(0, 0, 0, 0.35) 100%),
+    repeating-linear-gradient(
+      90deg,
+      rgba(0, 0, 0, 0.50) 0px,
+      rgba(0, 0, 0, 0.30) 3px,
+      rgba(0, 0, 0, 0.10) 6px,
+      rgba(255, 210, 192, 0.14) 12px,
+      rgba(0, 0, 0, 0.10) 18px,
+      rgba(0, 0, 0, 0.30) 22px,
+      rgba(0, 0, 0, 0.50) 26px
+    ),
+    linear-gradient(
+      to bottom,
+      var(--color-velvet) 0%,
+      var(--color-velvet-mid) 40%,
+      var(--color-velvet-deep) 52%,
+      var(--color-velvet-mid) 64%,
+      var(--color-velvet) 100%
+    );
+}
+
+/* Mirror the inner-edge shadow for the right drape so it falls on the
+   left edge (the side facing the page centre). */
+.stg-side-drape-right .stg-side-drape-body {
+  background:
+    linear-gradient(to left, transparent 0%, transparent 60%, rgba(0, 0, 0, 0.35) 100%),
+    repeating-linear-gradient(
+      90deg,
+      rgba(0, 0, 0, 0.50) 0px,
+      rgba(0, 0, 0, 0.30) 3px,
+      rgba(0, 0, 0, 0.10) 6px,
+      rgba(255, 210, 192, 0.14) 12px,
+      rgba(0, 0, 0, 0.10) 18px,
+      rgba(0, 0, 0, 0.30) 22px,
+      rgba(0, 0, 0, 0.50) 26px
+    ),
+    linear-gradient(
+      to bottom,
+      var(--color-velvet) 0%,
+      var(--color-velvet-mid) 40%,
+      var(--color-velvet-deep) 52%,
+      var(--color-velvet-mid) 64%,
+      var(--color-velvet) 100%
+    );
+}
+
+/* Hourglass silhouette — the inner edge curves inward at mid-height
+   where the tieback gathers the fabric. The outer edge stays straight
+   against the proscenium. */
+.stg-side-drape-left .stg-side-drape-body {
+  clip-path: polygon(
+    0 0, 100% 0,
+    96% 30%, 88% 50%, 96% 70%,
+    100% 100%, 0 100%
+  );
+}
+
+.stg-side-drape-right .stg-side-drape-body {
+  clip-path: polygon(
+    0 0, 100% 0, 100% 100%, 0 100%,
+    4% 70%, 12% 50%, 4% 30%
+  );
+}
+
+/* Tieback at mid-height — gold cord curves + a hanging tassel. The svg
+   inside is rendered by the SideTieback function in Curtain.jsx. */
+.stg-side-drape-tieback {
+  position: absolute;
+  top: 50%;
+  width: 100%;
+  height: clamp(28px, 4vw, 60px);
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+.stg-side-drape-tieback svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+@keyframes stg-side-drape-out-left {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-105%);
+  }
+}
+
+@keyframes stg-side-drape-out-right {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(105%);
+  }
+}
