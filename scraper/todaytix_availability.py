@@ -111,14 +111,23 @@ from pathlib import Path
 
 DEFAULT_WINDOW_DAYS          = 14
 DEFAULT_CHEAP_BAND_THRESHOLD = 3
-DEFAULT_WORKERS              = 1   # see "Bot-wall mitigations" above
+# Two workers is the cautious bump. Earlier in this codebase's history
+# we found that more workers + fresh-context-per-page made the
+# Cloudflare bot wall worse (clearance cookies lost). Keeping the
+# long-lived contexts and staggering worker startup (see _worker
+# below — each worker waits worker_index * WORKER_START_STAGGER_S
+# before its first request) lets us double throughput without
+# punching Cloudflare in the face. If we see fetch_failed spike in
+# practice, drop back to 1.
+DEFAULT_WORKERS              = 2
+WORKER_START_STAGGER_S       = 2.0   # second worker waits 2s before prewarm
 
 NAV_TIMEOUT_MS               = 30_000
-FIRST_PRICE_TIMEOUT_MS       = 12_000
+FIRST_PRICE_TIMEOUT_MS       = 12_000   # safety net; rarely hit
 STABILITY_POLL_S             = 0.25
-STABILITY_POLLS              = 3        # 3 × 250ms = 750ms stable
-MAX_WAIT_S                   = 4.0
-INTER_PAGE_SLEEP_S           = 2.0      # within-worker pacing
+STABILITY_POLLS              = 2        # 2 × 250ms = 500ms unchanged
+MAX_WAIT_S                   = 2.5      # hard cap; TT chips usually settle <1s
+INTER_PAGE_SLEEP_S           = 2.0      # within-worker pacing (proven floor)
 PREWARM_URL                  = "https://www.todaytix.com/london"
 
 # Plausible per-ticket price range.
@@ -292,11 +301,21 @@ async def _prewarm(context) -> None:
         except Exception: pass
 
 
-async def _worker(name: str, browser, queue: asyncio.Queue,
+async def _worker(name: str, worker_index: int, browser,
+                  queue: asyncio.Queue,
                   results: dict, lock: asyncio.Lock,
                   counter: list, total: int) -> None:
     """One long-lived context per worker. Pre-warms once, then pulls
-    items from the shared queue until empty."""
+    items from the shared queue until empty.
+
+    Workers stagger their startup by `worker_index * WORKER_START_STAGGER_S`
+    seconds — without this, N workers prewarm in parallel and N
+    simultaneous fresh Chrome fingerprints hitting Cloudflare's
+    challenge in the same instant looks more bot-like than one. The
+    stagger lets the first worker clear the challenge cleanly before
+    the second one starts, then both run concurrently from then on."""
+    if worker_index > 0:
+        await asyncio.sleep(worker_index * WORKER_START_STAGGER_S)
     context = await browser.new_context(
         viewport={"width": 1400, "height": 900},
         user_agent=UA,
@@ -349,7 +368,7 @@ async def _run_async(suspect_items: list[dict], workers: int) -> dict:
         lock = asyncio.Lock()
         tasks = [
             asyncio.create_task(
-                _worker(f"w{i+1}", browser, queue, results,
+                _worker(f"w{i+1}", i, browser, queue, results,
                         lock, counter, total)
             )
             for i in range(workers)
@@ -365,13 +384,41 @@ async def _run_async(suspect_items: list[dict], workers: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def run(payload: dict, window_days: int, threshold: int,
-        workers: int) -> dict:
+        workers: int,
+        cache_path: Path | None = None,
+        cache_ttl_hours: int = 24) -> dict:
     """Walk all shows × showtimes, classify suspects, run the chip
     pass, write verified_* fields. Returns a summary for the report
-    block."""
+    block.
+
+    Cache: when `cache_path` is given, suspect showtimes whose
+    catalogue inputs haven't changed since the last run skip the
+    Playwright extraction and reuse cached chip values. See
+    chip_pass_cache.py for the cache contract. The catalogue inputs
+    hashed for TT are `low_price_value` (the SSR snapshot's cheapest)
+    and the cheapest available band's price + seats_available — these
+    are exactly the fields that drive the suspect classifier, so any
+    change to them invalidates the cached result."""
     if not isinstance(payload, dict):
         return {"suspect_count": 0, "ok": 0, "no_chips": 0,
-                "fetch_failed": 0, "duration_seconds": 0.0}
+                "fetch_failed": 0, "duration_seconds": 0.0,
+                "cache_hits": 0, "cache_misses": 0}
+
+    # Cache setup — fully optional.
+    cache_entries: dict = {}
+    use_cache = cache_path is not None
+    cache_mod = None
+    if use_cache:
+        try:
+            import chip_pass_cache as cache_mod
+            cache_entries = cache_mod.load(cache_path)
+            log.info("Chip cache loaded from %s — %d entries",
+                     cache_path, len(cache_entries))
+        except ImportError:
+            log.warning("chip_pass_cache module not importable; "
+                        "running without cache.")
+            use_cache = False
+            cache_mod = None
 
     today = date.today()
     suspects = []
@@ -383,6 +430,14 @@ def run(payload: dict, window_days: int, threshold: int,
             url = st.get("booking_url")
             if not url:
                 continue
+            # Extract the cheapest-available band's price/seats for
+            # input hashing. If the band data changes, the chip pass
+            # would re-classify and re-extract — so invalidate.
+            bands = st.get("price_bands") or []
+            avail = [b for b in bands
+                     if (b.get("seats_available") or 0) > 0
+                     and b.get("price_value") is not None]
+            cheapest = min(avail, key=lambda b: b["price_value"]) if avail else None
             suspects.append({
                 "key":    (s_idx, st_idx),
                 "url":    url,
@@ -390,6 +445,9 @@ def run(payload: dict, window_days: int, threshold: int,
                 "show":   show.get("slug") or "?",
                 "date":   st.get("local_date"),
                 "time":   st.get("local_time"),
+                "_input_low_price":    st.get("low_price_value"),
+                "_input_cheap_price":  cheapest.get("price_value") if cheapest else None,
+                "_input_cheap_seats":  cheapest.get("seats_available") if cheapest else None,
             })
 
     log.info(
@@ -399,28 +457,78 @@ def run(payload: dict, window_days: int, threshold: int,
 
     if not suspects:
         return {"suspect_count": 0, "ok": 0, "no_chips": 0,
-                "fetch_failed": 0, "duration_seconds": 0.0}
+                "fetch_failed": 0, "duration_seconds": 0.0,
+                "cache_hits": 0, "cache_misses": 0}
 
-    est_min = max(1, len(suspects) * 4 // (max(workers, 1) * 60))
+    # Cache lookup: partition into hits and misses.
+    results: dict = {}
+    cache_hits = 0
+    cache_misses = 0
+    suspects_to_run = []
+    if use_cache and cache_mod is not None:
+        for s in suspects:
+            ckey = cache_mod.make_key(s["date"], s["time"], s["url"])
+            if ckey is None:
+                suspects_to_run.append(s)
+                cache_misses += 1
+                continue
+            input_hash = cache_mod.hash_inputs(
+                s["_input_low_price"],
+                s["_input_cheap_price"],
+                s["_input_cheap_seats"],
+            )
+            entry = cache_entries.get(ckey)
+            if cache_mod.is_hit(entry, input_hash, ttl_hours=cache_ttl_hours):
+                results[s["key"]] = (
+                    entry["chip_min"], entry["chip_max"],
+                    entry["candidates"], entry["note"],
+                )
+                s["_cached_source"] = entry["source"]
+                s["_cache_key"]     = ckey
+                s["_input_hash"]    = input_hash
+                cache_hits += 1
+            else:
+                s["_cache_key"]  = ckey
+                s["_input_hash"] = input_hash
+                suspects_to_run.append(s)
+                cache_misses += 1
+    else:
+        suspects_to_run = suspects
+        cache_misses = len(suspects)
+
+    log.info("Chip cache: %d hits, %d misses (running extractor on %d rows)",
+             cache_hits, cache_misses, len(suspects_to_run))
+
+    est_min = max(1, len(suspects_to_run) * 4 // (max(workers, 1) * 60))
     log.info("Starting chip pass: %d showtime(s), %d worker(s), "
-             "est. ~%d min", len(suspects), workers, est_min)
+             "est. ~%d min", len(suspects_to_run), workers, est_min)
 
     t0 = time.monotonic()
-    results = asyncio.run(_run_async(suspects, workers))
+    if suspects_to_run:
+        miss_results = asyncio.run(_run_async(suspects_to_run, workers))
+        results.update(miss_results)
     elapsed = time.monotonic() - t0
 
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     ok = no_chips = fetch_failed = 0
+    cache_writes = 0
     for s in suspects:
         min_p, max_p, candidates, note = results.get(
             s["key"], (None, None, [], "missed"),
         )
-        if min_p is not None:
-            source = PRICE_SOURCE_OK; ok += 1
-        elif note.startswith("no prices"):
-            source = PRICE_SOURCE_NO_CHIPS; no_chips += 1
+        cached_source = s.get("_cached_source")
+        if cached_source is not None:
+            source = cached_source
+            if source == PRICE_SOURCE_OK:        ok += 1
+            elif source == PRICE_SOURCE_NO_CHIPS: no_chips += 1
+            else:                                 fetch_failed += 1
         else:
-            source = PRICE_SOURCE_FETCH_FAIL; fetch_failed += 1
+            if min_p is not None:
+                source = PRICE_SOURCE_OK; ok += 1
+            elif note.startswith("no prices"):
+                source = PRICE_SOURCE_NO_CHIPS; no_chips += 1
+            else:
+                source = PRICE_SOURCE_FETCH_FAIL; fetch_failed += 1
         s_idx, st_idx = s["key"]
         st = payload["shows"][s_idx]["showtimes"][st_idx]
         st["verified_min_price"]    = min_p
@@ -432,9 +540,31 @@ def run(payload: dict, window_days: int, threshold: int,
         st["verified_url"]          = s["url"]
         st["verified_checked_at"]   = now_iso
 
+        if (use_cache and cache_mod is not None
+                and cached_source is None
+                and source in cache_mod.CACHEABLE_SOURCES
+                and s.get("_cache_key") is not None):
+            cache_entries[s["_cache_key"]] = cache_mod.make_entry(
+                chip_min=min_p,
+                chip_max=max_p,
+                candidates=candidates,
+                source=source,
+                reason=s["reason"],
+                note=note,
+                input_hash=s["_input_hash"],
+            )
+            cache_writes += 1
+
+    if use_cache and cache_mod is not None and cache_writes > 0:
+        cache_mod.save(cache_path, cache_entries)
+        log.info("Chip cache: wrote %d new entries → %s",
+                 cache_writes, cache_path)
+
     log.info(
-        "Done in %.1fs — ok=%d, no_chips=%d, fetch_failed=%d",
+        "Done in %.1fs — ok=%d, no_chips=%d, fetch_failed=%d"
+        " (cache: %d hits / %d misses / %d writes)",
         elapsed, ok, no_chips, fetch_failed,
+        cache_hits, cache_misses, cache_writes,
     )
 
     summary = {
@@ -447,6 +577,9 @@ def run(payload: dict, window_days: int, threshold: int,
         "no_chips":         no_chips,
         "fetch_failed":     fetch_failed,
         "duration_seconds": round(elapsed, 1),
+        "cache_hits":       cache_hits,
+        "cache_misses":     cache_misses,
+        "cache_writes":     cache_writes,
     }
     report = payload.setdefault("report", {})
     if isinstance(report, dict):
@@ -481,6 +614,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
         help=f"Concurrent Playwright pages (default: {DEFAULT_WORKERS}; "
              "TT is sensitive to bot detection — increase cautiously).")
+    p.add_argument("--chip-cache", type=Path, default=None,
+        help="Path to a JSON cache file for chip-pass results. When "
+             "provided, suspect showtimes whose catalogue inputs "
+             "haven't changed since the last run skip the Playwright "
+             "extraction and reuse cached chip values. Cache entries "
+             "expire after --chip-cache-ttl-hours (default 24). Omit "
+             "this flag to run without caching.")
+    p.add_argument("--chip-cache-ttl-hours", type=int, default=24,
+        help="How long a cache entry stays valid (default: 24h).")
     p.add_argument("--dry-run", action="store_true",
         help="Do everything except write the output file.")
     args = p.parse_args(argv)
@@ -501,7 +643,9 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_BAD_INPUT
 
     run(payload, window_days=args.window_days,
-        threshold=args.cheap_band_threshold, workers=args.workers)
+        threshold=args.cheap_band_threshold, workers=args.workers,
+        cache_path=args.chip_cache,
+        cache_ttl_hours=args.chip_cache_ttl_hours)
 
     if args.dry_run:
         log.info("--dry-run: not writing output")
