@@ -1309,3 +1309,131 @@
     text-align: left;
   }
 }
+
+/* ==========================================================================
+   CHEAPEST — Budget Tiers (additions for clickable drill-down)
+   --------------------------------------------------------------------------
+   Tiles are now buttons that toggle a drill-down panel. Active-state
+   styling mirrors the SELLERS card inversion so the visual vocabulary
+   stays consistent across "click a card → see what's under it" surfaces.
+   ========================================================================== */
+
+.stg-tier-tile {
+  /* Button reset — tiles are now <button>s, not <a>s */
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  width: 100%;
+}
+
+.stg-tier-tile.empty {
+  cursor: default;
+  pointer-events: none;
+}
+
+.stg-tier-tile.active {
+  background: var(--color-ink);
+  border-color: var(--color-brick);
+}
+
+.stg-tier-tile.active .stg-tier-tile-lbl {
+  color: var(--color-gold-light, #e6c876);
+}
+
+.stg-tier-tile.active .stg-tier-tile-count,
+.stg-tier-tile.active .stg-tier-tile-headline {
+  color: var(--color-paper);
+}
+
+.stg-tier-tile.active .stg-tier-tile-sub,
+.stg-tier-tile.active .stg-tier-tile-headline-lbl,
+.stg-tier-tile.active .stg-tier-tile-headline-meta {
+  color: rgba(236, 230, 214, 0.55);
+}
+
+.stg-tier-tile.active .stg-tier-tile-headline-price {
+  color: var(--color-gold-light, #e6c876);
+}
+
+.stg-tier-tile.active .stg-tier-tile-rule {
+  background: rgba(236, 230, 214, 0.18);
+}
+
+/* Drill-down panel — sits flush below the tier grid */
+.stg-tier-drill {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 0.5px solid var(--line-strong);
+}
+
+.stg-tier-drill-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 10px;
+}
+
+.stg-tier-drill-eye {
+  font-family: var(--font-slab);
+  font-size: 11px;
+  letter-spacing: 1.8px;
+  color: var(--color-text-muted);
+}
+
+.stg-tier-drill-eye b {
+  font-weight: 700;
+  color: var(--color-brick);
+}
+
+.stg-tier-drill-r-lbl {
+  font-family: var(--font-sans);
+  font-size: 9px;
+  letter-spacing: 1.8px;
+  color: var(--color-text-faint);
+  text-transform: uppercase;
+}
+
+.stg-tier-drill-row {
+  display: grid;
+  grid-template-columns: 40px 1fr auto;
+  gap: 14px;
+  align-items: center;
+  padding: 12px 4px;
+  border-bottom: 0.5px solid var(--line-faint);
+  transition: opacity 0.18s;
+  text-decoration: none;
+  color: inherit;
+}
+
+.stg-tier-drill-row:hover { opacity: 0.7; }
+
+.stg-tier-drill-rank {
+  font-family: var(--font-display);
+  font-size: 15px;
+  color: var(--color-text-faint);
+  text-align: center;
+}
+
+.stg-tier-drill-body { min-width: 0; }
+
+.stg-tier-drill-title {
+  font-family: var(--font-shout);
+  font-size: 15px;
+  color: var(--color-ink);
+  letter-spacing: -0.05px;
+  line-height: 1.1;
+}
+
+.stg-tier-drill-meta {
+  font-family: var(--font-slab);
+  font-size: 10px;
+  color: var(--color-text-muted);
+  margin-top: 4px;
+}
+
+.stg-tier-drill-price {
+  font-family: var(--font-display);
+  font-size: 18px;
+  color: var(--color-brick);
+  text-align: right;
+}
