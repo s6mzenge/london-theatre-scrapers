@@ -538,8 +538,18 @@ def _olt_available(p: dict) -> bool | None:
 #                          through to the calendar verification.
 #                          Switch back to `return None` once the
 #                          parser covers more venues.
-#     "fetch_failed"     — seat-plan fetch errored; fall through to
-#                          calendar
+#     "fetch_failed"     — seat-plan fetch errored. Specific sub-cases:
+#                          - seat_status="result_code=-1" + calendar
+#                            verified → SOLD OUT (return None). Manually
+#                            confirmed May 2026 across 4 perfs (3 Inter
+#                            Alia + 1 Beetlejuice), all genuinely sold
+#                            out despite JSON-LD still claiming InStock.
+#                            TTD's BindSeatPlan endpoint emits
+#                            ResultCode=-1 when a perf is listed in the
+#                            calendar but has no purchasable inventory.
+#                          - other seat_status values (HTTP errors,
+#                            network exceptions, empty body, json parse)
+#                            → transient; fall through to calendar.
 #     "skipped"          — not checked (past, no perf_id, etc.); fall
 #                          through to calendar
 #     (missing field)    — seat verification pass never ran; fall
@@ -558,6 +568,19 @@ def _ttd_price_from(p: dict) -> float | None:
         seat_min = p.get("seat_min_price")
         if seat_min is not None:
             return seat_min
+    # Sold-out detection. TTD's BindSeatPlan API returns
+    # ResultCode=-1 when a perf is calendared but has no purchasable
+    # inventory. The JSON-LD availability field continues to claim
+    # InStock in these cases, so the seat-plan signal is the only
+    # reliable way to detect this state. We require BOTH the
+    # ResultCode=-1 signal AND a successful calendar verification —
+    # if the calendar fetch itself failed we can't distinguish
+    # sold-out from a general TTD outage, so we fall through.
+    # Manually validated across all 4 observed perfs in May 2026.
+    if (seat_source == "fetch_failed"
+            and p.get("seat_status") == "result_code=-1"
+            and p.get("verified_price_source") == "ttd_calendar"):
+        return None
     # Note: previously also returned None on seat_source == "no_legend"
     # under the assumption that "no legend on the page" meant
     # "off-sale". First CI run (21 May 2026) showed the parser fails
@@ -584,9 +607,16 @@ def _ttd_price_to(p: dict) -> float | None:
     """Maximum price tier for the perf. Only the seat-plan verifier
     produces a meaningful max — JSON-LD lowPrice and the calendar
     widget's 'from £X' both have no upper bound. Returns None when
-    seat verification didn't conclude or had nothing to report."""
+    seat verification didn't conclude or when the perf is sold-out
+    (kept in sync with `_ttd_price_from`)."""
     if p.get("seat_price_source") == "seat_plan":
         return p.get("seat_max_price")
+    # Sold-out via BindSeatPlan ResultCode=-1 — see _ttd_price_from.
+    # Don't surface a max for a perf that isn't bookable.
+    if (p.get("seat_price_source") == "fetch_failed"
+            and p.get("seat_status") == "result_code=-1"
+            and p.get("verified_price_source") == "ttd_calendar"):
+        return None
     return None
 
 
