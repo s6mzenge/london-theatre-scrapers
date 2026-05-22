@@ -101,6 +101,7 @@ Output is a single JSON file:
 from __future__ import annotations
 
 import argparse
+import os
 import html
 import json
 import logging
@@ -228,35 +229,17 @@ class ListingCard:
 @dataclass
 class Performance:
     """One upcoming performance, sourced from the detail page's
-    TheaterEvent JSON-LD and (where overlapping) the Last Minute table.
-
-    Five fields at the end are filled by the availability-enrichment step
-    (see `_enrich_with_availability`), which calls SeatPlan's internal
-    /api/performance/normal-prices/ endpoint to get the actually-bookable
-    price. `low_price` is kept untouched — it carries the marketing
-    "from £X" price from JSON-LD, which SeatPlan themselves know is
-    stale (their new-quotes endpoint fires an `sp_ticketing_calendar_error`
-    event when this diverges from the real quote). Consumers should
-    prefer `available_from` and fall back to `low_price` only when
-    enrichment couldn't run (e.g. show outside the 30-perf cap, network
-    error during enrichment, or production has no sku)."""
+    TheaterEvent JSON-LD and (where overlapping) the Last Minute table."""
     iso: str | None            # full ISO with offset, e.g. "2026-05-19T19:30:00+01:00"
     date: str | None           # "2026-05-19"
     time: str | None           # "19:30"
-    low_price: float | None    # JSON-LD lowPrice — MARKETING price, often stale
+    low_price: float | None
     currency: str | None
     availability: str | None
     # Filled from the Last Minute table where dates overlap
     showtime_id: str | None    # data-id on the booking link
     book_url: str | None       # absolute URL for checkout
     has_deals: bool            # whether the row carried a "Deals" badge
-    # Filled by _enrich_with_availability. All None when enrichment
-    # didn't run for this perf.
-    performance_id: int | None = None       # SeatPlan's numeric perf ID
-    available_seats: int | None = None      # count from /normal-prices/ (0 = sold out)
-    available_from: float | None = None     # min normalMinPrice — the REAL cheapest
-    available_to: float | None = None       # max normalMaxPrice
-    price_source: str | None = None         # "normal_prices" | "sold_out" | None
 
 
 @dataclass
@@ -387,8 +370,62 @@ class ScrapeReport:
 # HTTP session
 # ---------------------------------------------------------------------------
 
-def build_session(pool_size: int) -> requests.Session:
-    s = requests.Session()
+class _ProxyingSession(requests.Session):
+    """requests.Session that tunnels every request through a reverse proxy.
+
+    Background: SeatPlan sits behind Cloudflare bot protection that
+    blocks GitHub Actions runner subnets intermittently. The fix is the
+    same Cloudflare Worker that already proxies OLT and SeeTickets
+    traffic — that worker accepts any URL on its ALLOWED_HOSTS list via
+    the X-Proxy-Target header.
+
+    This subclass intercepts requests.Session.request() and, for every
+    HTTP/HTTPS URL, sends the request to the proxy itself, passing the
+    real target URL as X-Proxy-Target. The worker reads that header,
+    fetches the target, and streams the response back. Authentication
+    is a static shared secret in X-Proxy-Auth.
+
+    Why intercept all URLs rather than just SeatPlan ones: the scraper
+    only ever hits seatplan.com, so there's no risk of leaking the
+    auth header to a third party that happens to share the session.
+    Intercepting unconditionally avoids drift if SeatPlan ever 30x's to
+    a different domain we'd still want proxied (rare in practice; cheap
+    insurance regardless).
+
+    Mirrors `olt_availability.py`'s _ProxyingSession one-for-one so the
+    operational story is uniform across both sources — same worker,
+    same auth header, same allowlist model.
+    """
+
+    def __init__(self, proxy_url: str, proxy_token: str | None) -> None:
+        super().__init__()
+        # Strip trailing slash so the URL is well-formed regardless of
+        # whether the user wrote "https://w.dev" or "https://w.dev/".
+        self._proxy_url = proxy_url.rstrip("/")
+        self._proxy_token = proxy_token or ""
+
+    def request(self, method, url, **kwargs):
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            # Merge with caller-supplied headers without mutating their
+            # dict — some call sites reuse the same dict across calls.
+            caller_headers = kwargs.get("headers") or {}
+            proxy_headers = {**caller_headers, "X-Proxy-Target": url}
+            if self._proxy_token:
+                proxy_headers["X-Proxy-Auth"] = self._proxy_token
+            kwargs["headers"] = proxy_headers
+            url = self._proxy_url
+        return super().request(method, url, **kwargs)
+
+
+def build_session(
+    pool_size: int,
+    proxy_url: str | None = None,
+    proxy_token: str | None = None,
+) -> requests.Session:
+    if proxy_url:
+        s: requests.Session = _ProxyingSession(proxy_url, proxy_token)
+    else:
+        s = requests.Session()
     s.headers.update(DEFAULT_HEADERS)
     retry = Retry(
         total=RETRY_TOTAL,
@@ -1059,187 +1096,6 @@ def _merge_lastminute(
     return perfs
 
 
-def _merge_global_lastminute_into_perfs(
-    perfs: list[dict],
-    global_lm: list[dict],
-) -> list[dict]:
-    """Fill in book_url / showtime_id / has_deals from the cross-show
-    global Last Minute Tickets table for performances whose per-show
-    `section#last-minute` was missing or didn't cover them.
-
-    The per-show section (merged earlier in `_merge_lastminute`) is the
-    preferred source; the global table — parsed from
-    `/london/whats-on/last-minute/`, which carries the same booking
-    deep-link URLs — is the fallback. We only fill fields that aren't
-    already populated, so per-show data always wins.
-
-    This matters for shows whose detail page omits the per-show widget
-    entirely. Typical cases:
-      * New productions in their first few days (no per-show widget
-        yet, but the show is bookable today/tomorrow via the global
-        table — e.g. Beetlejuice on opening week).
-      * Sold-out shows where the per-show table is empty.
-      * Productions where SeatPlan simply hasn't enabled the widget.
-
-    Without this merge, ~17 currently-bookable shows surface 0 book_urls
-    on their performances even though the global table carries them.
-
-    Returns the (possibly extended) list of performance dicts. Operates
-    on dicts (not Performance instances) because `_parse_detail_page`
-    has already done `asdict(p)` by the time we receive these.
-    """
-    if not global_lm:
-        return perfs
-
-    by_key: dict[tuple, dict] = {
-        (p.get("date"), p.get("time")): p for p in perfs
-    }
-
-    for e in global_lm:
-        key = (e.get("date"), e.get("time_24h"))
-        target = by_key.get(key)
-        if target is not None:
-            # Fill gaps only — don't overwrite per-show data
-            if not target.get("book_url") and e.get("book_url"):
-                target["book_url"] = e["book_url"]
-            if not target.get("showtime_id") and e.get("showtime_id"):
-                target["showtime_id"] = e["showtime_id"]
-            if not target.get("has_deals") and e.get("has_price_drops"):
-                target["has_deals"] = True
-        elif e.get("book_url"):
-            # No JSON-LD performance matches — append as a standalone
-            # entry, mirroring the Performance dataclass shape. Same
-            # fallback strategy `_merge_lastminute` uses for unmatched
-            # per-show entries.
-            perfs.append({
-                "iso": None,
-                "date": e.get("date"),
-                "time": e.get("time_24h"),
-                "low_price": e.get("from_price"),
-                "currency": "GBP",  # SeatPlan London is consistently GBP
-                "availability": None,
-                "showtime_id": e.get("showtime_id"),
-                "book_url": e["book_url"],
-                "has_deals": bool(e.get("has_price_drops")),
-            })
-
-    return perfs
-
-
-# ---------------------------------------------------------------------------
-# Constructed booking URLs (for performances beyond the rolling window)
-# ---------------------------------------------------------------------------
-
-# Lower-case 3-letter month abbreviations, indexed 1..12. SeatPlan's
-# URL slug uses these (e.g. "13-jun-2026"), so we match that exactly.
-_MONTH_ABBR: tuple[str, ...] = (
-    "jan", "feb", "mar", "apr", "may", "jun",
-    "jul", "aug", "sep", "oct", "nov", "dec",
-)
-
-
-def _construct_book_url(
-    show_url: str, date_iso: str | None, time_24h: str | None,
-) -> str | None:
-    """Build a SeatPlan booking deep-link URL from a (date, time) pair.
-
-    SeatPlan only renders deep-link booking URLs inline in the page DOM
-    for the rolling ~5-day "Last Minute" window, but their server
-    validates leaf URLs against the full performance calendar:
-
-      * Valid (date, time) with a real performance → serves a dedicated
-        "Select Seat" page (title "Select Seat | <time> <date> | …").
-      * (date, time) with no performance, or a past date → redirects
-        to the show page.
-
-    Verified empirically across +1 week, +3 weeks, +10 weeks, +20 weeks
-    and end-of-run for Wicked: all returned Select Seat pages. A Monday
-    probe (no performance) and a past-date probe both bounced. The
-    pattern works for the entire published run, not just the window.
-
-    Returns None on malformed inputs (missing date/time, non-numeric
-    components, out-of-range values). Since we feed this from JSON-LD
-    performance dates+times, malformed inputs should be rare; we still
-    guard against them so a single bad row doesn't crash a whole show.
-
-    URL format (matches what the per-show widget emits):
-        {show_url}tickets/{D-mon-YYYY}/{h-mm}{am|pm}/
-
-    Where D is the day of month with no leading zero, mon is the
-    lowercase 3-letter month, h is the 12-hour hour with no leading
-    zero, mm is the 2-digit minute, and am/pm is the meridian. Examples:
-        "2026-06-13" + "14:30" → ".../tickets/13-jun-2026/2-30pm/"
-        "2026-08-01" + "19:30" → ".../tickets/1-aug-2026/7-30pm/"
-        "2026-10-10" + "12:00" → ".../tickets/10-oct-2026/12-00pm/"
-        "2026-10-10" + "00:30" → ".../tickets/10-oct-2026/12-30am/"
-    """
-    if not show_url or not date_iso or not time_24h:
-        return None
-
-    try:
-        y_str, m_str, d_str = date_iso.split("-")
-        year, month, day = int(y_str), int(m_str), int(d_str)
-    except (ValueError, AttributeError):
-        return None
-    if not (1 <= month <= 12 and 1 <= day <= 31):
-        return None
-
-    try:
-        hh_str, mm_str = time_24h.split(":", 1)
-        hour, minute = int(hh_str), int(mm_str[:2])
-    except (ValueError, AttributeError, IndexError):
-        return None
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        return None
-
-    # 24h → 12h with am/pm
-    if hour == 0:
-        h12, ampm = 12, "am"
-    elif hour < 12:
-        h12, ampm = hour, "am"
-    elif hour == 12:
-        h12, ampm = 12, "pm"
-    else:
-        h12, ampm = hour - 12, "pm"
-
-    base = show_url if show_url.endswith("/") else show_url + "/"
-    return f"{base}tickets/{day}-{_MONTH_ABBR[month - 1]}-{year}/{h12}-{minute:02d}{ampm}/"
-
-
-def _fill_constructed_book_urls(
-    perfs: list[dict], show_url: str,
-) -> int:
-    """Fill `book_url` on any performance dict that's still missing one,
-    using the deterministic SeatPlan deep-link URL pattern.
-
-    Runs after the per-show widget merge (`_merge_lastminute`) and the
-    cross-show global table merge (`_merge_global_lastminute_into_perfs`)
-    have done what they can. Whatever's left is beyond the ~5-day
-    window the page DOM exposes; we construct URLs for those from the
-    JSON-LD date+time directly.
-
-    Mutates perfs in place. Returns the number of URLs constructed —
-    surfaced in the scrape report so anomalies (a sudden drop in
-    constructed count, or a sudden surge in construction failures) are
-    visible run-to-run.
-
-    No HTTP requests are made — this is a pure transform. If SeatPlan
-    ever changes the URL pattern, broken links will be emitted without
-    a runtime signal; the right tripwire is the cross-source
-    consistency check downstream, which would notice book_urls that
-    don't resolve.
-    """
-    constructed = 0
-    for p in perfs:
-        if p.get("book_url"):
-            continue
-        url = _construct_book_url(show_url, p.get("date"), p.get("time"))
-        if url is not None:
-            p["book_url"] = url
-            constructed += 1
-    return constructed
-
-
 def _extract_lastminute_showtime_ids(soup: BeautifulSoup) -> dict[str, str]:
     """Build a map from booking URL → data-id (showtime ID). We attach
     these in a separate pass so the merge step doesn't have to thread the
@@ -1255,182 +1111,6 @@ def _extract_lastminute_showtime_ids(soup: BeautifulSoup) -> dict[str, str]:
             absurl = urljoin(BASE, href)
             out[absurl] = data_id
     return out
-
-# ---------------------------------------------------------------------------
-# Availability enrichment — actual bookable prices, not marketing headlines
-# ---------------------------------------------------------------------------
-#
-# The JSON-LD lowPrice carried on each TheaterEvent block is the show's
-# headline "from £X" price (e.g. £12 for A Midsummer Night's Dream),
-# repeated identically across every performance. It's the marketing-tier
-# anchor price, not the actually-bookable cheapest. SeatPlan's own
-# new-quotes endpoint logs a `sp_ticketing_calendar_error` event whenever
-# the JSON-LD "from" diverges from the real quote, e.g.:
-#
-#     {"errorDescription": "From Price Too Low",
-#      "state": "Performance: 12.00; Quote: 30.00"}
-#
-# We work around it by calling two undocumented but stable endpoints:
-#
-#   1. GET /ajax/tickets/performances/{productionId}/{date}/
-#      Returns [{id, date, weekDay, time, link}, ...] for every upcoming
-#      performance from `date` onward. One call per show.
-#
-#   2. GET /api/performance/normal-prices/{performanceId}
-#      Returns [{seatId, normalMinPrice, normalMaxPrice}, ...] — one
-#      record per currently-available seat. min(normalMinPrice) is the
-#      real cheapest price; len() is the count of bookable seats;
-#      empty array means sold out.
-#
-# Both endpoints require only a browser-shaped User-Agent (already on
-# the session) and a Referer pointing at a seatplan booking page.
-# Responses are server-side cached (~2h per new-quotes'
-# quoteSearchRemainingLife) so load is mild.
-
-PERFORMANCES_URL = "/ajax/tickets/performances/{production_id}/{date}/"
-NORMAL_PRICES_URL = "/api/performance/normal-prices/{performance_id}"
-
-# Don't enrich more than this many performances per show — the discovery
-# endpoint typically returns ~15-20 future perfs and we don't need
-# accurate prices for the ones 3+ months out (price column on a
-# comparison table is about near-term decisions). Far-future perfs keep
-# their JSON-LD low_price as a fallback, clearly tagged via
-# price_source=None so consumers can tell they weren't verified.
-AVAILABILITY_PERF_CAP = 30
-
-# Lowercase month abbreviations for the performances endpoint, which
-# wants e.g. "21-may-2026". %b is locale-dependent so we format manually.
-_MONTH_ABBR_LC = ["jan", "feb", "mar", "apr", "may", "jun",
-                  "jul", "aug", "sep", "oct", "nov", "dec"]
-
-
-def _format_date_for_performances_endpoint(d) -> str:
-    """date(2026, 5, 21) -> '21-may-2026'."""
-    return f"{d.day}-{_MONTH_ABBR_LC[d.month - 1]}-{d.year}"
-
-
-def _parse_performances_endpoint_date(s: str) -> str | None:
-    """'21-May-2026' -> '2026-05-21'. None if unparseable."""
-    if not s:
-        return None
-    parts = s.split("-")
-    if len(parts) != 3:
-        return None
-    try:
-        day = int(parts[0])
-        mon = _MONTH_MAP.get(parts[1].title())
-        year = int(parts[2])
-        if mon is None:
-            return None
-        return f"{year:04d}-{mon:02d}-{day:02d}"
-    except (ValueError, TypeError):
-        return None
-
-
-def _fetch_performance_ids(
-    session: requests.Session, sku: str, slug: str, scraped_at: datetime,
-) -> dict[tuple[str, str], int]:
-    """Map (date_iso, time_24h) -> performance_id for every future
-    performance of this show. Empty dict on any error — caller falls
-    back to JSON-LD prices for all perfs."""
-    date_str = _format_date_for_performances_endpoint(scraped_at.date())
-    url = BASE + PERFORMANCES_URL.format(production_id=sku, date=date_str)
-    referer = f"{BASE}/london/{slug}/"
-    try:
-        resp = session.get(
-            url,
-            headers={"Referer": referer,
-                     "Accept": "application/json, text/plain, */*"},
-            timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except (requests.RequestException, ValueError) as e:
-        log.debug("performances endpoint failed for sku=%s: %s", sku, e)
-        return {}
-    if not isinstance(data, list):
-        return {}
-    out: dict[tuple[str, str], int] = {}
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        date_iso = _parse_performances_endpoint_date(item.get("date") or "")
-        time_24h = _parse_time_label_to_24h(item.get("time") or "")
-        pid = item.get("id")
-        if date_iso and time_24h and isinstance(pid, int):
-            out[(date_iso, time_24h)] = pid
-    return out
-
-
-def _fetch_normal_prices(
-    session: requests.Session, performance_id: int, slug: str,
-) -> list[dict] | None:
-    """Raw list from /api/performance/normal-prices/{id}. None on error;
-    empty list means genuinely sold out."""
-    url = BASE + NORMAL_PRICES_URL.format(performance_id=performance_id)
-    referer = f"{BASE}/london/{slug}/"
-    try:
-        resp = session.get(
-            url,
-            headers={"Referer": referer,
-                     "Accept": "application/json, text/plain, */*"},
-            timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except (requests.RequestException, ValueError) as e:
-        log.debug("normal-prices failed for perf=%s: %s", performance_id, e)
-        return None
-    return data if isinstance(data, list) else None
-
-
-def _enrich_with_availability(
-    session: requests.Session, sku: str | None, slug: str,
-    performances: list[dict], scraped_at: datetime,
-) -> int:
-    """Populate performance_id / available_seats / available_from /
-    available_to / price_source on each perf dict in place.
-
-    Returns the number of performances that got `price_source =
-    "normal_prices"` (i.e. genuinely enriched with a verified bookable
-    price). No-op if sku is missing or the discovery call fails — perfs
-    keep their JSON-LD `low_price` as fallback and `price_source` stays
-    None to signal "unverified"."""
-    if not sku or not performances:
-        return 0
-    id_map = _fetch_performance_ids(session, sku, slug, scraped_at)
-    if not id_map:
-        return 0
-
-    enriched = 0
-    for p in performances[:AVAILABILITY_PERF_CAP]:
-        key = (p.get("date"), p.get("time"))
-        pid = id_map.get(key)
-        if pid is None:
-            continue
-        p["performance_id"] = pid
-        prices = _fetch_normal_prices(session, pid, slug)
-        if prices is None:
-            # network/parse error — keep low_price, leave new fields None
-            continue
-        if not prices:
-            # endpoint returned [] -- genuinely sold out
-            p["available_seats"] = 0
-            p["price_source"] = "sold_out"
-            continue
-        mins = [_to_float(r.get("normalMinPrice")) for r in prices
-                if isinstance(r, dict)]
-        maxs = [_to_float(r.get("normalMaxPrice")) for r in prices
-                if isinstance(r, dict)]
-        mins = [m for m in mins if m is not None]
-        maxs = [m for m in maxs if m is not None]
-        if mins:
-            p["available_from"] = min(mins)
-            p["available_to"] = max(maxs) if maxs else min(mins)
-            p["available_seats"] = len(prices)
-            p["price_source"] = "normal_prices"
-            enriched += 1
-    return enriched
 
 
 def _extract_weekly_schedule(soup: BeautifulSoup) -> tuple[list[dict], str | None, str | None, str | None]:
@@ -1806,34 +1486,13 @@ def fetch_show_detail(
             return None, last_err
 
         try:
-            detail = parse_show(resp.text, scraped_at)
+            return parse_show(resp.text, scraped_at), None
         except Exception as e:
             last_err = f"parse: {type(e).__name__}: {e}"
             if attempt == 1:
                 time.sleep(DETAIL_PARSE_RETRY_DELAY_S)
                 continue
             return None, last_err
-
-        # Enrich with actually-bookable prices from the internal API.
-        # Failures here are non-fatal: perfs retain their JSON-LD
-        # low_price (with price_source=None) so the scrape still
-        # produces output, just less accurate for this show.
-        try:
-            enriched = _enrich_with_availability(
-                session,
-                detail.get("sku"),
-                card.slug,
-                detail.get("performances", []),
-                scraped_at,
-            )
-            if enriched:
-                log.debug("  %s: enriched %d perfs with normal-prices",
-                          card.slug, enriched)
-        except Exception as e:
-            log.warning("availability enrichment failed for %s: %s",
-                        card.slug, e)
-
-        return detail, None
 
     return None, last_err or "unknown"
 
@@ -1868,7 +1527,6 @@ def fetch_all_details(
     t_start = time.monotonic()
     budget_exceeded = False
     sku_backfills = [0]  # mutable counter for closure; logged at end
-    constructed_urls = [0]  # how many book_urls we built from the URL pattern
 
     results: list[Show | None] = [None] * len(cards)
     errors: list[str | None] = [None] * len(cards)
@@ -1894,26 +1552,6 @@ def fetch_all_details(
                     sku = backfill
                     with lock:
                         sku_backfills[0] += 1
-            # Fill book_url / showtime_id gaps from the cross-show
-            # global last-minute table. Critical for shows whose
-            # detail page has no `section#last-minute` widget — without
-            # this, ~17 currently-bookable shows surface 0 book_urls
-            # on their performances even though the data is available.
-            global_lm = last_minute_by_url.get(card.url, [])
-            performances = _merge_global_lastminute_into_perfs(
-                detail.get("performances") or [], global_lm,
-            )
-            # Final fallback: for performances still missing a book_url
-            # (i.e. anything beyond the rolling ~5-day window SeatPlan
-            # surfaces inline), construct the deep-link URL from the
-            # show URL + JSON-LD date/time. The server validates these
-            # against the real performance calendar — invalid (date,
-            # time) combos bounce to the show page rather than 404, so
-            # the worst-case fallback is graceful.
-            n_built = _fill_constructed_book_urls(performances, card.url)
-            if n_built:
-                with lock:
-                    constructed_urls[0] += n_built
             results[idx] = Show(
                 url=card.url,
                 slug=card.slug,
@@ -1953,8 +1591,8 @@ def fetch_all_details(
                 weekly_schedule=detail.get("weekly_schedule") or [],
                 cast=detail.get("cast") or [],
                 faq=detail.get("faq") or [],
-                performances=performances,
-                last_minute_listing=global_lm,
+                performances=detail.get("performances") or [],
+                last_minute_listing=last_minute_by_url.get(card.url, []),
                 detail_canonical=detail.get("detail_canonical"),
             )
         else:
@@ -1993,12 +1631,6 @@ def fetch_all_details(
             "  sku backfilled from last-minute production_id for %d show(s) "
             "where the detail page didn't expose Product.sku",
             sku_backfills[0],
-        )
-    if constructed_urls[0]:
-        log.info(
-            "  book_url constructed from URL pattern for %d performance(s) "
-            "beyond the rolling ~5-day window SeatPlan surfaces inline",
-            constructed_urls[0],
         )
     return shows, failures, budget_exceeded
 
@@ -2067,16 +1699,12 @@ def run_sanity_checks(
     all_perfs = [(s, p) for s in shows for p in s.performances]
     if all_perfs:
         no_book_url = sum(1 for _, p in all_perfs if not p.get("book_url"))
-        # After the URL-construction fallback, every performance with a
-        # valid (date, time) should carry a book_url — the only legitimate
-        # misses are perfs with malformed date/time fields. >10% missing
-        # therefore indicates URL construction is silently failing or the
-        # JSON-LD time format has shifted.
-        if no_book_url / len(all_perfs) > 0.10:
+        # Many performances legitimately lack book_url (only the next 5
+        # days are in the Last Minute table), so the threshold is loose.
+        if no_book_url / len(all_perfs) > 0.85:
             warnings.append(
                 f"performance: {no_book_url}/{len(all_perfs)} performances "
-                "lack book_url (>10% threshold) — URL construction may be "
-                "failing; check time format in JSON-LD"
+                "lack book_url (>85% threshold)"
             )
         bad_prices = sum(
             1 for _, p in all_perfs
@@ -2325,9 +1953,46 @@ def main(argv: list[str] | None = None) -> int:
                    help=f"How many previous outputs to retain (default: {DEFAULT_ROTATION_DEPTH}).")
     p.add_argument("--dry-run", action="store_true",
                    help="Do everything except write the output file.")
+    p.add_argument(
+        "--proxy-url",
+        default=os.environ.get("OLT_PROXY_URL"),
+        metavar="URL",
+        help="If set, route all requests to seatplan.com through this "
+             "proxy URL instead (a Cloudflare Worker that forwards to "
+             "seatplan.com and authenticates via the X-Proxy-Auth "
+             "header). Required when running from a cloud-CI subnet "
+             "that SeatPlan's bot protection blocks (which is most of "
+             "them, intermittently). Defaults to $OLT_PROXY_URL "
+             "if set, otherwise no proxy is used and requests go "
+             "directly to seatplan.com.",
+    )
+    p.add_argument(
+        "--proxy-token",
+        default=os.environ.get("OLT_PROXY_TOKEN"),
+        metavar="TOKEN",
+        help="Shared secret sent as X-Proxy-Auth on every proxied "
+             "request. Defaults to $OLT_PROXY_TOKEN. Must match "
+             "the PROXY_TOKEN secret bound on the Cloudflare Worker.",
+    )
     args = p.parse_args(argv)
 
-    session = build_session(pool_size=max(args.concurrency, 8))
+    if args.proxy_url:
+        log.info("Routing SeatPlan requests via proxy: %s", args.proxy_url)
+        if not args.proxy_token:
+            log.warning("--proxy-url is set but --proxy-token is empty — "
+                        "the worker will reject the request with 401")
+    else:
+        log.info("Going direct to seatplan.com (no proxy). If you start "
+                 "seeing empty results / 2031-byte stub pages, the runner "
+                 "subnet is probably on Cloudflare's blocklist; set "
+                 "OLT_PROXY_URL/OLT_PROXY_TOKEN to route via "
+                 "the worker instead.")
+
+    session = build_session(
+        pool_size=max(args.concurrency, 8),
+        proxy_url=args.proxy_url,
+        proxy_token=args.proxy_token,
+    )
     t_start = time.monotonic()
     scraped_at = datetime.now(timezone.utc)
     deadline = (t_start + args.max_runtime_seconds
