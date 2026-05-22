@@ -5,7 +5,7 @@ import {
   parseISO,
   todayISO,
 } from '../lib/dates.js'
-import { validPrice } from '../lib/data.js'
+import { validPrice, computePercentiles, priceBucket } from '../lib/data.js'
 
 // Per-show detail page. Replaces the old date×seller table with three
 // editorial blocks that share the homepage's calendar visual language:
@@ -106,8 +106,12 @@ function formatRunLabel(firstIso, lastIso) {
 
 // Build one month-grid (DOW-headers + 4–6 weeks of 7 cells). Pads
 // leading/trailing cells. Each cell carries the per-date aggregate
-// the calendar component needs (floor + times) when it's a perf day.
-function buildMonth(year, month, byDate, today) {
+// the calendar component needs (floor + times + heatmap bucket) when
+// it's a perf day. The bucket is computed against percentiles passed
+// from the caller — that way every month in the run shares the same
+// price colour-scale and a "cheap" June day looks identical to a
+// "cheap" July day.
+function buildMonth(year, month, byDate, today, percentiles) {
   const firstOfMonth = new Date(year, month, 1, 12)
   const lastOfMonth = new Date(year, month + 1, 0, 12)
   const firstDow = (firstOfMonth.getDay() + 6) % 7 // 0 = Mon
@@ -144,6 +148,7 @@ function buildMonth(year, month, byDate, today) {
       isPerf,
       floor,
       times,
+      bucket: isPerf && floor != null ? priceBucket(floor, percentiles) : null,
     })
     if (week.length === 7) {
       weeks.push(week)
@@ -247,7 +252,22 @@ function computeAnalysis(performances, today) {
 
   // Build one calendar per month spanned by the run (inclusive on
   // both ends). Most West End shows fit in 1–3 months so this is
-  // cheap; for longer runs the calendars stack vertically.
+  // cheap; for longer runs the calendars stack vertically. We also
+  // compute heatmap percentiles *once* across all date-floors in the
+  // run, so the bucket scale is stable across months (a £20 cell
+  // looks the same regardless of which month you're viewing).
+  const allDateFloors = []
+  for (const dateKey of Object.keys(byDate)) {
+    const performances = byDate[dateKey].performances
+    const dayFloor = Math.min(
+      ...performances
+        .map((p) => (p.sellers.length > 0 ? p.sellers[0].price : Infinity))
+        .filter(Number.isFinite),
+    )
+    if (Number.isFinite(dayFloor)) allDateFloors.push(dayFloor)
+  }
+  const percentiles = computePercentiles(allDateFloors)
+
   const firstIso = enriched[0].perf.date
   const lastIso = enriched[enriched.length - 1].perf.date
   const firstDate = parseISO(firstIso)
@@ -259,7 +279,7 @@ function computeAnalysis(performances, today) {
     cy < lastDate.getFullYear() ||
     (cy === lastDate.getFullYear() && cm <= lastDate.getMonth())
   ) {
-    months.push(buildMonth(cy, cm, byDate, today))
+    months.push(buildMonth(cy, cm, byDate, today, percentiles))
     cm++
     if (cm > 11) {
       cm = 0
@@ -576,6 +596,9 @@ function ShowCalendar({ weeks, selectedDateIso, onSelectDate }) {
           cell.isToday ? 'today' : '',
           isSelected ? 'sel' : '',
           clickable ? '' : 'nonclick',
+          cell.isPerf && cell.bucket != null && !cell.isPast
+            ? `bucket-${cell.bucket}`
+            : '',
         ]
           .filter(Boolean)
           .join(' ')
@@ -592,6 +615,9 @@ function ShowCalendar({ weeks, selectedDateIso, onSelectDate }) {
                   <div className="stg-show-cal-times">{cell.times}</div>
                 )}
               </div>
+            )}
+            {cell.isPerf && !cell.isPast && cell.bucket != null && (
+              <div className="stg-show-cal-heat" aria-hidden="true" />
             )}
           </>
         )
