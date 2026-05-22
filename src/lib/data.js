@@ -251,7 +251,7 @@ export function computeAggregations(data, today) {
   return {
     tonight: aggregateTonight(data, today),
     weekend: aggregateWeekend(data, today),
-    matinees: aggregateMatineesWeek(data, today),
+    matinees: aggregateMatineesByWeek(data, today),
     week: aggregateWeek(data, today, showFuturePrices),
     tiers: aggregatePriceTiers(data, today),
     spreads: aggregateSpreads(data, today),
@@ -361,8 +361,10 @@ function aggregateTonight(data, today) {
 
 // 5-bucket price thresholds for heatmap colouring, derived from the
 // actual distribution rather than hard-coded so it adapts to whatever
-// price profile we're looking at.
-function computePercentiles(prices) {
+// price profile we're looking at. Exported so the per-show calendar
+// can reuse the same bucket math (and thus the same CSS palette) on
+// its own price distribution.
+export function computePercentiles(prices) {
   if (prices.length === 0) return null
   const sorted = [...prices].sort((a, b) => a - b)
   const pct = (p) =>
@@ -370,7 +372,7 @@ function computePercentiles(prices) {
   return [pct(0.2), pct(0.4), pct(0.6), pct(0.8)]
 }
 
-function priceBucket(price, percentiles) {
+export function priceBucket(price, percentiles) {
   if (price == null || percentiles == null) return 5
   if (price <= percentiles[0]) return 1
   if (price <= percentiles[1]) return 2
@@ -782,82 +784,145 @@ function aggregateWeekend(data, today) {
 // across the same window so the card can show "save vs evening".
 // =============================================================
 
-function aggregateMatineesWeek(data, today) {
-  const windowEnd = addDaysISO(today, 7)
-  const matineeRows = []
-  const eveningByShow = new Map()
+// Matinées are now bucketed by *calendar* week (Mon–Sun) rather than a
+// rolling 7-day window. We materialise one entry per week from "today's
+// week" forward to whatever the furthest performance in the data is, so
+// the component can wire prev/next arrows that page between them. For
+// the current week, the window is clamped to [today, Sun] — past
+// matinées this week aren't bookable and surfacing them is noise.
+//
+// Each week entry carries the same {rows, totalPerfs, floor} shape the
+// component used to consume, plus enough metadata (label, isoStart,
+// isoEnd, kind) to render the navigator strip.
+function aggregateMatineesByWeek(data, today) {
+  // Mon-anchored start of *this* calendar week.
+  const todayDow = dowMondayFirst(today) // 0=Mon … 6=Sun
+  const thisMonIso = addDaysISO(today, -todayDow)
 
+  // Furthest performance date in the dataset — caps how many weeks we
+  // bother materialising (no point making a navigator step into empty
+  // air past the run window).
+  let maxDateIso = today
   for (const show of data.shows) {
-    let cheapestMat = null
     for (const perf of show.performances || []) {
-      if (perf.date < today || perf.date >= windowEnd) continue
-      const eff = effectiveCheapest(perf)
-      if (!eff) continue
-      const hour = perf.time ? parseInt(perf.time.split(':')[0], 10) : null
-      if (hour == null) continue
-      if (hour < 17) {
-        if (!cheapestMat || eff.price < cheapestMat.price) {
-          cheapestMat = {
-            show,
-            perf,
-            price: eff.price,
-            seller: eff.seller,
+      if (perf.date > maxDateIso) maxDateIso = perf.date
+    }
+  }
+  const daysToMax = Math.floor(
+    (parseISO(maxDateIso).getTime() - parseISO(thisMonIso).getTime()) /
+      86400000,
+  )
+  const weekCount = Math.max(1, Math.floor(daysToMax / 7) + 1)
+
+  const weeks = []
+  for (let wi = 0; wi < weekCount; wi++) {
+    const weekStart = addDaysISO(thisMonIso, wi * 7) // Mon
+    const weekEndExcl = addDaysISO(weekStart, 7) // following Mon (exclusive)
+    const weekEnd = addDaysISO(weekStart, 6) // Sun (inclusive, for labels)
+    // Current week clamps to today→Sun so we don't surface past matinées.
+    const effStart = wi === 0 && today > weekStart ? today : weekStart
+
+    const matineeRows = []
+    const eveningByShow = new Map()
+    for (const show of data.shows) {
+      let cheapestMat = null
+      for (const perf of show.performances || []) {
+        if (perf.date < effStart || perf.date >= weekEndExcl) continue
+        const eff = effectiveCheapest(perf)
+        if (!eff) continue
+        const hour = perf.time ? parseInt(perf.time.split(':')[0], 10) : null
+        if (hour == null) continue
+        if (hour < 17) {
+          if (!cheapestMat || eff.price < cheapestMat.price) {
+            cheapestMat = { show, perf, price: eff.price, seller: eff.seller }
+          }
+        } else {
+          const prev = eveningByShow.get(show.id)
+          if (prev == null || eff.price < prev) {
+            eveningByShow.set(show.id, eff.price)
           }
         }
-      } else {
-        const prev = eveningByShow.get(show.id)
-        if (!prev || eff.price < prev) {
-          eveningByShow.set(show.id, eff.price)
+      }
+      if (cheapestMat) matineeRows.push(cheapestMat)
+    }
+
+    matineeRows.sort((a, b) => a.price - b.price)
+
+    // Week-wide stats: total matinée perfs and the absolute floor.
+    let totalMatPerfs = 0
+    let floor = null
+    for (const show of data.shows) {
+      for (const perf of show.performances || []) {
+        if (perf.date < effStart || perf.date >= weekEndExcl) continue
+        const hour = perf.time ? parseInt(perf.time.split(':')[0], 10) : null
+        if (hour == null || hour >= 17) continue
+        const eff = effectiveCheapest(perf)
+        if (!eff) continue
+        totalMatPerfs++
+        if (floor == null || eff.price < floor) floor = eff.price
+      }
+    }
+
+    const rangeLabel = formatWeekRangeLabel(weekStart, weekEnd)
+    let kindLabel
+    if (wi === 0) kindLabel = 'THIS WEEK'
+    else if (wi === 1) kindLabel = 'NEXT WEEK'
+    else kindLabel = `WEEK OF ${dayOfMonth(weekStart)} ${parseISO(weekStart)
+      .toLocaleDateString('en-GB', { month: 'short' })
+      .toUpperCase()}`
+
+    weeks.push({
+      isoStart: weekStart,
+      isoEnd: weekEnd,
+      rangeLabel,
+      kindLabel,
+      isCurrentWeek: wi === 0,
+      rows: matineeRows.slice(0, 8).map((r) => {
+        const evening = eveningByShow.get(r.show.id) ?? null
+        const savings =
+          evening != null && evening > r.price
+            ? Math.round(evening - r.price)
+            : null
+        return {
+          show: {
+            id: r.show.id,
+            title: r.show.title,
+            venue: r.show.venue,
+          },
+          date: r.perf.date,
+          dayLabel: formatShortDate(r.perf.date).toUpperCase(),
+          time: r.perf.time || '',
+          price: r.price,
+          eveningPrice: evening,
+          savings,
         }
-      }
-    }
-    if (cheapestMat) {
-      matineeRows.push(cheapestMat)
-    }
+      }),
+      totalPerfs: totalMatPerfs,
+      floor,
+    })
   }
 
-  matineeRows.sort((a, b) => a.price - b.price)
+  return { weeks, defaultIdx: 0 }
+}
 
-  // Aggregate stats — total matinée performances in the window
-  // (counted across shows) and the absolute floor.
-  let totalMatPerfs = 0
-  let floor = null
-  for (const show of data.shows) {
-    for (const perf of show.performances || []) {
-      if (perf.date < today || perf.date >= windowEnd) continue
-      const hour = perf.time ? parseInt(perf.time.split(':')[0], 10) : null
-      if (hour == null || hour >= 17) continue
-      const eff = effectiveCheapest(perf)
-      if (!eff) continue
-      totalMatPerfs++
-      if (floor == null || eff.price < floor) floor = eff.price
-    }
+// "18–24 MAY" / "30 MAY – 5 JUN" — same shape as formatRunLabel in
+// ShowDetail but driven off Mon/Sun ISOs.
+function formatWeekRangeLabel(monIso, sunIso) {
+  const mon = parseISO(monIso)
+  const sun = parseISO(sunIso)
+  const monMonth = mon
+    .toLocaleDateString('en-GB', { month: 'short' })
+    .toUpperCase()
+  const sunMonth = sun
+    .toLocaleDateString('en-GB', { month: 'short' })
+    .toUpperCase()
+  if (
+    mon.getFullYear() === sun.getFullYear() &&
+    mon.getMonth() === sun.getMonth()
+  ) {
+    return `${mon.getDate()}–${sun.getDate()} ${sunMonth}`
   }
-
-  return {
-    rows: matineeRows.slice(0, 8).map((r) => {
-      const evening = eveningByShow.get(r.show.id) ?? null
-      const savings =
-        evening != null && evening > r.price
-          ? Math.round(evening - r.price)
-          : null
-      return {
-        show: {
-          id: r.show.id,
-          title: r.show.title,
-          venue: r.show.venue,
-        },
-        date: r.perf.date,
-        dayLabel: formatShortDate(r.perf.date).toUpperCase(),
-        time: r.perf.time || '',
-        price: r.price,
-        eveningPrice: evening,
-        savings,
-      }
-    }),
-    totalPerfs: totalMatPerfs,
-    floor,
-  }
+  return `${mon.getDate()} ${monMonth} – ${sun.getDate()} ${sunMonth}`
 }
 
 // =============================================================
