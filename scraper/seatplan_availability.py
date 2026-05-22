@@ -131,6 +131,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -261,8 +262,15 @@ log = logging.getLogger("seatplan-avail")
 # HTTP session
 # ---------------------------------------------------------------------------
 
-def build_session(pool_size: int) -> requests.Session:
-    s = requests.Session()
+def build_session(
+    pool_size: int,
+    proxy_url: str | None = None,
+    proxy_token: str | None = None,
+) -> requests.Session:
+    if proxy_url:
+        s: requests.Session = _ProxyingSession(proxy_url, proxy_token)
+    else:
+        s = requests.Session()
     s.headers.update(DEFAULT_HEADERS)
     retry = Retry(
         total=RETRY_TOTAL,
@@ -279,6 +287,30 @@ def build_session(pool_size: int) -> requests.Session:
     s.mount("https://", adapter)
     s.mount("http://", adapter)
     return s
+
+
+class _ProxyingSession(requests.Session):
+    """requests.Session that tunnels every request through a reverse
+    proxy via the X-Proxy-Target header. See seatplan_scraper.py for
+    the full rationale — same class, repeated here to keep the verifier
+    module self-contained (mirrors the OLT scraper/availability split,
+    which uses the identical pattern).
+    """
+
+    def __init__(self, proxy_url: str, proxy_token: str | None) -> None:
+        super().__init__()
+        self._proxy_url = proxy_url.rstrip("/")
+        self._proxy_token = proxy_token or ""
+
+    def request(self, method, url, **kwargs):
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            caller_headers = kwargs.get("headers") or {}
+            proxy_headers = {**caller_headers, "X-Proxy-Target": url}
+            if self._proxy_token:
+                proxy_headers["X-Proxy-Auth"] = self._proxy_token
+            kwargs["headers"] = proxy_headers
+            url = self._proxy_url
+        return super().request(method, url, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -509,11 +541,18 @@ def run(
     concurrency: int,
     limit: int | None,
     include_past: bool,
+    proxy_url: str | None = None,
+    proxy_token: str | None = None,
 ) -> dict:
     """Run verification in place on payload['shows'][i]['performances'][j].
 
     Returns a summary dict suitable for embedding under
     payload['report']['availability_verification'].
+
+    If proxy_url is set, all requests are routed through that URL
+    (typically a Cloudflare Worker forwarding to seatplan.com) with
+    proxy_token sent as the X-Proxy-Auth header. See seatplan_scraper.py
+    docstring for why this exists.
     """
     today_iso = datetime.now(timezone.utc).date().isoformat()
     tasks = iter_perfs_to_check(payload, today_iso, include_past=include_past)
@@ -539,7 +578,11 @@ def run(
     progress = {"n": 0}
     progress_lock = Lock()
 
-    session = build_session(pool_size=max(concurrency, 8))
+    session = build_session(
+        pool_size=max(concurrency, 8),
+        proxy_url=proxy_url,
+        proxy_token=proxy_token,
+    )
 
     def _job(task: tuple[int, int, str | None]) -> tuple[int, int, dict]:
         si, pi, url = task
@@ -1075,7 +1118,32 @@ def main(argv: list[str] | None = None) -> int:
         help="How long a cache entry stays valid (default: 24h). "
              "After expiry the entry is re-verified.",
     )
+    p.add_argument(
+        "--proxy-url",
+        default=os.environ.get("OLT_PROXY_URL"),
+        metavar="URL",
+        help="If set, route all fireCrmEvent fetches through this "
+             "proxy URL (a Cloudflare Worker forwarding to "
+             "seatplan.com, authenticated via X-Proxy-Auth). The "
+             "chip pass is unaffected — it uses Playwright and runs "
+             "from the host's IP regardless. Defaults to "
+             "$OLT_PROXY_URL.",
+    )
+    p.add_argument(
+        "--proxy-token",
+        default=os.environ.get("OLT_PROXY_TOKEN"),
+        metavar="TOKEN",
+        help="Shared secret for the proxy. Defaults to "
+             "$OLT_PROXY_TOKEN. Must match the worker's bound "
+             "PROXY_TOKEN secret.",
+    )
     args = p.parse_args(argv)
+
+    if args.proxy_url:
+        log.info("Routing fireCrmEvent fetches via proxy: %s", args.proxy_url)
+        if not args.proxy_token:
+            log.warning("--proxy-url set but --proxy-token is empty — "
+                        "the worker will reject the request with 401")
 
     if not args.in_path.exists():
         log.error("Input file %s not found", args.in_path)
@@ -1097,6 +1165,8 @@ def main(argv: list[str] | None = None) -> int:
         concurrency=args.concurrency,
         limit=args.limit,
         include_past=args.include_past,
+        proxy_url=args.proxy_url,
+        proxy_token=args.proxy_token,
     )
 
     # Second pass: chip re-verification for suspect performances.
