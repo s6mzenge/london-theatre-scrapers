@@ -69,19 +69,54 @@ Fields added to each Performance dict
     verified_url                str  | None    URL that was fetched
     verified_checked_at         str            UTC ISO timestamp
 
+Chip-pass fields (added only on rows the chip pass ran on)
+----------------------------------------------------------
+The fireCrmEvent payload sometimes carries the wrong value: a show-
+wide marketing floor (the £6/£8 Globe yard tier appears in every
+per-performance event regardless of actual availability), or a
+user-viewed tier when the page loads with a non-floor seat selected
+(observed on Paddington: fireCrmEvent says £215, real floor is £60).
+A targeted second pass opens such rows in headless Chromium and reads
+the actually-rendered price chips. A row is flagged "suspect" via any
+of three heuristics: verified_min_price ≤ £15 (catches yard-tier
+phantoms), max/min ratio > 8 (catches phantom-floor shape), or
+verified_min_price > 2× low_price (catches default-selected-tier
+high-side outliers).
+
+    verified_chip_min           float | None   cheapest chip on rendered page
+    verified_chip_max           float | None   most-expensive chip on rendered page
+    verified_chip_candidates    list[float]    full sorted list of plausible chips
+    verified_chip_source        str            "chips" | "no_chips_found" | "fetch_failed"
+    verified_chip_reason        str            "low_floor" | "wide_ratio" | "high_outlier"
+    verified_chip_note          str            short diagnostic
+    verified_chip_checked_at    str            UTC ISO timestamp
+
 The existing `low_price` / `currency` / `availability` fields are
-**not modified**. The dedupe layer's SeatPlan schema is updated
-separately to prefer `verified_min_price` when present.
+**not modified**, nor are the fireCrmEvent verified_* fields. The
+dedupe layer prefers `verified_chip_min` when it's set, falls back to
+`verified_min_price`, then `low_price`. Each tier is a stricter
+extraction than the previous.
 
 Usage
 -----
-    python seatplan_availability.py                    # in-place on default file
-    python seatplan_availability.py --in input.json    # different input
-    python seatplan_availability.py --out output.json  # write to different file
-    python seatplan_availability.py --concurrency 24   # tune parallelism
-    python seatplan_availability.py --limit 50         # smoke-test on N perfs
-    python seatplan_availability.py --include-past     # also check past dates
-    python seatplan_availability.py --dry-run          # don't write
+    python seatplan_availability.py                       # in-place on default file
+    python seatplan_availability.py --in input.json       # different input
+    python seatplan_availability.py --out output.json     # write to different file
+    python seatplan_availability.py --concurrency 24      # tune fireCrmEvent parallelism
+    python seatplan_availability.py --limit 50            # smoke-test on N perfs
+    python seatplan_availability.py --include-past        # also check past dates
+    python seatplan_availability.py --dry-run             # don't write
+    python seatplan_availability.py --skip-chips          # skip the chip second pass
+    python seatplan_availability.py --chip-workers 5      # tune chip-pass parallelism
+
+Dependencies
+------------
+The chip pass requires Playwright + Chromium:
+    pip install playwright
+    python -m playwright install chromium
+
+Without those, the chip pass logs an error and is skipped; the
+fireCrmEvent pass still runs and writes its results normally.
 
 Exit codes
 ----------
@@ -93,6 +128,7 @@ Exit codes
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import re
@@ -138,6 +174,72 @@ SOURCE_SKIPPED    = "skipped"
 EXIT_CLEAN     = 0
 EXIT_BAD_INPUT = 1
 EXIT_DRIFT     = 2
+
+# ---------------------------------------------------------------------------
+# Chip pass config
+# ---------------------------------------------------------------------------
+# After the requests-based fireCrmEvent pass completes, a second pass
+# runs in headless Chromium for performances whose `verified_min_price`
+# looks suspect — typically because SeatPlan's fireCrmEvent payload
+# emits the show-wide marketing floor (e.g. £6/£8 Globe yard tier) or a
+# user-viewed tier (Paddington-style premium-default) instead of the
+# actual cheapest-bookable chip. The chip pass reads the visible price
+# chips rendered by SeatPlan's frontend, which are the source of truth
+# for what the user can actually buy.
+#
+# Three independent suspicion heuristics — a perf is verified by chips
+# if ANY fires:
+#   1. SUSPECT_LOW_FLOOR — verified_min_price ≤ £15. Catches Globe
+#      yard-tier phantoms (£6, £8, £13). Some false-positive cost on
+#      genuinely cheap shows; the chip pass just re-confirms them.
+#   2. SUSPECT_RATIO — verified_max/verified_min > 8. Most shows have
+#      a 2-5x range; a 10x+ ratio (£8 → £102 Globe shape) is a strong
+#      phantom-floor signal.
+#   3. SUSPECT_OUTLIER — verified_min_price > 2 × low_price. Catches
+#      Paddington-style cases where fireCrmEvent fired with a default-
+#      selected premium tier instead of the floor.
+SUSPECT_LOW_FLOOR        = 15.0
+SUSPECT_RATIO_THRESHOLD  = 8.0
+SUSPECT_OUTLIER_RATIO    = 2.0
+
+CHIP_WORKERS              = 3
+CHIP_NAV_TIMEOUT_MS       = 30_000
+CHIP_FIRST_PRICE_TIMEOUT  = 12_000
+CHIP_STABILITY_POLL_S     = 0.25
+CHIP_STABILITY_POLLS      = 3       # 3 × 250ms = 750ms of unchanged candidates
+CHIP_MAX_WAIT_S           = 4.0
+
+# Plausible per-ticket range for chip extraction. Floor of £5 keeps the
+# legitimate £6 Globe yard tier in range when it really is bookable —
+# the chip pass's job is to find the truth, not to enforce our priors.
+CHIP_PRICE_MIN = 5.0
+CHIP_PRICE_MAX = 600.0
+
+# Resources to drop — text scan needs none of these, and blocking them
+# saves ~60% of page weight on commercial-template SPAs.
+CHIP_BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+
+CHIP_PRICE_RE = re.compile(r"£\s*(\d{1,4}(?:\.\d{1,2})?)")
+
+CHIP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+# Stealth init script — basic fingerprint masking that helps clear the
+# easy automation-detection checks. Manual rather than pulling in
+# playwright-stealth; covers the common cases without a new dep.
+CHIP_STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+window.chrome = window.chrome || { runtime: {} };
+Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3, 4, 5] });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-GB', 'en'] });
+"""
+
+# verified_chip_source values written onto each verified performance:
+CHIP_SOURCE_OK         = "chips"           # extracted chip min/max, trust these
+CHIP_SOURCE_NO_CHIPS   = "no_chips_found"  # page loaded but no plausible £-amount
+CHIP_SOURCE_FETCH_FAIL = "fetch_failed"    # browser navigation or render error
 
 logging.basicConfig(
     level=logging.INFO,
@@ -489,6 +591,284 @@ def run(
 
 
 # ---------------------------------------------------------------------------
+# Chip pass — headless-browser re-verification for suspect performances
+# ---------------------------------------------------------------------------
+# The fireCrmEvent pass above catches the common case but mis-reports
+# a small fraction of perfs because SeatPlan populates that payload
+# inconsistently. The chip pass is a targeted re-extraction over only
+# those rows that look suspicious, using rendered DOM text from the
+# user-facing booking page. It writes new fields, never overwrites the
+# fireCrmEvent ones — the dedupe layer decides which wins.
+
+def _classify_suspect(p: dict) -> str | None:
+    """Return a non-empty reason string if `p` looks suspect, else None.
+    Each branch is documented in the chip-pass config comment above."""
+    vmin = p.get("verified_min_price")
+    if vmin is None:
+        return None
+    vmax = p.get("verified_max_price")
+    low  = p.get("low_price")
+    if vmin <= SUSPECT_LOW_FLOOR:
+        return "low_floor"
+    if vmax is not None and vmin > 0 and (vmax / vmin) > SUSPECT_RATIO_THRESHOLD:
+        return "wide_ratio"
+    if low is not None and low > 0 and (vmin / low) > SUSPECT_OUTLIER_RATIO:
+        return "high_outlier"
+    return None
+
+
+async def _chip_block_heavy(route) -> None:
+    """Drop image/media/font requests at the network layer."""
+    try:
+        if route.request.resource_type in CHIP_BLOCKED_RESOURCE_TYPES:
+            await route.abort()
+        else:
+            await route.continue_()
+    except Exception:
+        # Route may already be resolved if the page closed mid-request.
+        pass
+
+
+# JS predicate: "page contains at least one £-amount in plausible range".
+# Used to wait for hydration before the stability poll begins.
+_CHIP_FIRST_PRICE_JS = """() => {
+  const re = /£\\s*(\\d{1,4}(?:\\.\\d{1,2})?)/g;
+  const t = document.body.innerText || '';
+  let m;
+  while ((m = re.exec(t)) !== null) {
+    const v = parseFloat(m[1]);
+    if (v >= %d && v <= %d) return true;
+  }
+  return false;
+}""" % (int(CHIP_PRICE_MIN), int(CHIP_PRICE_MAX))
+
+
+async def _chip_extract_one(context, url: str
+                            ) -> tuple[float | None, float | None,
+                                       list[float], str]:
+    """Open `url` in a fresh page, wait for prices to stabilise, return
+    (chip_min, chip_max, all_plausible_candidates, note).
+
+    Strategy mirrors the proven verify_live_prices_batch.py extractor:
+    domcontentloaded → wait for first plausible £ → stability poll
+    (finish when candidate set has been unchanged for 3 consecutive
+    250ms polls, or after 4s max) → scan final body innerText."""
+    from playwright.async_api import TimeoutError as PWTimeout
+
+    page = await context.new_page()
+    text = ""
+    try:
+        try:
+            await page.goto(url, wait_until="domcontentloaded",
+                            timeout=CHIP_NAV_TIMEOUT_MS)
+        except Exception as e:
+            return None, None, [], f"nav error — {type(e).__name__}: {e}"
+
+        try:
+            await page.wait_for_function(
+                _CHIP_FIRST_PRICE_JS, timeout=CHIP_FIRST_PRICE_TIMEOUT,
+            )
+        except PWTimeout:
+            # Continue anyway — scan below will report no-price if so.
+            pass
+
+        prev: frozenset[float] | None = None
+        stable = 0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + CHIP_MAX_WAIT_S
+        while loop.time() < deadline:
+            try:
+                text = await page.evaluate("document.body.innerText") or ""
+            except Exception:
+                break
+            cands = frozenset(
+                float(m.group(1)) for m in CHIP_PRICE_RE.finditer(text)
+                if CHIP_PRICE_MIN <= float(m.group(1)) <= CHIP_PRICE_MAX
+            )
+            if cands == prev and len(cands) > 0:
+                stable += 1
+                if stable >= CHIP_STABILITY_POLLS:
+                    break
+            else:
+                stable = 0
+                prev = cands
+            await asyncio.sleep(CHIP_STABILITY_POLL_S)
+    finally:
+        try: await page.close()
+        except Exception: pass
+
+    raw = [float(m.group(1)) for m in CHIP_PRICE_RE.finditer(text)]
+    valid = sorted({p for p in raw if CHIP_PRICE_MIN <= p <= CHIP_PRICE_MAX})
+    if not valid:
+        return None, None, [], (
+            f"no chips in plausible range "
+            f"({CHIP_PRICE_MIN:.0f}-{CHIP_PRICE_MAX:.0f}); "
+            f"saw {len(raw)} raw match(es)"
+        )
+    return valid[0], valid[-1], valid, "chips"
+
+
+async def _chip_worker(name: str, browser, queue: asyncio.Queue,
+                       results: dict, lock: asyncio.Lock,
+                       counter: list, total: int) -> None:
+    """One long-lived context per worker. Pulls suspect items from the
+    shared queue until empty."""
+    context = await browser.new_context(
+        viewport={"width": 1400, "height": 900},
+        user_agent=CHIP_UA,
+        locale="en-GB",
+        timezone_id="Europe/London",
+        extra_http_headers={"Accept-Language": "en-GB,en;q=0.9"},
+    )
+    await context.route("**/*", _chip_block_heavy)
+    await context.add_init_script(CHIP_STEALTH_JS)
+    try:
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            chip_min, chip_max, candidates, note = await _chip_extract_one(
+                context, item["url"]
+            )
+            async with lock:
+                counter[0] += 1
+                results[item["key"]] = (chip_min, chip_max, candidates, note)
+                if counter[0] % 10 == 0 or counter[0] == total:
+                    log.info("  chip progress: %d/%d", counter[0], total)
+    finally:
+        try: await context.close()
+        except Exception: pass
+
+
+async def _chip_pass_async(suspect_items: list[dict],
+                           workers: int = CHIP_WORKERS) -> dict:
+    from playwright.async_api import async_playwright
+    results: dict = {}
+    counter = [0]
+    total = len(suspect_items)
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+        except Exception as e:
+            log.error("chip pass: could not launch Chromium — %s", e)
+            log.error("  run: python -m playwright install chromium")
+            return results
+
+        queue: asyncio.Queue = asyncio.Queue()
+        for item in suspect_items:
+            queue.put_nowait(item)
+        lock = asyncio.Lock()
+        tasks = [
+            asyncio.create_task(
+                _chip_worker(f"w{i+1}", browser, queue, results,
+                             lock, counter, total)
+            )
+            for i in range(workers)
+        ]
+        await asyncio.gather(*tasks, return_exceptions=False)
+        try: await browser.close()
+        except Exception: pass
+    return results
+
+
+def run_chip_pass(payload: dict, workers: int = CHIP_WORKERS) -> dict:
+    """Identify suspect performances across the payload, run the
+    Playwright chip extractor over them, and write
+    verified_chip_min / verified_chip_max / verified_chip_source onto
+    each suspect performance in place. Returns a summary dict for the
+    report block.
+
+    Does NOT modify the existing verified_* fields. Dedupe consumes
+    chip_min/max when verified_chip_source == 'chips', else falls back
+    to the fireCrmEvent values, else the JSON-LD low_price. Each tier
+    is a stricter extraction than the previous."""
+    if not isinstance(payload, dict):
+        return {"ok": 0, "no_chips": 0, "fetch_failed": 0, "suspect_count": 0,
+                "duration_seconds": 0.0}
+
+    # Collect suspect performances along with mutable references.
+    suspects = []
+    by_reason: dict[str, int] = {}
+    for s_idx, show in enumerate(payload.get("shows", []) or []):
+        for p_idx, perf in enumerate(show.get("performances", []) or []):
+            reason = _classify_suspect(perf)
+            if reason is None:
+                continue
+            book_url = perf.get("book_url")
+            if not book_url:
+                continue
+            suspects.append({
+                "key":      (s_idx, p_idx),
+                "url":      book_url,
+                "reason":   reason,
+                "show_url": show.get("url") or "?",
+                "date":     perf.get("date"),
+                "time":     perf.get("time"),
+            })
+            by_reason[reason] = by_reason.get(reason, 0) + 1
+
+    log.info("Chip pass: %d suspect performances identified  (%s)",
+             len(suspects),
+             ", ".join(f"{k}={v}" for k, v in sorted(by_reason.items())) or "none")
+
+    if not suspects:
+        return {"ok": 0, "no_chips": 0, "fetch_failed": 0,
+                "suspect_count": 0, "duration_seconds": 0.0}
+
+    t0 = time.monotonic()
+    results = asyncio.run(_chip_pass_async(suspects, workers=workers))
+    elapsed = time.monotonic() - t0
+
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    ok = no_chips = fetch_failed = 0
+    for s in suspects:
+        chip_min, chip_max, candidates, note = results.get(
+            s["key"], (None, None, [], "missed"),
+        )
+        s_idx, p_idx = s["key"]
+        perf = payload["shows"][s_idx]["performances"][p_idx]
+        if chip_min is not None:
+            source = CHIP_SOURCE_OK
+            ok += 1
+        elif note.startswith("no chips"):
+            source = CHIP_SOURCE_NO_CHIPS
+            no_chips += 1
+        else:
+            source = CHIP_SOURCE_FETCH_FAIL
+            fetch_failed += 1
+        perf["verified_chip_min"]        = chip_min
+        perf["verified_chip_max"]        = chip_max
+        perf["verified_chip_candidates"] = candidates
+        perf["verified_chip_source"]     = source
+        perf["verified_chip_reason"]     = s["reason"]
+        perf["verified_chip_note"]       = note
+        perf["verified_chip_checked_at"] = now_iso
+
+    log.info(
+        "Chip pass done in %.1fs — ok=%d, no_chips=%d, fetch_failed=%d",
+        elapsed, ok, no_chips, fetch_failed,
+    )
+
+    summary = {
+        "verified_at":      now_iso,
+        "suspect_count":    len(suspects),
+        "ok":               ok,
+        "no_chips":         no_chips,
+        "fetch_failed":     fetch_failed,
+        "duration_seconds": round(elapsed, 1),
+        "by_reason":        by_reason,
+    }
+    report = payload.setdefault("report", {})
+    if isinstance(report, dict):
+        report["chip_verification"] = summary
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -525,6 +905,17 @@ def main(argv: list[str] | None = None) -> int:
         "--dry-run", action="store_true",
         help="Do everything except write the output file.",
     )
+    p.add_argument(
+        "--skip-chips", action="store_true",
+        help="Skip the chip-verification second pass "
+             "(by default it runs over suspect performances after the "
+             "main fireCrmEvent pass).",
+    )
+    p.add_argument(
+        "--chip-workers", type=int, default=CHIP_WORKERS,
+        help=f"Concurrent Playwright pages in the chip pass "
+             f"(default: {CHIP_WORKERS}).",
+    )
     args = p.parse_args(argv)
 
     if not args.in_path.exists():
@@ -548,6 +939,18 @@ def main(argv: list[str] | None = None) -> int:
         limit=args.limit,
         include_past=args.include_past,
     )
+
+    # Second pass: chip re-verification for suspect performances.
+    if not args.skip_chips:
+        try:
+            run_chip_pass(payload, workers=args.chip_workers)
+        except Exception as e:
+            # Chip pass is best-effort — never block the main verifier's
+            # output. Failures here just mean the suspect rows keep
+            # their fireCrmEvent values and dedupe falls back accordingly.
+            log.error("Chip pass failed: %s", e)
+    else:
+        log.info("Chip pass skipped (--skip-chips)")
 
     if args.dry_run:
         log.info("--dry-run: not writing output")
