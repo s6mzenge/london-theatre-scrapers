@@ -175,6 +175,19 @@ jobs:
     if: needs.setup.outputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # SeatPlan's Cloudflare bot rules block some Azure subnets and not
+    # others, and GH Actions can't pin runner regions, so the seatplan
+    # scrape fails ~1/N of the time when the runner lands on a blocked
+    # subnet (returns a 2031-byte stub page with no show cards). With
+    # `fail-fast: false` the other four scrapers run regardless and
+    # combine/dedupe/publish proceed on the partial input — but the
+    # workflow's overall status went red for cosmetic reasons. This
+    # expression marks ONLY seatplan as a tolerated failure; the other
+    # matrix entries stay strict so a real regression in todaytix /
+    # olt / ttd / lovetheatre still surfaces as a workflow failure.
+    # The long-term fix is to route SeatPlan through the same CF Worker
+    # proxy OLT uses; until that's set up, this is the cosmetic patch.
+    continue-on-error: ${{ matrix.name == 'seatplan' }}
 
     strategy:
       fail-fast: false   # one scraper failing shouldn't cancel the rest
