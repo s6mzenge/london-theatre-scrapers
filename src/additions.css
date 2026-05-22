@@ -1540,6 +1540,69 @@
     var(--color-velvet);
 }
 
+/* Update the valance's swag clip-path so it traces exactly the same
+   curve as the gold trim. The original polygon was deeper than the
+   bezier path on the trim — the polygon edge was at y=75% at x=8%,
+   but the bezier was at y=72% there, leaving a 3% strip of velvet
+   ABOVE the trim line visible as a darker band. Rebuilt below: 21
+   evenly-spaced points along the bezier  M 0,60 Q 50,140 100,60  so
+   that the velvet ends exactly where the trim sits. No darker strip
+   below the gold line. */
+.stg-valance {
+  clip-path: polygon(
+    0% 0%, 100% 0%, 100% 60%,
+    95% 67.6%, 90% 74.4%, 85% 80.4%, 80% 85.6%,
+    75% 90%, 70% 93.6%, 65% 96.4%, 60% 98.4%, 55% 99.6%,
+    50% 100%,
+    45% 99.6%, 40% 98.4%, 35% 96.4%, 30% 93.6%, 25% 90%,
+    20% 85.6%, 15% 80.4%, 10% 74.4%, 5% 67.6%,
+    0% 60%
+  );
+}
+
+/* Reposition the gold trim SVG to sit as a sibling of the valance,
+   over the curtain body. Previously the SVG lived inside .stg-valance
+   and was subject to its clip-path, which meant the visible trim was
+   the inner half of the stroke against velvet that ran further down.
+   Out here the trim coincides with the swag's edge — the top half of
+   the stroke is over the valance velvet, the bottom half over the
+   curtain body. Reads as a gold braid sewn onto the swag's bottom
+   edge, exactly where a real West End valance has it.
+
+   Height matches the valance height (clamp(80, 9vw, 150)) so the
+   bezier coordinates inside the SVG line up with the valance's
+   clip-path. The SVG itself is set to overflow: visible so the path's
+   control point at y=140 (outside the viewBox at y=100) can still
+   drive the curve through its midpoint at y=100. */
+.stg-valance-trim {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: clamp(80px, 9vw, 150px);
+  pointer-events: none;
+  z-index: 1;
+  overflow: visible;
+}
+
+/* Override the centre tassel's positioning: it now sits as a sibling
+   of the valance (not inside it), with its TOP at the valance's
+   bottom edge — i.e. at the swag's deepest dip, where the gold trim
+   reaches its low point. The tassel's cord begins exactly where the
+   trim line is, then the head + fringe hang down into the curtain
+   body, the way a real swagged tassel attaches to and dangles from
+   the bottom of a draped valance.
+
+   The left/right tassels at the swag's corners stay where they are
+   (inside the valance) — they look correct at the corner positions
+   where the swag is shallowest. */
+.stg-tassel-center {
+  top: clamp(80px, 9vw, 150px);
+  /* width / height / left / transform already inherited from the base
+     .stg-tassel and .stg-tassel-center rules in index.css; only the
+     `top` needs reworking. */
+}
+
 /* Side drapes — narrower than the first pass so they don't crowd the
    page. clamp() gives a fluid 10vw width with safe min/max bounds:
    min 40px so the tieback stays visible on small phones, max 160px so
