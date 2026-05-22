@@ -2052,13 +2052,22 @@ a {
   font-family: var(--font-display);
   font-weight: 500;
   font-size: clamp(22px, 4.5vw, 48px);
-  letter-spacing: clamp(4px, 0.6vw, 9px);
+  letter-spacing: 0;
   color: var(--color-gold-light);
-  text-shadow:
-    0 1px 0 var(--color-velvet-deep),
-    0 2px 4px rgba(0, 0, 0, 0.4);
   white-space: nowrap;
   z-index: 2;
+  display: inline-flex;
+  line-height: 1;
+}
+
+.stg-curtain-wordmark-svg {
+  height: 1.2em;
+  width: auto;
+  display: block;
+  /* SVG equivalent of the old text-shadow on the text wordmark, giving
+     the wordmark depth against the velvet. */
+  filter: drop-shadow(0 1px 0 var(--color-velvet-deep))
+          drop-shadow(0 2px 4px rgba(0, 0, 0, 0.4));
 }
 
 .stg-curtain-period {
