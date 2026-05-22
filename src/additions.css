@@ -718,209 +718,439 @@
 }
 
 /* ==========================================================================
-   WHEN — Day-of-week heatmap
+   WHEN — picks, strip plot, calendars
    ========================================================================== */
 
-.stg-dow-grid {
+/* --- Best Nights picks --------------------------------------------------- */
+
+.stg-when-picks {
   display: grid;
-  grid-template-columns: repeat(7, 1fr);
-  gap: 6px;
-  margin-bottom: 4px;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
 }
 
-.stg-dow-cell {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  padding: 14px 0 12px;
+.stg-when-pick {
   background: var(--color-paper-warm);
   border: 0.5px solid var(--line-soft);
   border-radius: 3px;
-  min-height: 200px;
-  position: relative;
+  padding: 14px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  min-height: 160px;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.18s, transform 0.18s;
 }
 
-.stg-dow-cell.min {
-  background: rgba(163, 50, 42, 0.07);
-  border-color: rgba(163, 50, 42, 0.45);
+.stg-when-pick:hover {
+  border-color: rgba(163, 50, 42, 0.5);
+  transform: translateY(-1px);
 }
 
-.stg-dow-cell.max::after {
-  content: 'PRICIEST';
-  position: absolute;
-  top: 4px;
-  right: 6px;
-  font-family: var(--font-sans);
-  font-size: 7px;
-  letter-spacing: 1.2px;
-  color: var(--color-text-faint);
+.stg-when-pick.featured {
+  background: var(--color-ink);
+  border-color: transparent;
 }
 
-.stg-dow-cell.min::after {
-  content: 'CHEAPEST';
-  position: absolute;
-  top: 4px;
-  right: 6px;
-  font-family: var(--font-sans);
-  font-size: 7px;
-  letter-spacing: 1.2px;
-  color: var(--color-brick);
-}
-
-.stg-dow-cell-dow {
+.stg-when-pick-tag {
   font-family: var(--font-slab);
-  font-size: 11px;
+  font-size: 9px;
+  letter-spacing: 1.6px;
+  color: var(--color-brick);
+  font-weight: 500;
+}
+
+.stg-when-pick.featured .stg-when-pick-tag {
+  color: var(--color-gold);
+}
+
+.stg-when-pick-dow {
+  font-family: var(--font-slab);
+  font-size: 10px;
   letter-spacing: 1.8px;
   color: var(--color-text-muted);
+  margin-top: 12px;
 }
 
-.stg-dow-cell-bar-wrap {
-  flex: 1;
-  width: 40%;
-  display: flex;
-  align-items: flex-end;
-  justify-content: center;
-  margin: 12px 0 10px;
+.stg-when-pick.featured .stg-when-pick-dow {
+  color: rgba(236, 230, 214, 0.55);
 }
 
-.stg-dow-cell-bar {
-  width: 100%;
-  background: linear-gradient(
-    180deg,
-    rgba(163, 50, 42, 0.55) 0%,
-    rgba(163, 50, 42, 0.85) 100%
-  );
-  border-radius: 2px 2px 0 0;
-  min-height: 14px;
-}
-
-.stg-dow-cell-bar.zero {
-  background: rgba(28, 26, 23, 0.06);
-  min-height: 6px;
-  height: 6px !important;
-}
-
-.stg-dow-cell-price {
-  font-family: var(--font-display);
-  font-size: 18px;
-  color: var(--color-brick);
+.stg-when-pick-dom {
+  font-family: var(--font-shout);
+  font-weight: 400;
+  font-size: 40px;
   line-height: 1;
+  letter-spacing: -1px;
+  color: var(--color-ink);
+  margin-top: 2px;
 }
 
-.stg-dow-cell.dark .stg-dow-cell-price { color: var(--color-text-faint); }
+.stg-when-pick.featured .stg-when-pick-dom {
+  color: var(--color-paper);
+}
 
-.stg-dow-cell-count {
+.stg-when-pick-month {
+  font-family: var(--font-display);
+  font-style: italic;
+  font-size: 11px;
+  color: var(--color-text-muted);
+  line-height: 1;
+  margin-top: 3px;
+}
+
+.stg-when-pick.featured .stg-when-pick-month {
+  color: rgba(236, 230, 214, 0.65);
+}
+
+.stg-when-pick-foot {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 0.5px dashed var(--line-soft);
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.stg-when-pick.featured .stg-when-pick-foot {
+  border-top-color: rgba(236, 230, 214, 0.2);
+}
+
+.stg-when-pick-from {
   font-family: var(--font-sans);
   font-size: 8px;
   letter-spacing: 1.2px;
   color: var(--color-text-muted);
-  margin-top: 4px;
 }
 
-/* ==========================================================================
-   WHEN — Long calendar (90-day strip)
-   ========================================================================== */
-
-.stg-longcal { margin-bottom: 18px; }
-
-.stg-longcal-strip {
-  display: grid;
-  grid-template-columns: repeat(45, 1fr);
-  gap: 2px;
-  align-items: end;
-  height: 90px;
-  padding: 8px 0 4px;
-  border-bottom: 0.5px solid var(--line-faint);
+.stg-when-pick.featured .stg-when-pick-from {
+  color: var(--color-brick);
 }
 
-.stg-longcal-cell {
-  display: flex;
-  flex-direction: column;
-  justify-content: flex-end;
-  align-items: stretch;
-  position: relative;
-  min-width: 0;
-  text-decoration: none;
-  color: inherit;
-  transition: opacity 0.15s;
+.stg-when-pick-price {
+  font-family: var(--font-display);
+  font-size: 24px;
+  line-height: 1;
+  color: var(--color-brick);
+  margin-top: 2px;
 }
 
-.stg-longcal-cell:hover { opacity: 0.65; }
+.stg-when-pick.featured .stg-when-pick-price {
+  color: var(--color-paper);
+}
 
-.stg-longcal-cell-bar {
-  width: 100%;
-  border-radius: 1px;
+.stg-when-pick-count {
+  font-family: var(--font-slab);
+  font-size: 10px;
+  color: var(--color-text-muted);
+}
+
+.stg-when-pick.featured .stg-when-pick-count {
+  color: rgba(236, 230, 214, 0.55);
+}
+
+/* --- Weekday strip plot -------------------------------------------------- */
+
+.stg-when-strip-editorial {
+  font-family: var(--font-display);
+  font-style: italic;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  margin: -8px 0 14px;
+}
+
+.stg-when-strip {
   display: block;
+  width: 100%;
+  height: auto;
 }
 
-.stg-longcal-cell.bucket-1 .stg-longcal-cell-bar { background: rgba(163, 50, 42, 0.85); height: 60px; }
-.stg-longcal-cell.bucket-2 .stg-longcal-cell-bar { background: rgba(163, 50, 42, 0.6);  height: 50px; }
-.stg-longcal-cell.bucket-3 .stg-longcal-cell-bar { background: rgba(163, 50, 42, 0.4);  height: 38px; }
-.stg-longcal-cell.bucket-4 .stg-longcal-cell-bar { background: rgba(163, 50, 42, 0.22); height: 28px; }
-.stg-longcal-cell.bucket-5 .stg-longcal-cell-bar { background: rgba(28, 26, 23, 0.12);  height: 18px; }
-.stg-longcal-cell.dark   .stg-longcal-cell-bar  { background: rgba(28, 26, 23, 0.05);  height: 6px; }
-
-.stg-longcal-cell.weekend .stg-longcal-cell-bar {
-  outline: 0.5px solid rgba(28, 26, 23, 0.18);
-  outline-offset: -0.5px;
+.stg-when-strip-bg-cheap {
+  fill: rgba(163, 50, 42, 0.04);
 }
 
-.stg-longcal-cell.today .stg-longcal-cell-bar {
-  outline: 1px solid var(--color-ink);
-  outline-offset: -1px;
+.stg-when-strip-gridline {
+  stroke: rgba(28, 26, 23, 0.08);
+  stroke-width: 0.5;
 }
 
-.stg-longcal-cell-dom {
-  display: none;
+.stg-when-strip-axis {
+  stroke: rgba(28, 26, 23, 0.3);
+  stroke-width: 0.5;
 }
 
-.stg-longcal-axis {
-  position: relative;
-  height: 18px;
-  margin-top: 4px;
-  border-bottom: 0.5px solid var(--line-faint);
-}
-
-.stg-longcal-axis-tick {
-  position: absolute;
-  top: 0;
-  font-family: var(--font-slab);
+.stg-when-strip-ytick {
+  font-family: var(--font-sans);
   font-size: 9px;
-  letter-spacing: 1.5px;
-  color: var(--color-text-muted);
-  padding: 0 4px;
-  background: var(--color-paper);
-  transform: translateX(-2px);
+  fill: var(--color-text-faint);
 }
 
-.stg-longcal-legend {
+.stg-when-strip-dot {
+  opacity: 0.78;
+}
+
+.stg-when-strip-dot.cheap {
+  fill: var(--color-brick);
+}
+
+.stg-when-strip-dot.prem {
+  fill: var(--color-ink);
+}
+
+.stg-when-strip-median {
+  stroke: var(--color-ink);
+  stroke-width: 2.5;
+  stroke-linecap: round;
+}
+
+.stg-when-strip-dow {
+  font-family: var(--font-slab);
+  font-size: 10px;
+  letter-spacing: 1.4px;
+  fill: var(--color-ink);
+  font-weight: 500;
+}
+
+.stg-when-strip-dow.cheap {
+  fill: var(--color-brick);
+}
+
+.stg-when-strip-dow.empty {
+  fill: var(--color-text-faint);
+  font-weight: 400;
+}
+
+.stg-when-strip-med-lbl {
+  font-family: var(--font-display);
+  font-size: 10px;
+  fill: var(--color-text-muted);
+}
+
+.stg-when-strip-legend {
   display: flex;
-  gap: 18px;
-  align-items: center;
-  justify-content: flex-end;
-  margin-top: 14px;
-  font-family: var(--font-slab);
+  justify-content: center;
+  gap: 22px;
+  margin-top: 8px;
+  font-family: var(--font-sans);
   font-size: 9px;
-  letter-spacing: 1.5px;
+  letter-spacing: 1.4px;
   color: var(--color-text-muted);
+  text-transform: uppercase;
+  align-items: center;
 }
 
-.stg-longcal-legend-key {
+.stg-when-strip-legend-item {
   display: inline-flex;
   align-items: center;
   gap: 6px;
 }
 
-.stg-longcal-swatch {
+.stg-when-strip-swatch {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
   display: inline-block;
-  width: 10px;
-  height: 10px;
+}
+
+.stg-when-strip-swatch.cheap {
+  background: var(--color-brick);
+}
+
+.stg-when-strip-swatch.prem {
+  background: var(--color-ink);
+}
+
+.stg-when-strip-swatch-bar {
+  width: 14px;
+  height: 2.5px;
+  background: var(--color-ink);
+  display: inline-block;
   border-radius: 1px;
 }
 
-.stg-longcal-swatch.bucket-1 { background: rgba(163, 50, 42, 0.85); }
-.stg-longcal-swatch.bucket-5 { background: rgba(28, 26, 23, 0.12); }
-.stg-longcal-swatch.dark     { background: rgba(28, 26, 23, 0.05); }
+/* --- Monthly calendars --------------------------------------------------- */
+
+.stg-when-cals {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 18px;
+}
+
+.stg-when-cal-head {
+  font-family: var(--font-shout);
+  font-weight: 400;
+  font-size: 18px;
+  letter-spacing: 0.5px;
+  color: var(--color-ink);
+  margin: 0 0 6px;
+}
+
+.stg-when-cal-head em {
+  font-family: var(--font-display);
+  font-style: italic;
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--color-text-muted);
+  margin-left: 6px;
+}
+
+.stg-when-cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 3px;
+}
+
+.stg-when-cal-h {
+  font-family: var(--font-sans);
+  font-size: 8px;
+  letter-spacing: 0.8px;
+  color: var(--color-text-faint);
+  text-align: center;
+  text-transform: uppercase;
+  padding: 2px 0 4px;
+}
+
+.stg-when-cal-cell {
+  aspect-ratio: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 2px;
+  position: relative;
+  font-family: var(--font-display);
+  font-size: 11px;
+  color: var(--color-ink);
+  text-decoration: none;
+  transition: opacity 0.15s;
+}
+
+.stg-when-cal-cell:hover {
+  opacity: 0.65;
+}
+
+.stg-when-cal-cell.blank {
+  background: transparent;
+  cursor: default;
+  pointer-events: none;
+}
+
+.stg-when-cal-cell.past {
+  color: rgba(28, 26, 23, 0.25);
+  cursor: default;
+  pointer-events: none;
+}
+
+.stg-when-cal-cell.b1 {
+  background: rgba(163, 50, 42, 0.85);
+  color: var(--color-paper);
+}
+.stg-when-cal-cell.b2 {
+  background: rgba(163, 50, 42, 0.55);
+  color: var(--color-ink);
+}
+.stg-when-cal-cell.b3 {
+  background: rgba(163, 50, 42, 0.3);
+}
+.stg-when-cal-cell.b4 {
+  background: rgba(163, 50, 42, 0.14);
+}
+.stg-when-cal-cell.b5 {
+  background: rgba(163, 50, 42, 0.05);
+  border: 0.5px solid rgba(28, 26, 23, 0.08);
+}
+
+.stg-when-cal-cell.dark {
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(28, 26, 23, 0.2) 0px,
+    rgba(28, 26, 23, 0.2) 1px,
+    transparent 1px,
+    transparent 4px
+  );
+  color: rgba(28, 26, 23, 0.4);
+  cursor: default;
+  pointer-events: none;
+}
+
+.stg-when-cal-cell.today {
+  outline: 1.5px solid var(--color-ink);
+  outline-offset: -1.5px;
+}
+
+.stg-when-cal-legend {
+  display: flex;
+  gap: 14px;
+  justify-content: flex-end;
+  margin-top: 14px;
+  font-family: var(--font-sans);
+  font-size: 9px;
+  letter-spacing: 1.4px;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  align-items: center;
+}
+
+.stg-when-cal-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.stg-when-cal-legend-sw {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  display: inline-block;
+}
+
+.stg-when-cal-legend-sw.b1 {
+  background: rgba(163, 50, 42, 0.85);
+}
+.stg-when-cal-legend-sw.b3 {
+  background: rgba(163, 50, 42, 0.3);
+}
+.stg-when-cal-legend-sw.b5 {
+  background: rgba(163, 50, 42, 0.05);
+  border: 0.5px solid rgba(28, 26, 23, 0.08);
+}
+.stg-when-cal-legend-sw.dark {
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(28, 26, 23, 0.2) 0px,
+    rgba(28, 26, 23, 0.2) 1px,
+    transparent 1px,
+    transparent 4px
+  );
+}
+
+/* --- WHEN responsive overrides ------------------------------------------- */
+
+@media (max-width: 900px) {
+  .stg-when-picks {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .stg-when-cals {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 540px) {
+  .stg-when-picks {
+    grid-template-columns: 1fr;
+  }
+  .stg-when-pick {
+    min-height: 0;
+  }
+  .stg-when-strip-legend {
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  .stg-when-cal-legend {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+}
 
 .stg-when-hint {
   font-family: var(--font-slab);
@@ -1288,22 +1518,12 @@
     grid-template-columns: 60px 1fr auto;
     gap: 12px;
   }
-  .stg-dow-grid {
-    grid-template-columns: repeat(7, 1fr);
-    gap: 2px;
-  }
-  .stg-dow-cell { min-height: 140px; }
-  .stg-dow-cell-bar-wrap { width: 60%; }
 }
 
 @media (max-width: 640px) {
   .stg-tier-grid { grid-template-columns: 1fr; }
   .stg-opening-grid { grid-template-columns: 1fr; }
   .stg-venue-grid { grid-template-columns: 1fr; }
-  .stg-longcal-strip {
-    grid-template-columns: repeat(30, 1fr);
-    height: 70px;
-  }
   .stg-coverage-row {
     grid-template-columns: 60px 1fr 40px;
     gap: 10px;
