@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { relativeTime } from '../lib/dates.js'
 import { Link } from '../lib/router.jsx'
+import Brand from './Brand.jsx'
 
 // Tabs are anchors (via the router's <Link>) instead of buttons so the
 // browser's standard "open in new tab / new window" affordances work
@@ -73,9 +74,7 @@ export default function Sidebar({ activeRoute, lastScrapedAt }) {
         <span className="stg-mobile-burger" aria-hidden="true">
           <span /><span /><span />
         </span>
-        <span className="stg-brand">
-          STAGE<span className="stg-period">.</span>
-        </span>
+        <Brand />
       </button>
 
       {/* Scrim behind the drawer — tap to close. Mobile-only. */}
@@ -92,9 +91,7 @@ export default function Sidebar({ activeRoute, lastScrapedAt }) {
         className={`stg-sidebar ${open ? 'open' : ''}`}
       >
         <div className="stg-sb-top">
-          <span className="stg-brand">
-            STAGE<span className="stg-period">.</span>
-          </span>
+          <Brand />
           <button
             type="button"
             className="stg-sidebar-close"
