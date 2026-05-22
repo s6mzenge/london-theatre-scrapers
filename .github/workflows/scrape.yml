@@ -288,7 +288,17 @@ jobs:
         # itself doesn't use Playwright. Use --skip-chips to disable
         # the chip pass if it ever misbehaves; fireCrmEvent values
         # will be used for all perfs in that case.
+        #
+        # continue-on-error: SeatPlan started instant-403'ing the
+        # /tickets/* sub-path from Azure runner IPs (likely Cloudflare
+        # bot detection), which makes the verifier exit 2 with all
+        # fetch_failed. The seatplan.json was still written with
+        # those fetch_failed flags, and dedupe falls back to the
+        # JSON-LD low_price for any perf without verified data — so
+        # losing this pass is a soft degradation, not a hard failure.
+        # Mirrors how the OLT step handles SeeTickets blocking us.
         if: steps.gate.outputs.run == 'true' && matrix.name == 'seatplan'
+        continue-on-error: true
         run: |
           python scraper/seatplan_availability.py \
             --in scraper/data/seatplan.json \
@@ -396,19 +406,25 @@ jobs:
         # workflow change is needed. ~13 min on ~200 suspect rows
         # at the default 1 worker; bump --workers cautiously since
         # TodayTix is sensitive to bot detection.
+        # continue-on-error: see SeatPlan step above for rationale.
         if: steps.gate.outputs.run == 'true' && matrix.name == 'todaytix'
+        continue-on-error: true
         run: |
           python scraper/todaytix_availability.py \
             --in scraper/data/todaytix.json \
             --chip-cache scraper/data/chip_cache_todaytix.json
 
       - name: Verify TTD per-performance prices
+        # continue-on-error: see SeatPlan step above for rationale.
         if: steps.gate.outputs.run == 'true' && matrix.name == 'ttd'
+        continue-on-error: true
         run: |
           python scraper/ttd_availability.py --in scraper/data/ttd.json
 
       - name: Verify TTD seat-plan prices (ground truth)
+        # continue-on-error: see SeatPlan step above for rationale.
         if: steps.gate.outputs.run == 'true' && matrix.name == 'ttd'
+        continue-on-error: true
         run: |
           python scraper/ttd_seat_verification.py --in scraper/data/ttd.json
 
@@ -421,7 +437,9 @@ jobs:
         # /api/calendar/{show_id}/; the live calendar dropped it an
         # hour later as the box office cutoff approached; our cached
         # data kept saying available until this verifier ran.
+        # continue-on-error: see SeatPlan step above for rationale.
         if: steps.gate.outputs.run == 'true' && matrix.name == 'lovetheatre'
+        continue-on-error: true
         run: |
           python scraper/lovetheatre_availability.py \
             --in scraper/data/lovetheatre.json \
