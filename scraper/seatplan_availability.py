@@ -202,12 +202,20 @@ SUSPECT_LOW_FLOOR        = 15.0
 SUSPECT_RATIO_THRESHOLD  = 8.0
 SUSPECT_OUTLIER_RATIO    = 2.0
 
-CHIP_WORKERS              = 3
+# Performance budget for the chip pass. SP has no observed bot wall
+# (we hit it 254× per scrape with the requests-based fireCrmEvent pass
+# already and never trip detection), so we can run many parallel
+# Playwright pages. Chips render fast once domcontentloaded fires —
+# typically <1s — so the stability poll can be aggressive.
+#
+# Wallclock target: ~1 min on ~250 suspect rows. Math: 250 rows ÷ 10
+# workers ≈ 25 rows per worker × ~2.5s mean per row ≈ 60s.
+CHIP_WORKERS              = 10
 CHIP_NAV_TIMEOUT_MS       = 30_000
-CHIP_FIRST_PRICE_TIMEOUT  = 12_000
+CHIP_FIRST_PRICE_TIMEOUT  = 12_000   # safety net for slow loads; rarely hit
 CHIP_STABILITY_POLL_S     = 0.25
-CHIP_STABILITY_POLLS      = 3       # 3 × 250ms = 750ms of unchanged candidates
-CHIP_MAX_WAIT_S           = 4.0
+CHIP_STABILITY_POLLS      = 2        # 2 × 250ms = 500ms of unchanged candidates
+CHIP_MAX_WAIT_S           = 2.5      # hard cap; chips usually settle in <1s
 
 # Plausible per-ticket range for chip extraction. Floor of £5 keeps the
 # legitimate £6 Globe yard tier in range when it really is bookable —
@@ -775,7 +783,9 @@ async def _chip_pass_async(suspect_items: list[dict],
     return results
 
 
-def run_chip_pass(payload: dict, workers: int = CHIP_WORKERS) -> dict:
+def run_chip_pass(payload: dict, workers: int = CHIP_WORKERS,
+                  cache_path: Path | None = None,
+                  cache_ttl_hours: int = 24) -> dict:
     """Identify suspect performances across the payload, run the
     Playwright chip extractor over them, and write
     verified_chip_min / verified_chip_max / verified_chip_source onto
@@ -785,10 +795,36 @@ def run_chip_pass(payload: dict, workers: int = CHIP_WORKERS) -> dict:
     Does NOT modify the existing verified_* fields. Dedupe consumes
     chip_min/max when verified_chip_source == 'chips', else falls back
     to the fireCrmEvent values, else the JSON-LD low_price. Each tier
-    is a stricter extraction than the previous."""
+    is a stricter extraction than the previous.
+
+    Cache (optional): when `cache_path` is given, suspect rows are
+    looked up in a JSON cache before the Playwright extractor runs.
+    Hits skip extraction and reuse the cached chip values. Misses run
+    the extractor and write back to the cache. The cache invalidates
+    on TTL (default 24h) and on input change (catalogue values that
+    changed since last verification). See chip_pass_cache.py for the
+    contract."""
     if not isinstance(payload, dict):
         return {"ok": 0, "no_chips": 0, "fetch_failed": 0, "suspect_count": 0,
-                "duration_seconds": 0.0}
+                "duration_seconds": 0.0, "cache_hits": 0, "cache_misses": 0}
+
+    # Cache setup — fully optional. If chip_pass_cache can't be
+    # imported (e.g. running against an older checkout), or the cache
+    # path isn't given, the chip pass behaves exactly as before.
+    cache_entries: dict = {}
+    use_cache = cache_path is not None
+    cache_mod = None
+    if use_cache:
+        try:
+            import chip_pass_cache as cache_mod
+            cache_entries = cache_mod.load(cache_path)
+            log.info("Chip cache loaded from %s — %d entries",
+                     cache_path, len(cache_entries))
+        except ImportError:
+            log.warning("chip_pass_cache module not importable; "
+                        "running without cache.")
+            use_cache = False
+            cache_mod = None
 
     # Collect suspect performances along with mutable references.
     suspects = []
@@ -808,6 +844,13 @@ def run_chip_pass(payload: dict, workers: int = CHIP_WORKERS) -> dict:
                 "show_url": show.get("url") or "?",
                 "date":     perf.get("date"),
                 "time":     perf.get("time"),
+                # Catalogue values that the chip pass acts on. If these
+                # change between runs, the cached chip result is stale.
+                # For SP: low_price (the JSON-LD floor) + verified
+                # min/max from the fireCrmEvent pass.
+                "_input_low_price":         perf.get("low_price"),
+                "_input_verified_min":      perf.get("verified_min_price"),
+                "_input_verified_max":      perf.get("verified_max_price"),
             })
             by_reason[reason] = by_reason.get(reason, 0) + 1
 
@@ -817,29 +860,102 @@ def run_chip_pass(payload: dict, workers: int = CHIP_WORKERS) -> dict:
 
     if not suspects:
         return {"ok": 0, "no_chips": 0, "fetch_failed": 0,
-                "suspect_count": 0, "duration_seconds": 0.0}
+                "suspect_count": 0, "duration_seconds": 0.0,
+                "cache_hits": 0, "cache_misses": 0}
 
+    # Cache lookup: partition suspects into hits (reuse) and misses
+    # (run the extractor). We resolve hits into the same `results`
+    # dict shape the async runner produces so the post-processing
+    # loop below is uniform regardless of source.
+    results: dict = {}
+    cache_hits = 0
+    cache_misses = 0
+    suspects_to_run = []
+    if use_cache and cache_mod is not None:
+        for s in suspects:
+            ckey = cache_mod.make_key(s["date"], s["time"], s["url"])
+            if ckey is None:
+                suspects_to_run.append(s)
+                cache_misses += 1
+                continue
+            input_hash = cache_mod.hash_inputs(
+                s["_input_low_price"],
+                s["_input_verified_min"],
+                s["_input_verified_max"],
+            )
+            entry = cache_entries.get(ckey)
+            if cache_mod.is_hit(entry, input_hash, ttl_hours=cache_ttl_hours):
+                # Reuse the cached chip result without running Playwright.
+                results[s["key"]] = (
+                    entry["chip_min"], entry["chip_max"],
+                    entry["candidates"], entry["note"],
+                )
+                # Remember the source so the post-processing loop
+                # writes the right verified_chip_source value.
+                s["_cached_source"] = entry["source"]
+                s["_cache_key"]     = ckey
+                s["_input_hash"]    = input_hash
+                cache_hits += 1
+            else:
+                s["_cache_key"]  = ckey
+                s["_input_hash"] = input_hash
+                suspects_to_run.append(s)
+                cache_misses += 1
+    else:
+        # No cache → run everything.
+        suspects_to_run = suspects
+        cache_misses = len(suspects)
+
+    log.info("Chip cache: %d hits, %d misses (running extractor on %d rows)",
+             cache_hits, cache_misses, len(suspects_to_run))
+
+    # Run the Playwright extractor on the cache-miss subset only.
     t0 = time.monotonic()
-    results = asyncio.run(_chip_pass_async(suspects, workers=workers))
+    if suspects_to_run:
+        miss_results = asyncio.run(
+            _chip_pass_async(suspects_to_run, workers=workers)
+        )
+        results.update(miss_results)
     elapsed = time.monotonic() - t0
 
+    # Post-processing: write back to the payload and the cache.
+    # Same loop walks both cache-hit rows (where results came from
+    # the cache) and cache-miss rows (where results came from the
+    # extractor), so the write logic is uniform.
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     ok = no_chips = fetch_failed = 0
+    cache_writes = 0
     for s in suspects:
         chip_min, chip_max, candidates, note = results.get(
             s["key"], (None, None, [], "missed"),
         )
         s_idx, p_idx = s["key"]
         perf = payload["shows"][s_idx]["performances"][p_idx]
-        if chip_min is not None:
-            source = CHIP_SOURCE_OK
-            ok += 1
-        elif note.startswith("no chips"):
-            source = CHIP_SOURCE_NO_CHIPS
-            no_chips += 1
+        # Determine the source label. Cache hits already know which
+        # cacheable outcome they were; cache misses derive it from the
+        # extractor output.
+        cached_source = s.get("_cached_source")
+        if cached_source is not None:
+            source = cached_source
+            if source == CHIP_SOURCE_OK:
+                ok += 1
+            elif source == CHIP_SOURCE_NO_CHIPS:
+                no_chips += 1
+            else:
+                # Defensive: cache should never store fetch_failed, but
+                # if a hand-edited cache or schema mismatch slipped one
+                # through, treat as fetch_failed in stats.
+                fetch_failed += 1
         else:
-            source = CHIP_SOURCE_FETCH_FAIL
-            fetch_failed += 1
+            if chip_min is not None:
+                source = CHIP_SOURCE_OK
+                ok += 1
+            elif note.startswith("no chips"):
+                source = CHIP_SOURCE_NO_CHIPS
+                no_chips += 1
+            else:
+                source = CHIP_SOURCE_FETCH_FAIL
+                fetch_failed += 1
         perf["verified_chip_min"]        = chip_min
         perf["verified_chip_max"]        = chip_max
         perf["verified_chip_candidates"] = candidates
@@ -848,9 +964,35 @@ def run_chip_pass(payload: dict, workers: int = CHIP_WORKERS) -> dict:
         perf["verified_chip_note"]       = note
         perf["verified_chip_checked_at"] = now_iso
 
+        # Persist freshly-extracted entries to the cache. Cache hits
+        # don't need rewriting; only NEW successful extractions get
+        # written, so the cache grows incrementally without churning
+        # untouched rows. Fetch failures are deliberately not cached.
+        if (use_cache and cache_mod is not None
+                and cached_source is None  # i.e. this was a cache miss
+                and source in cache_mod.CACHEABLE_SOURCES
+                and s.get("_cache_key") is not None):
+            cache_entries[s["_cache_key"]] = cache_mod.make_entry(
+                chip_min=chip_min,
+                chip_max=chip_max,
+                candidates=candidates,
+                source=source,
+                reason=s["reason"],
+                note=note,
+                input_hash=s["_input_hash"],
+            )
+            cache_writes += 1
+
+    if use_cache and cache_mod is not None and cache_writes > 0:
+        cache_mod.save(cache_path, cache_entries)
+        log.info("Chip cache: wrote %d new entries → %s",
+                 cache_writes, cache_path)
+
     log.info(
-        "Chip pass done in %.1fs — ok=%d, no_chips=%d, fetch_failed=%d",
+        "Chip pass done in %.1fs — ok=%d, no_chips=%d, fetch_failed=%d"
+        " (cache: %d hits / %d misses / %d writes)",
         elapsed, ok, no_chips, fetch_failed,
+        cache_hits, cache_misses, cache_writes,
     )
 
     summary = {
@@ -861,6 +1003,9 @@ def run_chip_pass(payload: dict, workers: int = CHIP_WORKERS) -> dict:
         "fetch_failed":     fetch_failed,
         "duration_seconds": round(elapsed, 1),
         "by_reason":        by_reason,
+        "cache_hits":       cache_hits,
+        "cache_misses":     cache_misses,
+        "cache_writes":     cache_writes,
     }
     report = payload.setdefault("report", {})
     if isinstance(report, dict):
@@ -916,6 +1061,20 @@ def main(argv: list[str] | None = None) -> int:
         help=f"Concurrent Playwright pages in the chip pass "
              f"(default: {CHIP_WORKERS}).",
     )
+    p.add_argument(
+        "--chip-cache", type=Path, default=None,
+        help="Path to a JSON cache file for chip-pass results. When "
+             "provided, suspect performances whose catalogue inputs "
+             "haven't changed since the last run skip the Playwright "
+             "extraction and reuse cached chip values. Cache entries "
+             "expire after --chip-cache-ttl-hours (default 24). "
+             "Omit this flag to run without caching.",
+    )
+    p.add_argument(
+        "--chip-cache-ttl-hours", type=int, default=24,
+        help="How long a cache entry stays valid (default: 24h). "
+             "After expiry the entry is re-verified.",
+    )
     args = p.parse_args(argv)
 
     if not args.in_path.exists():
@@ -943,7 +1102,12 @@ def main(argv: list[str] | None = None) -> int:
     # Second pass: chip re-verification for suspect performances.
     if not args.skip_chips:
         try:
-            run_chip_pass(payload, workers=args.chip_workers)
+            run_chip_pass(
+                payload,
+                workers=args.chip_workers,
+                cache_path=args.chip_cache,
+                cache_ttl_hours=args.chip_cache_ttl_hours,
+            )
         except Exception as e:
             # Chip pass is best-effort — never block the main verifier's
             # output. Failures here just mean the suspect rows keep
