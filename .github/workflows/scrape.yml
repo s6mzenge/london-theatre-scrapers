@@ -753,34 +753,63 @@ jobs:
           name: unified-shows
           path: dedupe_output/
 
-      - name: Copy unified.json into public/data/
+      - name: Commit and push to main
+        # Last-writer-wins with retry. unified.json is regenerated from
+        # scratch each run, so two parallel builds produce two complete,
+        # mutually-conflicting files -- rebase can't auto-merge them
+        # (essentially every line differs after re-serialization). The
+        # previous "git pull --rebase" strategy failed for exactly this
+        # reason on the 2026-05-22 16:19Z availability run.
+        #
+        # Strategy: if the push is rejected, hard-reset to the latest
+        # main, re-copy our freshly-built unified.json over the top, and
+        # retry. Both modes produce equally-fresh full files by
+        # construction, so the most recent finisher wins -- correct
+        # semantics for a write-only data file.
+        #
+        # The workflow-level `concurrency: scrape-and-refresh` block
+        # already serializes full vs availability runs of THIS workflow,
+        # so under normal operation this loop pushes on the first
+        # attempt. The retry is the safety net for anything outside that
+        # lock (human commits, other workflows touching main, etc).
+        #
         # Only unified.json is committed -- report.txt and review.json
         # stay as workflow artifacts. The website reads exactly one file.
         run: |
-          mkdir -p public/data
-          cp dedupe_output/unified.json public/data/unified.json
-          ls -la public/data/
-
-      - name: Commit and push to main
-        run: |
+          set -e
           MODE="${{ needs.setup.outputs.mode }}"
           if [ "$MODE" = "availability" ]; then
-            MSG="data: availability refresh ($(date -u +%Y-%m-%dT%H:%MZ))"
+            MSG_PREFIX="data: availability refresh"
           else
-            MSG="data: refresh from full scrape ($(date -u +%Y-%m-%dT%H:%MZ))"
+            MSG_PREFIX="data: refresh from full scrape"
           fi
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add public/data/unified.json
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
-          git commit -m "$MSG"
-          # Race protection: a parallel full scrape may have committed
-          # while we were running. Rebase rather than force-push so we
-          # don't clobber a fresher unified.json.
-          git pull --rebase origin main
-          git push origin main
+
+          MAX_ATTEMPTS=5
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            git fetch origin main
+            git reset --hard origin/main
+
+            mkdir -p public/data
+            cp dedupe_output/unified.json public/data/unified.json
+            git add public/data/unified.json
+
+            if git diff --cached --quiet; then
+              echo "No changes to commit."
+              exit 0
+            fi
+
+            git commit -m "$MSG_PREFIX ($(date -u +%Y-%m-%dT%H:%MZ))"
+            if git push origin main; then
+              echo "Pushed on attempt $i."
+              exit 0
+            fi
+            echo "Push rejected on attempt $i (concurrent push?). Retrying..."
+            sleep 2
+          done
+          echo "::error::Failed to push after $MAX_ATTEMPTS attempts."
+          exit 1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
