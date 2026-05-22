@@ -1955,3 +1955,434 @@
     transform: translateX(105%);
   }
 }
+
+/* ==========================================================================
+   CHEAPEST — Matinées · week navigator
+   --------------------------------------------------------------------------
+   The matinées section is now bucketed by calendar week (Mon–Sun). This
+   nav row matches the visual vocabulary of the per-show month navigator
+   in ShowDetail — arrow / centred label / arrow — so the two read as
+   the same control even though they live in different sections.
+   ========================================================================== */
+
+.stg-mat-weeknav {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  margin-bottom: 12px;
+  padding: 2px 0 8px;
+}
+
+.stg-mat-weeknav.single {
+  padding-top: 4px;
+}
+
+.stg-mat-weeknav-label {
+  font-family: var(--font-slab);
+  font-size: 11px;
+  letter-spacing: 2.5px;
+  color: var(--color-ink);
+  font-weight: 500;
+  min-width: 130px;
+  text-align: center;
+}
+
+.stg-mat-weeknav-arrow {
+  font-family: var(--font-display);
+  font-size: 18px;
+  line-height: 1;
+  color: var(--color-ink);
+  background: transparent;
+  border: 0.5px solid var(--line-soft);
+  width: 32px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.stg-mat-weeknav-arrow:hover:not(:disabled) {
+  background: var(--color-paper-warm);
+  border-color: var(--color-brick);
+  color: var(--color-brick);
+}
+
+.stg-mat-weeknav-arrow:focus-visible {
+  outline: 2px solid var(--color-brick);
+  outline-offset: 2px;
+}
+
+.stg-mat-weeknav-arrow:disabled {
+  color: var(--color-text-faint);
+  border-color: var(--line-faint);
+  cursor: default;
+  opacity: 0.5;
+}
+
+.stg-mat-empty {
+  padding: 28px 4px;
+  font-family: var(--font-slab);
+  font-style: italic;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  text-align: center;
+  border-top: 0.5px solid var(--line-soft);
+  border-bottom: 0.5px solid var(--line-faint);
+}
+
+/* ==========================================================================
+   SHOW DETAIL — Calendar heatmap
+   --------------------------------------------------------------------------
+   A small brick-tinted bar sits at the bottom of each performance cell.
+   Width is constant (the whole cell minus inset); the opacity encodes the
+   price bucket so cheap dates pop and pricey dates recede. Buckets are
+   computed once per show — see computePercentiles in data.js. Past and
+   non-perf cells stay clean (no bar). The palette is identical to the
+   weekstrip heatmap on the home page so the two surfaces use the same
+   colour language.
+   ========================================================================== */
+
+.stg-show-cal-heat {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 3px;
+  height: 3px;
+  background: rgba(28, 26, 23, 0.08);
+  pointer-events: none;
+  transition: background 0.15s, height 0.15s;
+}
+
+.stg-show-cal-c.bucket-1 .stg-show-cal-heat { background: rgba(163, 50, 42, 0.85); }
+.stg-show-cal-c.bucket-2 .stg-show-cal-heat { background: rgba(163, 50, 42, 0.55); }
+.stg-show-cal-c.bucket-3 .stg-show-cal-heat { background: rgba(163, 50, 42, 0.32); }
+.stg-show-cal-c.bucket-4 .stg-show-cal-heat { background: rgba(163, 50, 42, 0.18); }
+.stg-show-cal-c.bucket-5 .stg-show-cal-heat { background: rgba(28, 26, 23, 0.10); }
+
+/* Selected day's bar pumps up slightly so the active cell stays
+   visually anchored even with the warm-paper background. */
+.stg-show-cal-c.sel .stg-show-cal-heat {
+  height: 4px;
+  bottom: 3px;
+}
+
+/* Past and non-perf cells: no heat bar to encode. (Past cells stay
+   visually quiet via the existing .past dim styles.) */
+.stg-show-cal-c.past .stg-show-cal-heat,
+.stg-show-cal-c.dark .stg-show-cal-heat {
+  display: none;
+}
+
+/* ==========================================================================
+   SIDEBAR — Sub-tabs (TODAY · STACKED under CHEAPEST)
+   --------------------------------------------------------------------------
+   Sub-tabs indent under their parent tab and use a smaller font-size +
+   thinner letter-spacing so the hierarchy is legible at a glance. The
+   parent tab does NOT light up when a sub-tab is selected — the sub-tab
+   carries its own active mark, and the visual indentation is enough to
+   communicate "you're inside CHEAPEST". A thin connector dash to the
+   left of each sub-tab anchors it to the parent column.
+   ========================================================================== */
+
+.stg-tab-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.stg-subtabs {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-left: 18px;
+  /* No gap-top because the parent .stg-tab-wrap gap handles spacing. */
+}
+
+.stg-subtab {
+  position: relative;
+  font-family: var(--font-slab);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 2px;
+  color: var(--color-paper);
+  opacity: 0.4;
+  padding-left: 18px;
+  text-align: left;
+  width: 100%;
+  text-decoration: none;
+  transition: opacity 0.18s;
+}
+
+.stg-subtab::before {
+  /* Thin horizontal dash linking the sub-tab to its parent column —
+     reads like a tree connector without drawing a full bracket. */
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 50%;
+  width: 8px;
+  height: 1px;
+  background: var(--color-paper);
+  opacity: 0.35;
+}
+
+.stg-subtab:hover {
+  opacity: 0.75;
+}
+
+.stg-subtab.active {
+  opacity: 1;
+}
+
+.stg-subtab-mark {
+  position: absolute;
+  left: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 10px;
+  background: var(--color-brick);
+}
+
+.stg-subtab.active::before {
+  /* Hide the tree-dash when the active mark is showing — keeps the
+     visual quiet, mark does the work. */
+  display: none;
+}
+
+/* ==========================================================================
+   TODAY · STACKED — Vertical timeline feed
+   --------------------------------------------------------------------------
+   Time labels on the left, cards on the right, with a continuous spine
+   running through the time-label column. The spine line is rendered as
+   an absolutely-positioned 1px column inside each row's left gutter;
+   row-to-row continuity is achieved by extending the line a few px
+   beyond each row's box into the inter-row gap. The time label sits ON
+   the line with paper-coloured background padding that "cuts through"
+   it — same trick cinemahub uses for its mobile timeline.
+   ========================================================================== */
+
+.stg-today {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.stg-tody-feed {
+  display: flex;
+  flex-direction: column;
+  /* No gap between groups — inter-group spacing comes from the
+     extended spine line + has-gap-group bottom margin. */
+}
+
+.stg-tody-group {
+  display: flex;
+  flex-direction: column;
+}
+
+.stg-tody-row {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  transition: opacity 0.3s;
+}
+
+.stg-tody-row.has-gap {
+  /* Gap between cards inside one group. */
+  margin-bottom: 6px;
+}
+
+.stg-tody-row.has-gap-group {
+  /* Larger gap between groups so the time-label clusters read
+     distinctly without losing the spine continuity. */
+  margin-bottom: 14px;
+}
+
+.stg-tody-row.past {
+  opacity: 0.45;
+}
+
+/* Spine column — fixed width, contains the line + time label */
+.stg-tody-spine {
+  width: 68px;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.stg-tody-spine-line {
+  position: absolute;
+  left: 50%;
+  width: 1px;
+  background: rgba(28, 26, 23, 0.18);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.stg-tody-row.past .stg-tody-spine-line {
+  background: rgba(28, 26, 23, 0.08);
+}
+
+.stg-tody-time {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: var(--color-paper);
+  padding: 4px 6px;
+  font-family: var(--font-display);
+  font-size: 16px;
+  color: var(--color-brick);
+  line-height: 1;
+  white-space: nowrap;
+  z-index: 1;
+}
+
+.stg-tody-row.past .stg-tody-time {
+  color: var(--color-text-faint);
+}
+
+/* Card — same visual vocabulary as other warm-paper cards in the app. */
+.stg-tody-card {
+  flex: 1;
+  background: var(--color-paper-warm);
+  border: 0.5px solid var(--line-soft);
+  border-radius: 3px;
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  transition: border-color 0.18s;
+}
+
+.stg-tody-row:not(.past) .stg-tody-card:hover {
+  border-color: var(--color-brick);
+}
+
+.stg-tody-card-body {
+  flex: 1;
+  padding: 14px 18px;
+  text-decoration: none;
+  color: inherit;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 6px;
+}
+
+.stg-tody-card-title {
+  font-family: var(--font-shout);
+  font-size: 17px;
+  color: var(--color-ink);
+  line-height: 1.15;
+  letter-spacing: -0.1px;
+  /* 2-line clamp so a runaway title doesn't blow up the card height. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.stg-tody-card-meta {
+  display: flex;
+  gap: 14px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.stg-tody-card-venue {
+  font-family: var(--font-slab);
+  font-size: 11px;
+  color: var(--color-text-muted);
+  letter-spacing: 0.2px;
+}
+
+.stg-tody-card-price {
+  font-family: var(--font-display);
+  font-size: 14px;
+  color: var(--color-brick);
+  line-height: 1;
+}
+
+/* Perforated divider + BOOK affordance — echoes the ticket-stub
+   feel of the cinemahub design without leaning into the literal
+   dotted graphic (subtler here because every card has it). */
+.stg-tody-card-book {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 18px;
+  font-family: var(--font-slab);
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: var(--color-brick);
+  text-decoration: none;
+  border-left: 0.5px dashed var(--line-soft);
+  background: transparent;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s;
+}
+
+.stg-tody-card-book:hover {
+  background: rgba(163, 50, 42, 0.06);
+}
+
+/* NOW tick — a single row dropped between past and future groups.
+   The brick pill on the spine reads as the cursor, and a thin
+   brick rule extends across the card column so the whole row reads
+   as a horizontal "you are here" line. */
+.stg-tody-row.now {
+  margin-top: 4px;
+  margin-bottom: 10px;
+}
+
+.stg-tody-now-pill {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: var(--color-brick);
+  color: var(--color-paper);
+  padding: 3px 7px;
+  font-family: var(--font-slab);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  line-height: 1;
+  white-space: nowrap;
+  z-index: 1;
+}
+
+.stg-tody-now-rule {
+  flex: 1;
+  align-self: center;
+  height: 1px;
+  background: var(--color-brick);
+  opacity: 0.35;
+}
+
+/* On narrow viewports keep the spine but tighten the card padding and
+   shrink the BOOK affordance so the cards remain readable. */
+@media (max-width: 640px) {
+  .stg-tody-spine {
+    width: 56px;
+  }
+  .stg-tody-time {
+    font-size: 14px;
+    padding: 3px 5px;
+  }
+  .stg-tody-card-body {
+    padding: 12px 14px;
+  }
+  .stg-tody-card-title {
+    font-size: 15px;
+  }
+  .stg-tody-card-book {
+    padding: 0 14px;
+    font-size: 9px;
+    letter-spacing: 1.5px;
+  }
+}
