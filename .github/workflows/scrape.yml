@@ -93,7 +93,7 @@ jobs:
           - { name: todaytix,            script: scraper/todaytix_scraper.py,            playwright: true }
           - { name: olt,                 script: scraper/olt_scraper.py,                 playwright: false }
           - { name: lovetheatre,         script: scraper/lovetheatre_scraper.py,         playwright: false }
-          - { name: seatplan,            script: scraper/seatplan_scraper.py,            playwright: false }
+          - { name: seatplan,            script: scraper/seatplan_scraper.py,            playwright: true  }
           - { name: ttd,                 script: scraper/ttd_scraper.py,                 playwright: false }
 
     steps:
@@ -173,6 +173,15 @@ jobs:
           "
 
       - name: Verify SeatPlan per-performance prices
+        # The fireCrmEvent pass (requests-only) handles ~95% of perfs.
+        # The remaining ~5% — yard tiers, premium-default outliers —
+        # are re-verified by a Playwright chip pass that reads the
+        # actually-rendered price tiers from the booking page. That
+        # second pass needs Chromium, which is why the seatplan
+        # matrix entry has playwright: true even though the scraper
+        # itself doesn't use Playwright. Use --skip-chips to disable
+        # the chip pass if it ever misbehaves; fireCrmEvent values
+        # will be used for all perfs in that case.
         if: steps.gate.outputs.run == 'true' && matrix.name == 'seatplan'
         run: |
           python scraper/seatplan_availability.py --in scraper/data/seatplan.json
@@ -254,6 +263,21 @@ jobs:
           else:
               print("(Beetlejuice show not found — skipping spot-check)")
           PY
+
+      - name: Verify TodayTix per-performance prices
+        # Runs the chip-pass second pass over showtimes whose SSR
+        # snapshot looks suspect (cheapest band has <3 seats and
+        # within 14 days). This is the TT analogue of the SeatPlan
+        # chip pass — it catches inventory that sold out between
+        # scrape time and click time. The TT matrix entry already
+        # has playwright: true (the scraper itself uses it), so
+        # Chromium is provisioned in this job and no further
+        # workflow change is needed. ~13 min on ~200 suspect rows
+        # at the default 1 worker; bump --workers cautiously since
+        # TodayTix is sensitive to bot detection.
+        if: steps.gate.outputs.run == 'true' && matrix.name == 'todaytix'
+        run: |
+          python scraper/todaytix_availability.py --in scraper/data/todaytix.json
 
       - name: Verify TTD per-performance prices
         if: steps.gate.outputs.run == 'true' && matrix.name == 'ttd'
