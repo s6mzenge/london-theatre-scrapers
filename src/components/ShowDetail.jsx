@@ -51,12 +51,9 @@ function cleanDescription(md) {
 // the show-wide price axis bounds, and a default-selected date.
 // ---------------------------------------------------------------------------
 
-// Per-seller show-page URL, keyed by seller id. Used as a fallback
-// for performances where the seller didn't expose a per-perf booking
-// URL — most notably SeatPlan, which only publishes book_urls for
-// the next ~5 days (their "Last Minute" table). Without this fallback,
-// links to those performances would have an empty/'#' href and clicking
-// them would just reload the current page.
+// Per-seller show-page URL, keyed by seller id. The base layer of our
+// `bookUrl` fallback — every show has a URL on every seller that listed
+// it, captured in unified.json's `show.sources[].url`.
 function buildShowUrlBySeller(show) {
   const map = {}
   for (const src of show?.sources || []) {
@@ -67,6 +64,65 @@ function buildShowUrlBySeller(show) {
   return map
 }
 
+// ---------------------------------------------------------------------------
+// SeatPlan per-performance URL construction
+// ---------------------------------------------------------------------------
+// SeatPlan only ships a per-performance booking URL (book_url) for the
+// next ~5 days via their "Last Minute" table. For every other performance
+// the scraper leaves book_url null — but the URL is deterministically
+// constructible from the show URL + date + time, in the form:
+//
+//   {show.url}tickets/{D-mon-YYYY}/{H-MMam|pm}/
+//
+// e.g. .../kinky-boots-tickets/tickets/25-may-2026/7-30pm/
+//
+// Mirrors `build_ticketing_url` in scraper/seatplan_availability.py one-
+// for-one so the operational story is the same on both sides.
+
+const _SEATPLAN_MONTH_ABBR = [
+  'jan', 'feb', 'mar', 'apr', 'may', 'jun',
+  'jul', 'aug', 'sep', 'oct', 'nov', 'dec',
+]
+
+// '2026-05-21' -> '21-may-2026'. Returns null if input malformed.
+function seatplanDateSegment(dateIso) {
+  if (!dateIso || dateIso.length < 10) return null
+  const parts = dateIso.slice(0, 10).split('-')
+  if (parts.length !== 3) return null
+  const [y, m, d] = parts
+  const monthIdx = parseInt(m, 10) - 1
+  if (!Number.isFinite(monthIdx) || monthIdx < 0 || monthIdx > 11) return null
+  const day = parseInt(d, 10)
+  if (!Number.isFinite(day)) return null
+  return `${day}-${_SEATPLAN_MONTH_ABBR[monthIdx]}-${y}`
+}
+
+// '14:00' -> '2-00pm'. '00:30' -> '12-30am'. '12:00' -> '12-00pm'.
+function seatplanTimeSegment(timeHhmm) {
+  if (!timeHhmm || !timeHhmm.includes(':')) return null
+  const [hStr, mStr] = timeHhmm.split(':', 2)
+  const h = parseInt(hStr, 10)
+  const m = parseInt((mStr || '').slice(0, 2), 10)
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return null
+  if (h < 0 || h >= 24 || m < 0 || m >= 60) return null
+
+  let hour12, suffix
+  if (h === 0) { hour12 = 12; suffix = 'am' }
+  else if (h < 12) { hour12 = h; suffix = 'am' }
+  else if (h === 12) { hour12 = 12; suffix = 'pm' }
+  else { hour12 = h - 12; suffix = 'pm' }
+  return `${hour12}-${String(m).padStart(2, '0')}${suffix}`
+}
+
+function buildSeatplanTicketingUrl(showUrl, perfDate, perfTime) {
+  if (!showUrl) return null
+  const dateSeg = seatplanDateSegment(perfDate)
+  const timeSeg = seatplanTimeSegment(perfTime)
+  if (!dateSeg || !timeSeg) return null
+  const base = showUrl.endsWith('/') ? showUrl : showUrl + '/'
+  return `${base}tickets/${dateSeg}/${timeSeg}/`
+}
+
 // All sellers' prices for a single performance, sorted ascending,
 // invalid-£0 entries dropped. The drill-down strip and the scoreboard
 // both read off this shape.
@@ -75,18 +131,32 @@ function buildShowUrlBySeller(show) {
 //   1. The seller's per-performance booking URL (book_url), when present.
 //      Always present for TodayTix, OLT, etc.; only present for SeatPlan
 //      when the perf is in the next ~5 days.
-//   2. The seller's show-page URL (from showUrlBySeller). Lands the user
-//      on a real page on that seller rather than re-loading our site.
-//   3. null — the link will render non-interactively (no href attr).
+//   2. For SeatPlan: the deterministically-constructed ticketing-page
+//      URL ({show.url}/tickets/{D-mon-YYYY}/{H-MMam|pm}/). This is the
+//      same URL the Last Minute table would have surfaced; it works for
+//      any future performance regardless of how far out it is.
+//   3. The seller's show-page URL. Last-resort fallback for sellers we
+//      don't have a per-perf URL pattern for, or when date/time are
+//      missing.
+//   4. null — the link will render non-interactively (no href attr).
 function effectiveSellersAsc(perf, showUrlBySeller) {
   if (!perf.sources) return []
   const items = []
   for (const [sid, info] of Object.entries(perf.sources)) {
     if (info && validPrice(info.price_from)) {
+      let bookUrl = info.book_url || null
+      if (!bookUrl && sid === 'seatplan') {
+        bookUrl = buildSeatplanTicketingUrl(
+          showUrlBySeller[sid], perf.date, perf.time,
+        )
+      }
+      if (!bookUrl) {
+        bookUrl = showUrlBySeller[sid] || null
+      }
       items.push({
         sellerId: sid,
         price: info.price_from,
-        bookUrl: info.book_url || showUrlBySeller[sid] || null,
+        bookUrl,
       })
     }
   }
