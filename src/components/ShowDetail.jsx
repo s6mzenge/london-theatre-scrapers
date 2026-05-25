@@ -51,10 +51,34 @@ function cleanDescription(md) {
 // the show-wide price axis bounds, and a default-selected date.
 // ---------------------------------------------------------------------------
 
+// Per-seller show-page URL, keyed by seller id. Used as a fallback
+// for performances where the seller didn't expose a per-perf booking
+// URL — most notably SeatPlan, which only publishes book_urls for
+// the next ~5 days (their "Last Minute" table). Without this fallback,
+// links to those performances would have an empty/'#' href and clicking
+// them would just reload the current page.
+function buildShowUrlBySeller(show) {
+  const map = {}
+  for (const src of show?.sources || []) {
+    if (src && src.source && src.url) {
+      map[src.source] = src.url
+    }
+  }
+  return map
+}
+
 // All sellers' prices for a single performance, sorted ascending,
 // invalid-£0 entries dropped. The drill-down strip and the scoreboard
 // both read off this shape.
-function effectiveSellersAsc(perf) {
+//
+// `bookUrl` resolution order:
+//   1. The seller's per-performance booking URL (book_url), when present.
+//      Always present for TodayTix, OLT, etc.; only present for SeatPlan
+//      when the perf is in the next ~5 days.
+//   2. The seller's show-page URL (from showUrlBySeller). Lands the user
+//      on a real page on that seller rather than re-loading our site.
+//   3. null — the link will render non-interactively (no href attr).
+function effectiveSellersAsc(perf, showUrlBySeller) {
   if (!perf.sources) return []
   const items = []
   for (const [sid, info] of Object.entries(perf.sources)) {
@@ -62,7 +86,7 @@ function effectiveSellersAsc(perf) {
       items.push({
         sellerId: sid,
         price: info.price_from,
-        bookUrl: info.book_url || null,
+        bookUrl: info.book_url || showUrlBySeller[sid] || null,
       })
     }
   }
@@ -160,7 +184,7 @@ function buildMonth(year, month, byDate, today, percentiles) {
   return { year, month, label, weeks }
 }
 
-function computeAnalysis(performances, today) {
+function computeAnalysis(performances, today, showUrlBySeller) {
   const sorted = [...performances].sort((a, b) => {
     if (a.date !== b.date) return a.date.localeCompare(b.date)
     return (a.time || '').localeCompare(b.time || '')
@@ -170,7 +194,7 @@ function computeAnalysis(performances, today) {
   // The rest of the analysis is just bookkeeping over this.
   const enriched = sorted.map((perf) => ({
     perf,
-    sellers: effectiveSellersAsc(perf),
+    sellers: effectiveSellersAsc(perf, showUrlBySeller),
   }))
 
   // Axis bounds — the show-wide min and max effective price. Every
@@ -333,9 +357,13 @@ function computeAnalysis(performances, today) {
 
 export default function ShowDetail({ show, onBack }) {
   const today = todayISO()
+  const showUrlBySeller = useMemo(
+    () => buildShowUrlBySeller(show),
+    [show],
+  )
   const analysis = useMemo(
-    () => computeAnalysis(show.performances || [], today),
-    [show, today],
+    () => computeAnalysis(show.performances || [], today, showUrlBySeller),
+    [show, today, showUrlBySeller],
   )
   const [selectedDateIso, setSelectedDateIso] = useState(
     analysis.defaultDateIso,
@@ -760,7 +788,7 @@ function PerformanceBlock({ performance, axisMin, axisMax }) {
                   key={gi}
                   className={`stg-show-spread-tick ${isCheap ? 'cheap' : ''}`}
                   style={{ left: `${pct}%` }}
-                  href={linkSeller.bookUrl || '#'}
+                  href={linkSeller.bookUrl || undefined}
                   target={linkSeller.bookUrl ? '_blank' : undefined}
                   rel={linkSeller.bookUrl ? 'noopener noreferrer' : undefined}
                   aria-label={`${label} at £${Math.round(group.price)}`}
@@ -798,7 +826,7 @@ function PerformanceBlock({ performance, axisMin, axisMax }) {
                 <a
                   key={si}
                   className={`stg-show-spread-item ${isCheap ? 'cheap' : ''}`}
-                  href={s.bookUrl || '#'}
+                  href={s.bookUrl || undefined}
                   target={s.bookUrl ? '_blank' : undefined}
                   rel={s.bookUrl ? 'noopener noreferrer' : undefined}
                   aria-label={`Book ${sellerLabel(s.sellerId)} at £${Math.round(s.price)}`}
