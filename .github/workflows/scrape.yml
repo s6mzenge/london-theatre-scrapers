@@ -753,6 +753,16 @@ jobs:
           name: unified-shows
           path: dedupe_output/
 
+      - name: Set up Python for history update
+        # The history-update script is pure stdlib (json + zoneinfo +
+        # pathlib + argparse) so no pip install is needed. We still pin
+        # via setup-python for parity with the dedupe / availability
+        # jobs and so we don't depend on whatever python3 the runner
+        # image happens to ship.
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Commit and push to main
         # Last-writer-wins with retry. unified.json is regenerated from
         # scratch each run, so two parallel builds produce two complete,
@@ -773,8 +783,21 @@ jobs:
         # attempt. The retry is the safety net for anything outside that
         # lock (human commits, other workflows touching main, etc).
         #
-        # Only unified.json is committed -- report.txt and review.json
-        # stay as workflow artifacts. The website reads exactly one file.
+        # Both unified.json and price_history.json are committed --
+        # report.txt and review.json stay as workflow artifacts. The
+        # website reads both committed files; see scripts/gzip-data.mjs
+        # for the build-time gzip step that ships them to the CDN.
+        #
+        # The price-history update lives INSIDE the retry loop, after
+        # `git reset --hard origin/main` and before `git add`. That's
+        # deliberate: a parallel run that won the race may have just
+        # committed a newer price_history.json with snapshots we don't
+        # have yet, and we want to rebase OUR new snapshot onto that
+        # rather than overwrite their work. Running the script outside
+        # the loop would mean either (a) updating against a stale base
+        # the reset then wipes, or (b) updating against a base the next
+        # iteration's reset wipes anyway. Inside-the-loop is the only
+        # correct placement.
         run: |
           set -e
           MODE="${{ needs.setup.outputs.mode }}"
@@ -794,7 +817,19 @@ jobs:
 
             mkdir -p public/data
             cp dedupe_output/unified.json public/data/unified.json
-            git add public/data/unified.json
+
+            # Append a snapshot for any (show, date, time) whose price
+            # payload moved vs its last recorded entry; prune buckets
+            # whose perf date is strictly past in London local time;
+            # prune show_ids no longer in unified. Idempotent w.r.t.
+            # unified.generated_at, so a re-iteration of this loop on
+            # the same dedupe output never produces duplicate entries.
+            python scraper/analysis/update_price_history.py \
+              --unified public/data/unified.json \
+              --history-in public/data/price_history.json \
+              --out public/data/price_history.json
+
+            git add public/data/unified.json public/data/price_history.json
 
             if git diff --cached --quiet; then
               echo "No changes to commit."
