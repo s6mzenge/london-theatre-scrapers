@@ -26,21 +26,57 @@ import {
 // CORS preflight, no dependency on external caches — the data ships
 // with the bundle, and a Pages redeploy after every scrape is what
 // makes it fresh.
-const DATA_URL = `${(import.meta.env && import.meta.env.BASE_URL) || '/'}data/unified.json.gz`
+//
+// price_history.json is a sibling file written by the same workflow:
+// an append-only per-(show, date, time) snapshot log of how prices
+// moved across scrapes, pruned to drop performances whose date is
+// strictly past in London local time. We fetch it in parallel and
+// attach it to the loaded unified object as `data.priceHistory` so
+// every existing consumer continues to work unchanged. Components
+// that want history data read `data.priceHistory` (it may be null on
+// first deploy or on a 404).
+const BASE = (import.meta.env && import.meta.env.BASE_URL) || '/'
+const UNIFIED_URL = `${BASE}data/unified.json.gz`
+const HISTORY_URL = `${BASE}data/price_history.json.gz`
 
 export async function loadUnifiedData() {
-  const r = await fetch(DATA_URL, { cache: 'default' })
-  if (!r.ok) {
-    throw new Error(`Failed to fetch ${DATA_URL}: HTTP ${r.status}`)
+  // Fire both fetches in parallel. We catch the history-fetch failure
+  // here so a missing or 404'd history file is never fatal — we just
+  // boot the site without it (the helpers below degrade to empty arrays).
+  const [unifiedRes, historyRes] = await Promise.all([
+    fetch(UNIFIED_URL, { cache: 'default' }),
+    fetch(HISTORY_URL, { cache: 'default' }).catch((err) => {
+      console.warn('[STAGE] price history fetch failed', err)
+      return null
+    }),
+  ])
+
+  if (!unifiedRes.ok) {
+    throw new Error(`Failed to fetch ${UNIFIED_URL}: HTTP ${unifiedRes.status}`)
   }
-  // Decompress in JS rather than relying on Content-Encoding: gzip.
-  // Cloudflare Pages doesn't honor that header from _headers files for
-  // static assets, so the browser gets raw gzip bytes back and chokes
-  // on them as JSON. DecompressionStream is supported in all evergreen
-  // browsers since 2023, so this works everywhere we care about.
-  const decompressed = r.body.pipeThrough(new DecompressionStream('gzip'))
-  const text = await new Response(decompressed).text()
-  const data = JSON.parse(text)
+  const data = await _gunzipJSON(unifiedRes)
+
+  let priceHistory = null
+  if (historyRes && historyRes.ok) {
+    try {
+      priceHistory = await _gunzipJSON(historyRes)
+    } catch (err) {
+      // Decode failed — log and continue. The site stays functional
+      // without history; only the history-aware features lose their data.
+      console.warn('[STAGE] price history failed to decode; continuing without', err)
+    }
+  } else if (historyRes && !historyRes.ok && historyRes.status !== 404) {
+    // 404 is expected on the very first deploy before the workflow has
+    // produced a history file. Anything else is worth a console note.
+    console.warn(`[STAGE] price history fetch returned HTTP ${historyRes.status}`)
+  }
+
+  // Attach BEFORE filterToUpcomingShows. That filter spreads `data`
+  // into a new object (`{...data, shows: upcoming, ...}`), which
+  // carries `priceHistory` through automatically — no need to teach
+  // the filter about it.
+  data.priceHistory = priceHistory
+
   // The unified.json that ships with the build can include shows whose
   // entire run is in the past — the scrape doesn't actively prune them,
   // and a show that closed last week is still a valid catalogue entry
@@ -52,6 +88,18 @@ export async function loadUnifiedData() {
   // App-level show lookup) automatically sees only upcoming shows
   // without having to add its own filter.
   return filterToUpcomingShows(data, todayISO())
+}
+
+// Shared gunzip helper. Decompress in JS rather than relying on
+// Content-Encoding: gzip — Cloudflare Pages doesn't honor that header
+// from _headers files for static assets, so the browser gets raw gzip
+// bytes back and chokes on them as JSON. DecompressionStream is
+// supported in all evergreen browsers since 2023, so this works
+// everywhere we care about.
+async function _gunzipJSON(res) {
+  const decompressed = res.body.pipeThrough(new DecompressionStream('gzip'))
+  const text = await new Response(decompressed).text()
+  return JSON.parse(text)
 }
 
 // A show counts as upcoming if at least one of its performances is dated
@@ -88,6 +136,66 @@ export function extractMeta(data) {
     sourceSummary: data?.source_summary || {},
     coverageDistribution: data?.coverage_distribution || {},
   }
+}
+
+// =============================================================
+// Price history lookup helpers
+// =============================================================
+
+// Build the (show_id, date, time) -> snapshots[] key used in
+// price_history.json. Keep this in lockstep with the Python writer's
+// key shape in scraper/analysis/update_price_history.py.
+function _historyKey(date, time) {
+  return `${date}T${time}`
+}
+
+// Get the ordered snapshot array for a specific performance.
+// Returns [] if the history file is missing (e.g. first deploy, network
+// blip), the show isn't tracked, or the (date, time) hasn't been seen
+// before. Snapshots are in chronological order — oldest first; the
+// last entry reflects the most recent scrape.
+//
+// Each snapshot shape (kept compact for over-the-wire size):
+//   { t, min, max, currency, any_available,
+//     sources: { sellerId: {from, to, available}, ... } }
+//
+// Note: `min` / `max` can be null (price unknown for that scrape),
+// and `min` of 0 should be treated as "unknown" too — same convention
+// as everywhere else in this file. Use `validPrice` from above when
+// you want to actually plot or compare values.
+export function getPriceHistory(data, showId, date, time) {
+  const buckets = data?.priceHistory?.shows?.[showId]
+  if (!buckets) return []
+  return buckets[_historyKey(date, time)] || []
+}
+
+// Convenience: change in cheapest price between the current scrape and
+// the previous distinct valid price for a perf. Returns:
+//   null            — untracked, or no two distinct valid prices ever recorded
+//   { prev, current, deltaGbp, deltaPct }
+// Walks back from the most recent valid snapshot to find the previous
+// snapshot with a different valid `min`. This makes us robust to runs
+// of identical values (shouldn't happen given the writer's
+// change-detect, but cheap to be safe) and to gaps where `min` was
+// briefly null. Useful for "↓ £X since last scrape" badges.
+export function getPriceChange(data, showId, date, time) {
+  const snaps = getPriceHistory(data, showId, date, time)
+  if (snaps.length < 2) return null
+  let current = null
+  let prev = null
+  for (let i = snaps.length - 1; i >= 0; i--) {
+    if (!validPrice(snaps[i].min)) continue
+    if (current === null) {
+      current = snaps[i].min
+    } else if (snaps[i].min !== current) {
+      prev = snaps[i].min
+      break
+    }
+  }
+  if (current === null || prev === null) return null
+  const deltaGbp = current - prev
+  const deltaPct = prev > 0 ? (deltaGbp / prev) * 100 : null
+  return { prev, current, deltaGbp, deltaPct }
 }
 
 // =============================================================
