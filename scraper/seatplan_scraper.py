@@ -445,6 +445,102 @@ def build_session(
 
 
 # ---------------------------------------------------------------------------
+# HTTP diagnostics  (temporary instrumentation — safe to remove later)
+# ---------------------------------------------------------------------------
+#
+# Purpose: when a request to seatplan.com comes back non-2xx, dump the
+# response body + a curated set of headers so we can tell WHO returned
+# the error. The scraper otherwise calls raise_for_status() and discards
+# the body, which hides the one signal that distinguishes the two failure
+# modes:
+#
+#   * Cloudflare edge block (SeatPlan's protection rejecting the proxy
+#     Worker's egress): `server: cloudflare`, a `cf-ray` value, often
+#     `cf-mitigated: challenge`, and an HTML body whose title is
+#     "Attention Required! | Cloudflare" or which says "Sorry, you have
+#     been blocked". A Ray ID usually appears near the foot of that body.
+#
+#   * Worker-internal 403 (the Cloudflare Worker proxy rejecting us
+#     before it ever reached SeatPlan — bad X-Proxy-Auth, or seatplan.com
+#     missing from / mismatched against its ALLOWED_HOSTS): a short
+#     text/JSON body (e.g. "forbidden: host not allowed", "bad auth")
+#     and NONE of the cf-* headers (a Worker building a fresh Response
+#     typically won't carry SeatPlan's cf-ray through).
+#
+# The body is the deciding signal: even if the Worker strips SeatPlan's
+# headers when re-wrapping the response, a passed-through Cloudflare block
+# page still carries its title and Ray ID in the HTML.
+
+# Headers worth surfacing on a non-2xx. Absent ones are simply skipped.
+_DIAG_HEADERS = (
+    "server", "cf-ray", "cf-mitigated", "cf-cache-status",
+    "content-type", "content-length", "retry-after",
+    "x-proxy-error", "x-proxy-target", "x-worker-error", "via",
+)
+
+# Per-detail diagnostics are capped across all worker threads: a broad
+# block would otherwise dump hundreds of identical block pages. The
+# master-listing diagnostic is unconditional (it is a single request).
+_DETAIL_DIAG_MAX = 3
+_detail_diag_lock = Lock()
+_detail_diag_count = 0
+
+
+def _detail_diag_take() -> bool:
+    """Return True at most _DETAIL_DIAG_MAX times, thread-safely."""
+    global _detail_diag_count
+    with _detail_diag_lock:
+        if _detail_diag_count >= _DETAIL_DIAG_MAX:
+            return False
+        _detail_diag_count += 1
+        return True
+
+
+def _log_http_diagnostic(
+    resp: requests.Response, *, context: str,
+    head: int = 1100, tail: int = 400,
+) -> None:
+    """Emit a 3-line diagnostic block for a non-2xx response.
+
+    Logs the status line, the curated header subset, and a
+    whitespace-collapsed body excerpt (head + tail, so both a block
+    page's title and its trailing Ray ID survive truncation). Best-effort
+    throughout — a diagnostic must never raise and mask the real error.
+    """
+    status = getattr(resp, "status_code", "?")
+    reason = getattr(resp, "reason", "")
+
+    hdrs: list[str] = []
+    try:
+        for h in _DIAG_HEADERS:
+            v = resp.headers.get(h)
+            if v is not None:
+                hdrs.append(f"{h}: {v}")
+    except Exception:  # pragma: no cover - headers should always exist
+        pass
+    hdr_str = "; ".join(hdrs) if hdrs else (
+        "(none of the diagnostic headers present — proxy Worker may have "
+        "stripped upstream headers; rely on the body below)"
+    )
+
+    try:
+        body = resp.text or ""
+    except Exception as ex:
+        body = f"(could not read body: {type(ex).__name__}: {ex})"
+    collapsed = " ".join(body.split())
+    n = len(collapsed)
+    if n <= head + tail:
+        excerpt = collapsed
+    else:
+        excerpt = f"{collapsed[:head]} …[+{n - head - tail} chars omitted]… {collapsed[-tail:]}"
+
+    log.error("HTTP DIAGNOSTIC [%s]: status=%s reason=%r body_len=%d",
+              context, status, reason, n)
+    log.error("HTTP DIAGNOSTIC [%s]: headers=[%s]", context, hdr_str)
+    log.error("HTTP DIAGNOSTIC [%s]: body=%s", context, excerpt)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -1341,11 +1437,28 @@ def fetch_master_and_tags(
     log.info("Fetching master listing: %s", MASTER_URL)
     try:
         resp = session.get(MASTER_URL, timeout=30)
-        resp.raise_for_status()
+    except requests.RequestException as e:
+        # No response object at all — a transport-level error (DNS,
+        # connect, TLS, timeout) rather than an HTTP status. Nothing to
+        # capture a body from in this case.
+        log.error("Master listing fetch failed (no HTTP response — transport "
+                  "error): %s: %s", type(e).__name__, e)
+        return [], {}, {}, {}, {}
+
+    if not resp.ok:
+        # We got an HTTP response with a non-2xx status. Capture the body
+        # and key headers BEFORE aborting — this is the whole point of the
+        # diagnostic build (see _log_http_diagnostic for how to read it).
+        _log_http_diagnostic(resp, context=f"master listing GET {MASTER_URL}")
+        log.error("Master listing fetch failed: HTTP %s %s (via proxy if "
+                  "configured)", resp.status_code, resp.reason)
+        return [], {}, {}, {}, {}
+
+    try:
         master_cards = parse_listing(resp.text)
         log.info("  master listing: parsed=%d cards", len(master_cards))
-    except requests.RequestException as e:
-        log.error("Master listing fetch failed: %s", e)
+    except Exception as e:
+        log.error("Master listing parse failed: %s: %s", type(e).__name__, e)
         return [], {}, {}, {}, {}
 
     appears_in_map: dict[str, list[str]] = {}
@@ -1393,6 +1506,9 @@ def fetch_master_and_tags(
                     tag, len(resp.text), any_sp_card, empty_marker,
                 )
         except requests.RequestException as e:
+            resp_obj = getattr(e, "response", None)
+            if resp_obj is not None:
+                _log_http_diagnostic(resp_obj, context=f"tag list '{tag}' GET {url}")
             log.warning("  tag list '%s' failed: %s — skipping", tag, e)
             tag_list_counts[tag] = -1
 
@@ -1446,6 +1562,9 @@ def fetch_master_and_tags(
                 len(resp.text), has_table, has_class,
             )
     except requests.RequestException as e:
+        resp_obj = getattr(e, "response", None)
+        if resp_obj is not None:
+            _log_http_diagnostic(resp_obj, context=f"last-minute GET {LAST_MINUTE_URL}")
         log.warning("  last-minute fetch failed: %s — skipping", e)
         tag_list_counts["last_minute"] = -1
 
@@ -1471,6 +1590,13 @@ def fetch_show_detail(
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else "?"
             last_err = f"HTTP {code}"
+            # One-shot, thread-capped body capture for block-like statuses
+            # so the detail endpoints get characterised too. Relevant to
+            # the historical "most perfs missing book_url" anomaly, which
+            # looked like partial challenge pages served on detail fetches.
+            if (e.response is not None and code in (401, 403, 429, 503)
+                    and _detail_diag_take()):
+                _log_http_diagnostic(e.response, context=f"detail GET {card.url}")
             if code in (404, 410):
                 # Permanent — don't waste a retry
                 return None, last_err
