@@ -321,18 +321,24 @@ jobs:
         if: steps.gate.outputs.run == 'true' && matrix.name == 'seatplan'
         continue-on-error: true
         env:
-          # Same Lambda egress as the SeatPlan scrape (see "Run scraper").
           # SeatPlan sits behind AWS WAF, which serves a JS challenge (HTTP 202)
-          # our requests-based fetcher can't solve. The clean window is a brief
-          # WALL-CLOCK grace (~20-40s), NOT a request budget — so we BURST
-          # (high concurrency, no pacing) to capture the most per run, --shuffle
-          # so a different ~half of the catalogue lands in the grace each run,
-          # and --price-cache so the rest carry their last real price forward.
-          # Coverage rolls to the full catalogue over a few runs. (Pacing was
-          # tried and made it worse — 1.2 req/s got only ~46 through.)
-          # --max-seconds is just a safety cap; a burst finishes in ~30s.
-          # The chip pass below is unaffected (Playwright, runner-direct,
-          # continue-on-error).
+          # a plain HTTP client can't solve — so the requests-based fetcher only
+          # ever verified a slice per run. Browser mode (--fetch-mode browser)
+          # fixes that: it fetches every ticketing URL through ONE headless-
+          # Chromium context that has solved the WAF challenge (the same
+          # mechanism the chip pass uses), so the aws-waf-token rides along on
+          # each in-page fetch and ALL ~1,100 performances verify every run,
+          # direct from the runner IP. --concurrency 12 is the in-page fetch
+          # pool; --max-seconds is a safety cap (a sweep finishes in ~30-60s);
+          # --price-cache is the safety net (if a run partially fails, perfs
+          # carry their last real price instead of reverting to catalogue
+          # lowPrice). The chip pass below is unaffected (Playwright, runner-
+          # direct, continue-on-error). Chromium is already installed for the
+          # chip pass, so no extra setup is needed here.
+          #
+          # The proxy env below is UNUSED in browser mode (which goes direct);
+          # it's retained so reverting to --fetch-mode requests (burst + shuffle
+          # + price-cache, the proven rolling fallback) is a one-flag change.
           OLT_PROXY_URL: ${{ secrets.SEATPLAN_PROXY_URL }}
           OLT_PROXY_TOKEN: ${{ secrets.SEATPLAN_PROXY_TOKEN }}
         run: |
@@ -340,8 +346,8 @@ jobs:
             --in scraper/data/seatplan.json \
             --chip-cache scraper/data/chip_cache_seatplan.json \
             --price-cache scraper/data/seatplan_price_cache.json \
-            --concurrency 16 \
-            --shuffle \
+            --fetch-mode browser \
+            --concurrency 12 \
             --max-seconds 780
 
       - name: Verify OLT per-performance availability
