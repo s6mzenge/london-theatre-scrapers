@@ -322,13 +322,15 @@ jobs:
         continue-on-error: true
         env:
           # Same Lambda egress as the SeatPlan scrape (see "Run scraper").
-          # SeatPlan sits behind AWS WAF, which serves a JS challenge (HTTP
-          # 202) to an egress IP that bursts too fast — requests can't solve
-          # it. So the pass is paced (--max-rate) below the trip threshold and
-          # bounded by a wall-clock budget (--max-seconds) so it always
-          # finishes before the next 15-min run. Perfs not fetched in a given
-          # run (budget tail, or a stray 202) keep their last real price via
-          # --price-cache instead of reverting to the catalogue lowPrice.
+          # SeatPlan sits behind AWS WAF, which serves a JS challenge (HTTP 202)
+          # our requests-based fetcher can't solve. The clean window is a brief
+          # WALL-CLOCK grace (~20-40s), NOT a request budget — so we BURST
+          # (high concurrency, no pacing) to capture the most per run, --shuffle
+          # so a different ~half of the catalogue lands in the grace each run,
+          # and --price-cache so the rest carry their last real price forward.
+          # Coverage rolls to the full catalogue over a few runs. (Pacing was
+          # tried and made it worse — 1.2 req/s got only ~46 through.)
+          # --max-seconds is just a safety cap; a burst finishes in ~30s.
           # The chip pass below is unaffected (Playwright, runner-direct,
           # continue-on-error).
           OLT_PROXY_URL: ${{ secrets.SEATPLAN_PROXY_URL }}
@@ -338,8 +340,8 @@ jobs:
             --in scraper/data/seatplan.json \
             --chip-cache scraper/data/chip_cache_seatplan.json \
             --price-cache scraper/data/seatplan_price_cache.json \
-            --concurrency 8 \
-            --max-rate 1.2 \
+            --concurrency 16 \
+            --shuffle \
             --max-seconds 780
 
       - name: Verify OLT per-performance availability
