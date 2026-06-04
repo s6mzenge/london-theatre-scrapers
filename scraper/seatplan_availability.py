@@ -466,6 +466,59 @@ def _empty_result(url: str | None, source: str, status=None) -> dict:
     }
 
 
+# --- HTTP diagnostics (temporary instrumentation — safe to remove later) ----
+# Same purpose as in seatplan_scraper.py: on a non-200 from seatplan.com, dump
+# the body + key headers so we can tell WHO is blocking the egress —
+#   * CloudFront / SeatPlan block (server: cloudflare? no — CloudFront; body
+#     "Request blocked", a CloudFront request ID, or a 429): SeatPlan is
+#     rate-limiting the Lambda's egress IP.
+#   * {"Reason":"ConcurrentInvocationLimitExceeded",...} with content-type
+#     application/json: it's the Lambda being throttled, not SeatPlan.
+# Capped across worker threads so a sustained block can't flood the log.
+_DIAG_HEADERS = (
+    "server", "cf-ray", "cf-mitigated", "cf-cache-status",
+    "content-type", "content-length", "retry-after",
+    "x-proxy-error", "x-worker-error", "via",
+)
+_DIAG_MAX = 4
+_diag_lock = Lock()
+_diag_count = 0
+
+
+def _diag_take() -> bool:
+    global _diag_count
+    with _diag_lock:
+        if _diag_count >= _DIAG_MAX:
+            return False
+        _diag_count += 1
+        return True
+
+
+def _log_http_diagnostic(resp, *, context, head=900, tail=400):
+    status = getattr(resp, "status_code", "?")
+    hdrs = []
+    try:
+        for h in _DIAG_HEADERS:
+            v = resp.headers.get(h)
+            if v is not None:
+                hdrs.append(f"{h}: {v}")
+    except Exception:
+        pass
+    hdr_str = "; ".join(hdrs) if hdrs else "(no diagnostic headers present)"
+    try:
+        body = resp.text or ""
+    except Exception as ex:
+        body = f"(could not read body: {type(ex).__name__}: {ex})"
+    collapsed = " ".join(body.split())
+    n = len(collapsed)
+    excerpt = collapsed if n <= head + tail else (
+        f"{collapsed[:head]} …[+{n - head - tail} chars]… {collapsed[-tail:]}"
+    )
+    log.error("HTTP DIAGNOSTIC [%s]: status=%s body_len=%d", context, status, n)
+    log.error("HTTP DIAGNOSTIC [%s]: headers=[%s]", context, hdr_str)
+    log.error("HTTP DIAGNOSTIC [%s]: body=%s", context, excerpt)
+
+
 def verify_one(
     session: requests.Session,
     url: str | None,
@@ -484,6 +537,8 @@ def verify_one(
         return _empty_result(url, SOURCE_FETCH_FAIL, status=str(e)[:160])
 
     if r.status_code != 200:
+        if r.status_code in (401, 403, 429, 503) and _diag_take():
+            _log_http_diagnostic(r, context=f"fireCrmEvent GET {url}")
         return _empty_result(url, SOURCE_FETCH_FAIL, status=r.status_code)
 
     parsed = parse_fire_crm(r.text)
