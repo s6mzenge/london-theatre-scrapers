@@ -136,7 +136,7 @@ import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from urllib.parse import urljoin
@@ -161,6 +161,29 @@ DEFAULT_HEADERS = {
 
 DEFAULT_CONCURRENCY = 16
 DEFAULT_TIMEOUT_S = 15
+
+# Throttle defaults. SeatPlan sits behind AWS WAF, which serves a JavaScript
+# challenge (HTTP 202 + gokuProps) once an egress IP exceeds a request rate —
+# our requests-based fetcher can't solve that challenge. Empirically the IP
+# stays clean for ~400 requests then gets challenged, and the counter resets
+# between the 15-min-spaced runs. Pacing the pass to a sustained rate below
+# that threshold keeps every request answered. 1.2 req/s ≈ 360 per 5 min,
+# comfortably under the observed ~380-450 trip point.
+DEFAULT_MAX_RATE = 1.2          # requests/second; <=0 disables pacing
+DEFAULT_MAX_SECONDS = 0.0       # wall-clock budget; <=0 disables (CI sets this)
+
+# Persistent verified-price cache. With pacing the full pass takes ~14 min; if
+# a wall-clock budget cuts it short (or a stray 202 slips through), the perfs
+# we didn't freshly verify carry their last real price forward instead of
+# reverting to SeatPlan's catalogue lowPrice (a stale marketing headline).
+PRICE_CACHE_VERSION = 1
+DEFAULT_PRICE_CACHE_TTL_HOURS = 48
+_PRICE_FIELDS = (
+    "verified_min_price", "verified_max_price", "verified_price",
+    "verified_is_discounted", "verified_is_no_booking_fee",
+    "verified_price_source", "verified_status", "verified_url",
+    "verified_checked_at",
+)
 
 RETRY_TOTAL = 3
 RETRY_BACKOFF = 0.5
@@ -614,6 +637,70 @@ def iter_perfs_to_check(
     return out
 
 
+class _RateLimiter:
+    """Thread-safe global pacer. Hands out request slots no closer together
+    than `interval` seconds, so the combined rate across all worker threads
+    stays at or below `rate_per_s`. interval<=0 disables pacing.
+    """
+
+    def __init__(self, rate_per_s: float) -> None:
+        self._interval = (1.0 / rate_per_s) if rate_per_s and rate_per_s > 0 else 0.0
+        self._lock = Lock()
+        self._next = 0.0
+
+    def wait(self) -> None:
+        if self._interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            start = self._next if self._next > now else now
+            self._next = start + self._interval
+            delay = start - now
+        if delay > 0:
+            time.sleep(delay)
+
+
+def _load_price_cache(path: Path | None) -> dict:
+    if not path:
+        return {}
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if isinstance(raw, dict) and isinstance(raw.get("entries"), dict):
+        return raw["entries"]
+    return {}
+
+
+def _save_price_cache(path: Path | None, entries: dict) -> None:
+    if not path:
+        return
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        tmp = Path(str(path) + ".tmp")
+        tmp.write_text(
+            json.dumps({"version": PRICE_CACHE_VERSION, "entries": entries},
+                       ensure_ascii=False),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except OSError as e:
+        log.warning("could not write price cache %s: %s", path, e)
+
+
+def _price_entry_fresh(entry: dict, now: datetime, ttl: timedelta) -> bool:
+    ts = entry.get("verified_checked_at")
+    if not ts:
+        return False
+    try:
+        dt = datetime.fromisoformat(ts)
+    except ValueError:
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (now - dt) <= ttl
+
+
 def run(
     payload: dict,
     *,
@@ -622,6 +709,10 @@ def run(
     include_past: bool,
     proxy_url: str | None = None,
     proxy_token: str | None = None,
+    max_rate: float = DEFAULT_MAX_RATE,
+    max_seconds: float = DEFAULT_MAX_SECONDS,
+    price_cache_path: Path | None = None,
+    price_cache_ttl_hours: int = DEFAULT_PRICE_CACHE_TTL_HOURS,
 ) -> dict:
     """Run verification in place on payload['shows'][i]['performances'][j].
 
@@ -663,11 +754,32 @@ def run(
         proxy_token=proxy_token,
     )
 
+    limiter = _RateLimiter(max_rate)
+    t0 = time.monotonic()
+    deadline = (t0 + max_seconds) if max_seconds and max_seconds > 0 else None
+    budget_skipped = {"n": 0}
+
+    if max_rate and max_rate > 0:
+        log.info(
+            "Pacing at <=%.2f req/s%s",
+            max_rate,
+            f"; wall-clock budget {max_seconds:.0f}s" if deadline else "",
+        )
+
     def _job(task: tuple[int, int, str | None]) -> tuple[int, int, dict]:
         si, pi, url = task
+        if not url:
+            # Unusable date/time — instant SKIPPED, no fetch, no pacing.
+            return si, pi, verify_one(session, url)
+        if deadline is not None and time.monotonic() >= deadline:
+            # Out of wall-clock budget: short-circuit without fetching. The
+            # price-cache merge below carries this perf's last real price.
+            with progress_lock:
+                budget_skipped["n"] += 1
+            return si, pi, _empty_result(url, SOURCE_SKIPPED, status="budget")
+        limiter.wait()
         return si, pi, verify_one(session, url)
 
-    t0 = time.monotonic()
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = [pool.submit(_job, t) for t in tasks]
         for fut in as_completed(futures):
@@ -706,6 +818,48 @@ def run(
             for reason, n in sorted(_fail_tally.items(), key=lambda kv: -kv[1])
         )
         log.info("fetch_failed breakdown: %s", breakdown)
+    if budget_skipped["n"]:
+        log.info(
+            "Budget reached — %d performance(s) not fetched this run "
+            "(carried forward from price cache where available)",
+            budget_skipped["n"],
+        )
+
+    # --- Price-cache merge ------------------------------------------------
+    # For perfs verified OK this run, refresh the cache. For perfs we could
+    # NOT fetch (fetch_failed, or budget-skipped), overlay the last real
+    # price from the cache so they don't fall back to SeatPlan's catalogue
+    # lowPrice. no_seats is left untouched (respect a genuine sold-out), and
+    # its stale entry is allowed to age out. Entries are pruned to URLs seen
+    # this run and to within the TTL, which bounds the file size.
+    carried = fresh = 0
+    if price_cache_path:
+        prev = _load_price_cache(price_cache_path)
+        now = datetime.now(timezone.utc)
+        ttl = timedelta(hours=price_cache_ttl_hours)
+        new_entries: dict = {}
+        for si, pi, url in tasks:
+            if not url:
+                continue
+            perf = payload["shows"][si]["performances"][pi]
+            src = perf.get("verified_price_source")
+            if src == SOURCE_OK:
+                new_entries[url] = {k: perf.get(k) for k in _PRICE_FIELDS}
+                fresh += 1
+            elif src in (SOURCE_FETCH_FAIL, SOURCE_SKIPPED):
+                entry = prev.get(url)
+                if entry and _price_entry_fresh(entry, now, ttl):
+                    for k in _PRICE_FIELDS:
+                        if k in entry:
+                            perf[k] = entry[k]
+                    perf["verified_price_cached"] = True
+                    new_entries[url] = entry
+                    carried += 1
+        _save_price_cache(price_cache_path, new_entries)
+        log.info(
+            "Price cache: %d fresh, %d carried-forward, %d entries saved",
+            fresh, carried, len(new_entries),
+        )
 
     summary = {
         "verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -714,6 +868,7 @@ def run(
         "no_seats": counts[SOURCE_NO_SEATS],
         "fetch_failed": counts[SOURCE_FETCH_FAIL],
         "skipped": counts[SOURCE_SKIPPED],
+        "carried_forward": carried,
         "duration_seconds": round(elapsed, 1),
     }
 
@@ -1222,6 +1377,35 @@ def main(argv: list[str] | None = None) -> int:
              "$OLT_PROXY_TOKEN. Must match the worker's bound "
              "PROXY_TOKEN secret.",
     )
+    p.add_argument(
+        "--max-rate", type=float, default=DEFAULT_MAX_RATE, metavar="RPS",
+        help=f"Cap the fireCrmEvent pass at this many requests/second "
+             f"across all workers (default: {DEFAULT_MAX_RATE}). SeatPlan's "
+             f"AWS WAF challenges an egress IP that bursts too fast; pacing "
+             f"below the threshold keeps every request answered. Set <=0 to "
+             f"disable pacing.",
+    )
+    p.add_argument(
+        "--max-seconds", type=float, default=DEFAULT_MAX_SECONDS, metavar="SECS",
+        help="Wall-clock budget for the fireCrmEvent pass. Once exceeded, "
+             "remaining performances are skipped without fetching (and keep "
+             "their cached price). Use this in CI to guarantee the job "
+             "finishes before the next scheduled run. Default 0 = no budget.",
+    )
+    p.add_argument(
+        "--price-cache", type=Path, default=None,
+        help="Path to a JSON cache of last-known verified prices. When set, "
+             "performances that couldn't be fetched this run (budget-skipped "
+             "or WAF-challenged) carry their last real price forward instead "
+             "of reverting to SeatPlan's catalogue lowPrice. Omit to disable.",
+    )
+    p.add_argument(
+        "--price-cache-ttl-hours", type=int,
+        default=DEFAULT_PRICE_CACHE_TTL_HOURS,
+        help=f"How long a cached price stays usable for carry-forward "
+             f"(default: {DEFAULT_PRICE_CACHE_TTL_HOURS}h). Older entries are "
+             f"dropped rather than shown.",
+    )
     args = p.parse_args(argv)
 
     if args.proxy_url:
@@ -1252,6 +1436,10 @@ def main(argv: list[str] | None = None) -> int:
         include_past=args.include_past,
         proxy_url=args.proxy_url,
         proxy_token=args.proxy_token,
+        max_rate=args.max_rate,
+        max_seconds=args.max_seconds,
+        price_cache_path=args.price_cache,
+        price_cache_ttl_hours=args.price_cache_ttl_hours,
     )
 
     # Second pass: chip re-verification for suspect performances.
