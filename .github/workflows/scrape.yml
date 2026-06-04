@@ -244,6 +244,14 @@ jobs:
           if [ -n "${{ inputs.limit }}" ]; then
             ARGS="--limit ${{ inputs.limit }}"
           fi
+          # SeatPlan is proxied via the AWS Lambda, whose parallelism is bounded
+          # by the AWS account's "Concurrent executions" quota (low on new
+          # accounts, ~10). Cap SeatPlan workers below that so the Lambda doesn't
+          # return 429 ConcurrentInvocationLimitExceeded. Other sources are
+          # unaffected and keep the default 16.
+          if [ "${{ matrix.name }}" = "seatplan" ]; then
+            ARGS="$ARGS --concurrency 8"
+          fi
           set +e
           python ${{ matrix.script }} $ARGS --out scraper/data/${{ matrix.name }}.json
           EXIT=$?
@@ -319,7 +327,8 @@ jobs:
         run: |
           python scraper/seatplan_availability.py \
             --in scraper/data/seatplan.json \
-            --chip-cache scraper/data/chip_cache_seatplan.json
+            --chip-cache scraper/data/chip_cache_seatplan.json \
+            --concurrency 8
 
       - name: Verify OLT per-performance availability
         if: steps.gate.outputs.run == 'true' && matrix.name == 'olt'
