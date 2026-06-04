@@ -519,6 +519,20 @@ def _log_http_diagnostic(resp, *, context, head=900, tail=400):
     log.error("HTTP DIAGNOSTIC [%s]: body=%s", context, excerpt)
 
 
+# Failure-reason tally — populated across worker threads, logged once at the
+# end of the run. This is the diagnostic that cannot miss: whatever the 610
+# failures actually are (an HTTP status from SeatPlan/CloudFront, or a
+# network-level exception like ConnectionError / ReadTimeout from the Lambda
+# being throttled or dropping the connection), they show up here bucketed.
+_fail_tally: dict[str, int] = {}
+_fail_lock = Lock()
+
+
+def _tally_fail(reason: str) -> None:
+    with _fail_lock:
+        _fail_tally[reason] = _fail_tally.get(reason, 0) + 1
+
+
 def verify_one(
     session: requests.Session,
     url: str | None,
@@ -534,10 +548,20 @@ def verify_one(
     try:
         r = session.get(url, timeout=timeout_s)
     except requests.RequestException as e:
+        # Network-level failure (no HTTP status). Bucket by exception class and
+        # capture the first few full repr strings so we can see exactly what
+        # the connection did (reset, read timeout, etc.).
+        _tally_fail(f"EXC {type(e).__name__}")
+        if _diag_take():
+            log.error("HTTP DIAGNOSTIC [fireCrmEvent GET %s]: exception %r", url, e)
         return _empty_result(url, SOURCE_FETCH_FAIL, status=str(e)[:160])
 
     if r.status_code != 200:
-        if r.status_code in (401, 403, 429, 503) and _diag_take():
+        _tally_fail(f"HTTP {r.status_code}")
+        # Capture the body/headers on ANY non-200 (capped), not just a fixed
+        # subset of codes — the earlier run printed nothing because the real
+        # status wasn't in the old gate.
+        if _diag_take():
             _log_http_diagnostic(r, context=f"fireCrmEvent GET {url}")
         return _empty_result(url, SOURCE_FETCH_FAIL, status=r.status_code)
 
@@ -676,6 +700,12 @@ def run(
         counts[SOURCE_FETCH_FAIL],
         counts[SOURCE_SKIPPED],
     )
+    if _fail_tally:
+        breakdown = ", ".join(
+            f"{reason}×{n}"
+            for reason, n in sorted(_fail_tally.items(), key=lambda kv: -kv[1])
+        )
+        log.info("fetch_failed breakdown: %s", breakdown)
 
     summary = {
         "verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
