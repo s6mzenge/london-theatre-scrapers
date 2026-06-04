@@ -224,8 +224,16 @@ jobs:
       - name: Run scraper
         if: steps.gate.outputs.run == 'true'
         env:
-          OLT_PROXY_URL: ${{ secrets.OLT_PROXY_URL }}
-          OLT_PROXY_TOKEN: ${{ secrets.OLT_PROXY_TOKEN }}
+          # SeatPlan is proxied via a separate AWS Lambda (SEATPLAN_PROXY_URL)
+          # because seatplan.com sits behind AWS / CloudFront + AWS WAF, which
+          # blocks the Cloudflare Worker's egress IPs. Routing SeatPlan through
+          # AWS's own egress (same cloud as the origin) sidesteps that block.
+          # Everything else (OLT, SeeTickets) keeps using the Cloudflare Worker
+          # via OLT_PROXY_URL. We keep the env var NAMED OLT_PROXY_URL (that's
+          # what every scraper reads); only its VALUE differs for the seatplan
+          # leg, which also uses its own dedicated token (SEATPLAN_PROXY_TOKEN).
+          OLT_PROXY_URL: ${{ matrix.name == 'seatplan' && secrets.SEATPLAN_PROXY_URL || secrets.OLT_PROXY_URL }}
+          OLT_PROXY_TOKEN: ${{ matrix.name == 'seatplan' && secrets.SEATPLAN_PROXY_TOKEN || secrets.OLT_PROXY_TOKEN }}
         # Exit code policy (matches smoke_test.py):
         #   0 = clean
         #   2 = scraper wrote output, but flagged warnings (still success)
@@ -289,10 +297,10 @@ jobs:
         # the chip pass if it ever misbehaves; fireCrmEvent values
         # will be used for all perfs in that case.
         #
-        # The fireCrmEvent pass now routes through the same OLT_PROXY_URL
-        # Worker (which has seatplan.com on its ALLOWED_HOSTS list and
-        # forwards via X-Proxy-Target), so the previous "0/386 verified"
-        # failure mode from Azure-IP blocking is fixed. The chip pass
+        # The fireCrmEvent pass now routes through the SeatPlan AWS Lambda
+        # (SEATPLAN_PROXY_URL, same egress as the scrape), so the previous
+        # "0/386 verified" failure from AWS-WAF/CloudFront blocking the
+        # Cloudflare Worker's egress is fixed. The chip pass
         # is still direct — it uses Playwright, which doesn't share
         # the requests-based proxy plumbing; if SeatPlan blocks the
         # browser-driven chip pass, this step exits 2 but
@@ -303,8 +311,11 @@ jobs:
         if: steps.gate.outputs.run == 'true' && matrix.name == 'seatplan'
         continue-on-error: true
         env:
-          OLT_PROXY_URL: ${{ secrets.OLT_PROXY_URL }}
-          OLT_PROXY_TOKEN: ${{ secrets.OLT_PROXY_TOKEN }}
+          # Same Lambda egress as the SeatPlan scrape (see "Run scraper").
+          # The fireCrmEvent pass hits seatplan.com ~254x/run; the chip pass
+          # below is unaffected (Playwright, runner-direct, continue-on-error).
+          OLT_PROXY_URL: ${{ secrets.SEATPLAN_PROXY_URL }}
+          OLT_PROXY_TOKEN: ${{ secrets.SEATPLAN_PROXY_TOKEN }}
         run: |
           python scraper/seatplan_availability.py \
             --in scraper/data/seatplan.json \
