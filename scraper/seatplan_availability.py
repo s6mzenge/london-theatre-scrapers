@@ -132,6 +132,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -162,14 +163,15 @@ DEFAULT_HEADERS = {
 DEFAULT_CONCURRENCY = 16
 DEFAULT_TIMEOUT_S = 15
 
-# Throttle defaults. SeatPlan sits behind AWS WAF, which serves a JavaScript
-# challenge (HTTP 202 + gokuProps) once an egress IP exceeds a request rate —
-# our requests-based fetcher can't solve that challenge. Empirically the IP
-# stays clean for ~400 requests then gets challenged, and the counter resets
-# between the 15-min-spaced runs. Pacing the pass to a sustained rate below
-# that threshold keeps every request answered. 1.2 req/s ≈ 360 per 5 min,
-# comfortably under the observed ~380-450 trip point.
-DEFAULT_MAX_RATE = 1.2          # requests/second; <=0 disables pacing
+# Throttle knobs. SeatPlan sits behind AWS WAF, which serves a JavaScript
+# challenge (HTTP 202 + gokuProps) that our requests-based fetcher can't solve.
+# IMPORTANT, learned the hard way: the clean window is a brief WALL-CLOCK grace
+# (~20-40s from the start of the pass), NOT a request budget. Bursting fills
+# that grace with ~400-600 requests; pacing wastes it (1.2 req/s got only ~46
+# through). So pacing is OFF by default — we burst to capture the most per run,
+# shuffle the order so a different slice lands in the grace each run, and lean
+# on the price cache for the rest. --max-rate is retained only for experiments.
+DEFAULT_MAX_RATE = 0.0          # requests/second; <=0 disables pacing (default)
 DEFAULT_MAX_SECONDS = 0.0       # wall-clock budget; <=0 disables (CI sets this)
 
 # Persistent verified-price cache. With pacing the full pass takes ~14 min; if
@@ -713,6 +715,7 @@ def run(
     max_seconds: float = DEFAULT_MAX_SECONDS,
     price_cache_path: Path | None = None,
     price_cache_ttl_hours: int = DEFAULT_PRICE_CACHE_TTL_HOURS,
+    shuffle: bool = False,
 ) -> dict:
     """Run verification in place on payload['shows'][i]['performances'][j].
 
@@ -726,6 +729,12 @@ def run(
     """
     today_iso = datetime.now(timezone.utc).date().isoformat()
     tasks = iter_perfs_to_check(payload, today_iso, include_past=include_past)
+    if shuffle:
+        # The WAF grace window covers only the first chunk of requests by
+        # wall-clock; randomising submission order spreads which performances
+        # land inside it, so successive runs refresh different slices and the
+        # catalogue rolls to full coverage (combined with the price cache).
+        random.shuffle(tasks)
     if limit is not None:
         tasks = tasks[:limit]
         log.info("--limit %d applied", limit)
@@ -1406,6 +1415,14 @@ def main(argv: list[str] | None = None) -> int:
              f"(default: {DEFAULT_PRICE_CACHE_TTL_HOURS}h). Older entries are "
              f"dropped rather than shown.",
     )
+    p.add_argument(
+        "--shuffle", action="store_true",
+        help="Randomise the order performances are fetched. SeatPlan's AWS "
+             "WAF only lets a brief burst through before challenging, so "
+             "shuffling spreads which performances land in that window — "
+             "successive runs refresh different slices and (with --price-cache) "
+             "the catalogue rolls to full coverage over a few runs.",
+    )
     args = p.parse_args(argv)
 
     if args.proxy_url:
@@ -1440,6 +1457,7 @@ def main(argv: list[str] | None = None) -> int:
         max_seconds=args.max_seconds,
         price_cache_path=args.price_cache,
         price_cache_ttl_hours=args.price_cache_ttl_hours,
+        shuffle=args.shuffle,
     )
 
     # Second pass: chip re-verification for suspect performances.
