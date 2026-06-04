@@ -936,24 +936,27 @@ async def _browser_fetch_async(
                 status = r.get("status", -1)
                 fire = r.get("fire") or ""
                 is_challenge = bool(r.get("challenge")) or status == 202
-                if is_challenge:
-                    challenged += 1
-                    if not challenge_logged:
-                        log.info("browser pass: WAF challenge seen (HTTP 202) — "
-                                 "re-solving token and retrying affected URLs")
-                        challenge_logged = True
+                is_transient = status == -1  # in-page fetch threw; not a WAF verdict
+                if is_challenge or is_transient:
+                    if is_challenge:
+                        challenged += 1
+                        if not challenge_logged:
+                            log.info("browser pass: WAF challenge seen (HTTP 202) "
+                                     "— re-solving token and retrying affected URLs")
+                            challenge_logged = True
                     if it["attempt"] < BROWSER_MAX_ATTEMPTS:
                         it["attempt"] += 1
                         requeue.append(it)
                         continue
-                    # Retries exhausted — record as fetch_failed (carried by cache).
-                    _tally_fail("HTTP 202")
+                    # Retries exhausted — record the failure (carried by cache).
+                    reason = "HTTP 202" if is_challenge else "HTTP -1"
+                    _tally_fail(reason)
                     _apply_result(payload, it["si"], it["pi"],
                                   _empty_result(it["url"], SOURCE_FETCH_FAIL,
-                                                status=202),
+                                                status=(202 if is_challenge else -1)),
                                   counts, counts_lock, progress, progress_lock, total)
                     continue
-                # Not a challenge → build the result the shared way.
+                # Clean response → build the result the shared way.
                 _apply_result(payload, it["si"], it["pi"],
                               _result_from_html(it["url"], status, fire),
                               counts, counts_lock, progress, progress_lock, total)
@@ -1245,7 +1248,7 @@ async def _chip_block_heavy(route) -> None:
 # Used to wait for hydration before the stability poll begins.
 _CHIP_FIRST_PRICE_JS = """() => {
   const re = /£\\s*(\\d{1,4}(?:\\.\\d{1,2})?)/g;
-  const t = document.body.innerText || '';
+  const t = (document.body && document.body.innerText) || '';
   let m;
   while ((m = re.exec(t)) !== null) {
     const v = parseFloat(m[1]);
@@ -1280,8 +1283,11 @@ async def _chip_extract_one(context, url: str
             await page.wait_for_function(
                 _CHIP_FIRST_PRICE_JS, timeout=CHIP_FIRST_PRICE_TIMEOUT,
             )
-        except PWTimeout:
-            # Continue anyway — scan below will report no-price if so.
+        except Exception:
+            # Continue anyway — the scan below reports no-price if needed. This
+            # catches the predicate *throwing* (e.g. document.body momentarily
+            # null during a WAF-challenge reload), not just PWTimeout; either
+            # way we fall through to the stability poll.
             pass
 
         prev: frozenset[float] | None = None
@@ -1340,9 +1346,13 @@ async def _chip_worker(name: str, browser, queue: asyncio.Queue,
                 item = queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
-            chip_min, chip_max, candidates, note = await _chip_extract_one(
-                context, item["url"]
-            )
+            try:
+                chip_min, chip_max, candidates, note = await _chip_extract_one(
+                    context, item["url"]
+                )
+            except Exception as e:  # noqa: BLE001 — one bad row must not kill the pass
+                chip_min = chip_max = None
+                candidates, note = [], f"chip error — {type(e).__name__}: {e}"
             async with lock:
                 counter[0] += 1
                 results[item["key"]] = (chip_min, chip_max, candidates, note)
@@ -1381,7 +1391,10 @@ async def _chip_pass_async(suspect_items: list[dict],
             )
             for i in range(workers)
         ]
-        await asyncio.gather(*tasks, return_exceptions=False)
+        # return_exceptions=True so a single worker failing can't cancel its
+        # siblings mid-flight — that cascade is what produced the wall of
+        # TargetClosedError tracebacks.
+        await asyncio.gather(*tasks, return_exceptions=True)
         try: await browser.close()
         except Exception: pass
     return results
