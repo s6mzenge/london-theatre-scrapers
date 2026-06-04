@@ -136,6 +136,7 @@ import random
 import re
 import sys
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -274,6 +275,72 @@ Object.defineProperty(navigator, 'languages', { get: () => ['en-GB', 'en'] });
 CHIP_SOURCE_OK         = "chips"           # extracted chip min/max, trust these
 CHIP_SOURCE_NO_CHIPS   = "no_chips_found"  # page loaded but no plausible £-amount
 CHIP_SOURCE_FETCH_FAIL = "fetch_failed"    # browser navigation or render error
+
+# ---------------------------------------------------------------------------
+# Browser-fetch config (fireCrmEvent pass, fetch-mode "browser")
+# ---------------------------------------------------------------------------
+# The fireCrmEvent pass has two fetch modes:
+#
+#   "requests" — a ThreadPool of requests.get() calls, optionally via the
+#                proxy. Fast, but SeatPlan's AWS WAF serves a JavaScript
+#                challenge (HTTP 202 + window.gokuProps) once an egress IP
+#                bursts past its grace, and a plain HTTP client can't solve
+#                JS — so only the first slice of each run verifies. Paired
+#                with --price-cache + --shuffle, coverage rolls to full over
+#                several runs (last-known prices carry forward in between).
+#
+#   "browser"  — fetch EVERY ticketing URL through one headless-Chromium
+#                context that has solved the WAF challenge. A single warm-up
+#                navigation lets Chromium run the AWS WAF challenge JS (the
+#                very thing the chip pass relies on every run) and bank an
+#                aws-waf-token cookie; subsequent *in-page* fetch() calls run
+#                on the browser's real network stack, so they carry that token
+#                and clear the WAF. Result: all performances verify each run,
+#                direct from this host's IP — the proxy isn't used. If the
+#                token's immunity window lapses mid-sweep (a 202 reappears),
+#                we re-navigate to re-solve and retry the affected URLs.
+#
+# Why in-page fetch() and not Playwright's APIRequestContext or a cookie
+# lifted into `requests`: AWS WAF tokens can be bound to the client that
+# solved them (TLS/fingerprint + cookie), so the robust path is to fetch with
+# the exact browser identity that earned the token — i.e. from inside the page.
+BROWSER_MAX_CONC        = 12        # in-page fetch concurrency (JS promise pool)
+BROWSER_CHUNK           = 120       # URLs handed to each page.evaluate() round-trip
+BROWSER_NAV_TIMEOUT_MS  = 30_000
+BROWSER_RESOLVE_SLEEP_S = 5.0       # let the challenge JS solve + set the cookie
+BROWSER_MAX_ATTEMPTS    = 2         # per-URL tries (one retry after a re-solve)
+BROWSER_MAX_EVALS       = 60        # hard safety cap on evaluate() round-trips
+
+# In-page fetch pool. Single arg [items, conc] where items = [{idx, url}].
+# Returns [{idx, status, fire, challenge}] — `fire` is the matched
+# fireCrmEvent('Viewed Performance', {...}) block substring (parsed in Python
+# by parse_fire_crm, the single source of truth), and `challenge` flags an AWS
+# WAF interstitial body. Returning only the block substring (not the whole
+# ~30 KB page) keeps the CDP bridge light across ~1,100 URLs.
+_BROWSER_POOL_JS = r"""
+async ([items, conc]) => {
+  const out = [];
+  let i = 0;
+  const reBlock = /fireCrmEvent\(\s*['"]Viewed Performance['"]\s*,\s*\{[^}]*\}/;
+  async function worker() {
+    while (i < items.length) {
+      const it = items[i++];
+      try {
+        const r = await fetch(it.url, {credentials: 'include',
+                                       headers: {'Accept': 'text/html'}});
+        const t = await r.text();
+        const m = t.match(reBlock);
+        out.push({idx: it.idx, status: r.status, fire: m ? m[0] : "",
+                  challenge: t.indexOf('gokuProps') !== -1});
+      } catch (e) {
+        out.push({idx: it.idx, status: -1, fire: "", challenge: false});
+      }
+    }
+  }
+  await Promise.all(Array.from({length: conc}, () => worker()));
+  return out;
+}
+"""
 
 logging.basicConfig(
     level=logging.INFO,
@@ -558,14 +625,48 @@ def _tally_fail(reason: str) -> None:
         _fail_tally[reason] = _fail_tally.get(reason, 0) + 1
 
 
+def _result_from_html(url: str | None, status_code, html: str) -> dict:
+    """Build the verified-price dict from one fetched ticketing page.
+
+    Shared by both fetch modes (the requests `verify_one` and the browser
+    pass), so the parse→result mapping — and therefore the downstream
+    price-cache merge — is identical no matter how the HTML was obtained.
+    `status_code` is a real HTTP code (or a sentinel like -1); anything other
+    than 200 is treated as a fetch failure and tallied. Never raises.
+    """
+    if status_code != 200:
+        _tally_fail(f"HTTP {status_code}")
+        return _empty_result(url, SOURCE_FETCH_FAIL, status=status_code)
+
+    parsed = parse_fire_crm(html)
+    if parsed is None:
+        # Page loaded but no Viewed-Performance tracking call. Most
+        # commonly: sold-out redirect, off-sale page, or layout change.
+        # Treat as no-seats; price_source surfaces the distinction.
+        return _empty_result(url, SOURCE_NO_SEATS, status=status_code)
+
+    result = _empty_result(url, SOURCE_OK, status=status_code)
+    result["verified_min_price"]         = parsed["min_price"]
+    result["verified_max_price"]         = parsed["max_price"]
+    result["verified_price"]             = parsed["price"]
+    result["verified_is_discounted"]     = parsed["is_discounted"]
+    result["verified_is_no_booking_fee"] = parsed["is_no_booking_fee"]
+
+    if parsed["min_price"] is None:
+        # Tracking call present but missing the price field. Unusual —
+        # mark as no_seats so the dedupe layer drops it cleanly.
+        result["verified_price_source"] = SOURCE_NO_SEATS
+
+    return result
+
+
 def verify_one(
     session: requests.Session,
     url: str | None,
     timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> dict:
-    """Fetch one ticketing page and return the verified-price dict.
-
-    Never raises — failures surface in verified_price_source / verified_status.
+    """Fetch one ticketing page (requests mode) and return the verified-price
+    dict. Never raises — failures surface in verified_price_source/status.
     """
     if not url:
         return _empty_result(url, SOURCE_SKIPPED)
@@ -581,35 +682,12 @@ def verify_one(
             log.error("HTTP DIAGNOSTIC [fireCrmEvent GET %s]: exception %r", url, e)
         return _empty_result(url, SOURCE_FETCH_FAIL, status=str(e)[:160])
 
-    if r.status_code != 200:
-        _tally_fail(f"HTTP {r.status_code}")
-        # Capture the body/headers on ANY non-200 (capped), not just a fixed
-        # subset of codes — the earlier run printed nothing because the real
-        # status wasn't in the old gate.
-        if _diag_take():
-            _log_http_diagnostic(r, context=f"fireCrmEvent GET {url}")
-        return _empty_result(url, SOURCE_FETCH_FAIL, status=r.status_code)
+    # Capture the body/headers on ANY non-200 (capped) before delegating to the
+    # shared result builder, which does the tally + result construction.
+    if r.status_code != 200 and _diag_take():
+        _log_http_diagnostic(r, context=f"fireCrmEvent GET {url}")
 
-    parsed = parse_fire_crm(r.text)
-    if parsed is None:
-        # Page loaded but no Viewed-Performance tracking call. Most
-        # commonly: sold-out redirect, off-sale page, or layout change.
-        # Treat as no-seats; price_source surfaces the distinction.
-        return _empty_result(url, SOURCE_NO_SEATS, status=r.status_code)
-
-    result = _empty_result(url, SOURCE_OK, status=r.status_code)
-    result["verified_min_price"]         = parsed["min_price"]
-    result["verified_max_price"]         = parsed["max_price"]
-    result["verified_price"]             = parsed["price"]
-    result["verified_is_discounted"]     = parsed["is_discounted"]
-    result["verified_is_no_booking_fee"] = parsed["is_no_booking_fee"]
-
-    if parsed["min_price"] is None:
-        # Tracking call present but missing the price field. Unusual —
-        # mark as no_seats so the dedupe layer drops it cleanly.
-        result["verified_price_source"] = SOURCE_NO_SEATS
-
-    return result
+    return _result_from_html(url, r.status_code, r.text)
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +781,224 @@ def _price_entry_fresh(entry: dict, now: datetime, ttl: timedelta) -> bool:
     return (now - dt) <= ttl
 
 
+# ---------------------------------------------------------------------------
+# Browser fetch pass (fireCrmEvent pass, fetch-mode "browser")
+# ---------------------------------------------------------------------------
+
+def _apply_result(payload: dict, si: int, pi: int, out: dict,
+                  counts: dict, counts_lock: Lock,
+                  progress: dict, progress_lock: Lock, total: int) -> None:
+    """Write one verified result into payload and update the shared counters —
+    the same bookkeeping the requests ThreadPool loop does, factored out so the
+    browser pass yields identical counts/progress and the downstream
+    price-cache merge + summary are reached unchanged."""
+    payload["shows"][si]["performances"][pi].update(out)
+    src = out["verified_price_source"]
+    with counts_lock:
+        counts[src] = counts.get(src, 0) + 1
+    with progress_lock:
+        progress["n"] += 1
+        if progress["n"] % 100 == 0:
+            log.info(
+                "  progress: %d/%d  (ok=%d, no_seats=%d, fail=%d)",
+                progress["n"], total,
+                counts[SOURCE_OK], counts[SOURCE_NO_SEATS],
+                counts[SOURCE_FETCH_FAIL],
+            )
+
+
+async def _browser_fetch_async(
+    tasks: list[tuple[int, int, str | None]], payload: dict, *,
+    concurrency: int, max_seconds: float,
+    counts: dict, counts_lock: Lock, progress: dict, progress_lock: Lock,
+    budget_skipped: dict, total: int,
+) -> None:
+    """Verify every task by fetching its ticketing URL through one
+    WAF-solved headless-Chromium context (in-page fetch). Writes results into
+    payload exactly like the requests loop, so run()'s cache merge is shared."""
+    from playwright.async_api import async_playwright
+
+    # url==None → instant SKIPPED (no fetch); collect the rest to fetch.
+    usable: list[dict] = []
+    for (si, pi, url) in tasks:
+        if not url:
+            _apply_result(payload, si, pi, _empty_result(url, SOURCE_SKIPPED),
+                          counts, counts_lock, progress, progress_lock, total)
+        else:
+            usable.append({"si": si, "pi": pi, "url": url, "attempt": 1})
+    if not usable:
+        return
+
+    conc = min(max(int(concurrency), 1), BROWSER_MAX_CONC)
+    warm_url = usable[0]["url"]
+    loop = asyncio.get_running_loop()
+    deadline = (loop.time() + max_seconds) if max_seconds and max_seconds > 0 else None
+
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+        except Exception as e:
+            # Chromium unavailable — mark every usable perf fetch_failed so the
+            # price cache carries last-known prices (never worse than today).
+            log.error("browser pass: could not launch Chromium — %s", e)
+            log.error("  run: python -m playwright install chromium")
+            for it in usable:
+                _tally_fail("EXC ChromiumLaunch")
+                _apply_result(payload, it["si"], it["pi"],
+                              _empty_result(it["url"], SOURCE_FETCH_FAIL,
+                                            status="chromium-launch"),
+                              counts, counts_lock, progress, progress_lock, total)
+            return
+
+        context = await browser.new_context(
+            viewport={"width": 1400, "height": 900},
+            user_agent=CHIP_UA, locale="en-GB", timezone_id="Europe/London",
+            extra_http_headers={"Accept-Language": "en-GB,en;q=0.9"},
+        )
+        await context.route("**/*", _chip_block_heavy)
+        await context.add_init_script(CHIP_STEALTH_JS)
+        page = await context.new_page()
+
+        async def solve_token() -> None:
+            """Navigate to a ticketing page so Chromium runs the AWS WAF
+            challenge JS and (re)sets the aws-waf-token cookie on the context."""
+            try:
+                await page.goto(warm_url, wait_until="domcontentloaded",
+                                timeout=BROWSER_NAV_TIMEOUT_MS)
+            except Exception as e:
+                log.warning("browser pass: token nav error — %s", type(e).__name__)
+            await asyncio.sleep(BROWSER_RESOLVE_SLEEP_S)
+
+        await solve_token()
+        try:
+            names = sorted({c["name"] for c in await context.cookies()})
+            log.info("browser pass: token primed; context cookies: %s",
+                     names or "(none)")
+        except Exception:
+            pass
+
+        pending: deque = deque(usable)
+        evals = 0
+        challenge_logged = False
+        while pending:
+            # Wall-clock budget: carry the remainder via the price cache.
+            if deadline is not None and loop.time() >= deadline:
+                n = 0
+                while pending:
+                    it = pending.popleft()
+                    with progress_lock:
+                        budget_skipped["n"] += 1
+                    _apply_result(payload, it["si"], it["pi"],
+                                  _empty_result(it["url"], SOURCE_SKIPPED,
+                                                status="budget"),
+                                  counts, counts_lock, progress, progress_lock, total)
+                    n += 1
+                log.info("browser pass: wall-clock budget reached — %d "
+                         "performance(s) carried from price cache", n)
+                break
+            if evals >= BROWSER_MAX_EVALS:
+                while pending:
+                    it = pending.popleft()
+                    _tally_fail("eval-cap")
+                    _apply_result(payload, it["si"], it["pi"],
+                                  _empty_result(it["url"], SOURCE_FETCH_FAIL,
+                                                status="eval-cap"),
+                                  counts, counts_lock, progress, progress_lock, total)
+                log.warning("browser pass: hit evaluate() safety cap (%d) — "
+                            "remaining perfs carried from cache", BROWSER_MAX_EVALS)
+                break
+
+            chunk = [pending.popleft()
+                     for _ in range(min(BROWSER_CHUNK, len(pending)))]
+            items_js = [{"idx": i, "url": it["url"]} for i, it in enumerate(chunk)]
+            try:
+                out = await page.evaluate(_BROWSER_POOL_JS, [items_js, conc])
+                evals += 1
+            except Exception as e:
+                # Whole batch failed at the CDP bridge — re-solve and retry it
+                # once without advancing attempt counts (not a WAF verdict).
+                log.warning("browser pass: evaluate error — %s; re-solving",
+                            type(e).__name__)
+                for it in reversed(chunk):
+                    pending.appendleft(it)
+                await solve_token()
+                evals += 1
+                continue
+
+            by_idx = {r.get("idx"): r for r in (out or [])}
+            requeue: list[dict] = []
+            challenged = 0
+            for i, it in enumerate(chunk):
+                r = by_idx.get(i) or {"status": -1, "fire": "", "challenge": False}
+                status = r.get("status", -1)
+                fire = r.get("fire") or ""
+                is_challenge = bool(r.get("challenge")) or status == 202
+                if is_challenge:
+                    challenged += 1
+                    if not challenge_logged:
+                        log.info("browser pass: WAF challenge seen (HTTP 202) — "
+                                 "re-solving token and retrying affected URLs")
+                        challenge_logged = True
+                    if it["attempt"] < BROWSER_MAX_ATTEMPTS:
+                        it["attempt"] += 1
+                        requeue.append(it)
+                        continue
+                    # Retries exhausted — record as fetch_failed (carried by cache).
+                    _tally_fail("HTTP 202")
+                    _apply_result(payload, it["si"], it["pi"],
+                                  _empty_result(it["url"], SOURCE_FETCH_FAIL,
+                                                status=202),
+                                  counts, counts_lock, progress, progress_lock, total)
+                    continue
+                # Not a challenge → build the result the shared way.
+                _apply_result(payload, it["si"], it["pi"],
+                              _result_from_html(it["url"], status, fire),
+                              counts, counts_lock, progress, progress_lock, total)
+
+            if requeue:
+                # A challenged chunk means the token died (immunity elapsed or
+                # rate-tripped); re-solve before the retries get their turn.
+                if challenged >= max(3, len(chunk) // 4):
+                    await solve_token()
+                for it in requeue:
+                    pending.append(it)
+
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+
+def _run_browser_fetch(tasks: list[tuple[int, int, str | None]],
+                       payload: dict, **kw) -> None:
+    """Sync entry point for the browser pass. Guarantees that even a
+    catastrophic failure leaves every performance marked, so run()'s
+    price-cache carry-forward still fires and we're never worse than the
+    requests path."""
+    try:
+        asyncio.run(_browser_fetch_async(tasks, payload, **kw))
+    except Exception as e:  # noqa: BLE001 — defend the whole pipeline
+        log.error("browser pass crashed (%s) — marking unfetched perfs as "
+                  "fetch_failed so cached prices carry forward", e)
+        counts, counts_lock = kw["counts"], kw["counts_lock"]
+        progress, progress_lock = kw["progress"], kw["progress_lock"]
+        total = kw["total"]
+        for (si, pi, url) in tasks:
+            perf = payload["shows"][si]["performances"][pi]
+            if perf.get("verified_price_source"):
+                continue  # already recorded before the crash
+            if url:
+                _tally_fail("EXC BrowserPass")
+                out = _empty_result(url, SOURCE_FETCH_FAIL, status="crash")
+            else:
+                out = _empty_result(url, SOURCE_SKIPPED)
+            _apply_result(payload, si, pi, out, counts, counts_lock,
+                          progress, progress_lock, total)
+
+
 def run(
     payload: dict,
     *,
@@ -716,6 +1012,7 @@ def run(
     price_cache_path: Path | None = None,
     price_cache_ttl_hours: int = DEFAULT_PRICE_CACHE_TTL_HOURS,
     shuffle: bool = False,
+    fetch_mode: str = "requests",
 ) -> dict:
     """Run verification in place on payload['shows'][i]['performances'][j].
 
@@ -757,60 +1054,75 @@ def run(
     progress = {"n": 0}
     progress_lock = Lock()
 
-    session = build_session(
-        pool_size=max(concurrency, 8),
-        proxy_url=proxy_url,
-        proxy_token=proxy_token,
-    )
-
-    limiter = _RateLimiter(max_rate)
     t0 = time.monotonic()
-    deadline = (t0 + max_seconds) if max_seconds and max_seconds > 0 else None
     budget_skipped = {"n": 0}
 
-    if max_rate and max_rate > 0:
+    if fetch_mode == "browser":
         log.info(
-            "Pacing at <=%.2f req/s%s",
-            max_rate,
-            f"; wall-clock budget {max_seconds:.0f}s" if deadline else "",
+            "Fetch mode: browser — one WAF-solved Chromium context, in-page "
+            "fetch over all %d performance(s) (direct from host; proxy unused)",
+            total,
+        )
+        _run_browser_fetch(
+            tasks, payload,
+            concurrency=concurrency, max_seconds=max_seconds,
+            counts=counts, counts_lock=counts_lock,
+            progress=progress, progress_lock=progress_lock,
+            budget_skipped=budget_skipped, total=total,
+        )
+    else:
+        session = build_session(
+            pool_size=max(concurrency, 8),
+            proxy_url=proxy_url,
+            proxy_token=proxy_token,
         )
 
-    def _job(task: tuple[int, int, str | None]) -> tuple[int, int, dict]:
-        si, pi, url = task
-        if not url:
-            # Unusable date/time — instant SKIPPED, no fetch, no pacing.
-            return si, pi, verify_one(session, url)
-        if deadline is not None and time.monotonic() >= deadline:
-            # Out of wall-clock budget: short-circuit without fetching. The
-            # price-cache merge below carries this perf's last real price.
-            with progress_lock:
-                budget_skipped["n"] += 1
-            return si, pi, _empty_result(url, SOURCE_SKIPPED, status="budget")
-        limiter.wait()
-        return si, pi, verify_one(session, url)
+        limiter = _RateLimiter(max_rate)
+        deadline = (t0 + max_seconds) if max_seconds and max_seconds > 0 else None
 
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = [pool.submit(_job, t) for t in tasks]
-        for fut in as_completed(futures):
-            try:
-                si, pi, out = fut.result()
-            except Exception as e:  # noqa: BLE001 — worker shouldn't raise, but defend
-                log.warning("worker exception: %s", e)
-                continue
-            payload["shows"][si]["performances"][pi].update(out)
-            src = out["verified_price_source"]
-            with counts_lock:
-                counts[src] = counts.get(src, 0) + 1
-            with progress_lock:
-                progress["n"] += 1
-                if progress["n"] % 100 == 0:
-                    log.info(
-                        "  progress: %d/%d  (ok=%d, no_seats=%d, fail=%d)",
-                        progress["n"], total,
-                        counts[SOURCE_OK],
-                        counts[SOURCE_NO_SEATS],
-                        counts[SOURCE_FETCH_FAIL],
-                    )
+        if max_rate and max_rate > 0:
+            log.info(
+                "Pacing at <=%.2f req/s%s",
+                max_rate,
+                f"; wall-clock budget {max_seconds:.0f}s" if deadline else "",
+            )
+
+        def _job(task: tuple[int, int, str | None]) -> tuple[int, int, dict]:
+            si, pi, url = task
+            if not url:
+                # Unusable date/time — instant SKIPPED, no fetch, no pacing.
+                return si, pi, verify_one(session, url)
+            if deadline is not None and time.monotonic() >= deadline:
+                # Out of wall-clock budget: short-circuit without fetching. The
+                # price-cache merge below carries this perf's last real price.
+                with progress_lock:
+                    budget_skipped["n"] += 1
+                return si, pi, _empty_result(url, SOURCE_SKIPPED, status="budget")
+            limiter.wait()
+            return si, pi, verify_one(session, url)
+
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = [pool.submit(_job, t) for t in tasks]
+            for fut in as_completed(futures):
+                try:
+                    si, pi, out = fut.result()
+                except Exception as e:  # noqa: BLE001 — worker shouldn't raise, but defend
+                    log.warning("worker exception: %s", e)
+                    continue
+                payload["shows"][si]["performances"][pi].update(out)
+                src = out["verified_price_source"]
+                with counts_lock:
+                    counts[src] = counts.get(src, 0) + 1
+                with progress_lock:
+                    progress["n"] += 1
+                    if progress["n"] % 100 == 0:
+                        log.info(
+                            "  progress: %d/%d  (ok=%d, no_seats=%d, fail=%d)",
+                            progress["n"], total,
+                            counts[SOURCE_OK],
+                            counts[SOURCE_NO_SEATS],
+                            counts[SOURCE_FETCH_FAIL],
+                        )
 
     elapsed = time.monotonic() - t0
     log.info(
@@ -1421,11 +1733,26 @@ def main(argv: list[str] | None = None) -> int:
              "WAF only lets a brief burst through before challenging, so "
              "shuffling spreads which performances land in that window — "
              "successive runs refresh different slices and (with --price-cache) "
-             "the catalogue rolls to full coverage over a few runs.",
+             "the catalogue rolls to full coverage over a few runs. "
+             "(requests mode only; browser mode verifies everything regardless.)",
+    )
+    p.add_argument(
+        "--fetch-mode", choices=("requests", "browser"), default="requests",
+        help="How to fetch ticketing pages for the fireCrmEvent pass. "
+             "'requests' (default): a ThreadPool of HTTP gets, optionally via "
+             "--proxy-url; SeatPlan's AWS WAF JS-challenges the egress after a "
+             "burst (HTTP 202), so only a slice verifies per run — pair with "
+             "--price-cache / --shuffle. 'browser': fetch every URL through one "
+             "WAF-solved headless-Chromium context (in-page fetch carries the "
+             "aws-waf-token), verifying ALL performances each run, direct from "
+             "this host — the proxy is not used.",
     )
     args = p.parse_args(argv)
 
-    if args.proxy_url:
+    if args.fetch_mode == "browser":
+        log.info("fireCrmEvent pass: browser fetch mode "
+                 "(WAF-solved Chromium; proxy not used)")
+    elif args.proxy_url:
         log.info("Routing fireCrmEvent fetches via proxy: %s", args.proxy_url)
         if not args.proxy_token:
             log.warning("--proxy-url set but --proxy-token is empty — "
@@ -1458,6 +1785,7 @@ def main(argv: list[str] | None = None) -> int:
         price_cache_path=args.price_cache,
         price_cache_ttl_hours=args.price_cache_ttl_hours,
         shuffle=args.shuffle,
+        fetch_mode=args.fetch_mode,
     )
 
     # Second pass: chip re-verification for suspect performances.
