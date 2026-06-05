@@ -1,0 +1,30 @@
+name: TodayTix API check
+
+# Standalone smoke test: proves api.todaytix.com is reachable from a GitHub
+# (US-based) runner and returns GBP with the X-TT-Currency pin — i.e. that the
+# JSON-API availability checker will work in CI, where the old browser pass
+# silently broke. Run it manually from the Actions tab (Run workflow).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  api-check:
+    runs-on: ubuntu-latest          # same US-based runner class as the scrape
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Probe api.todaytix.com from this runner
+        run: python scraper/todaytix_api_check.py
