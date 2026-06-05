@@ -21,14 +21,34 @@ Two URLs that look like listings but aren't:
     booking URLs, and "Price Drops on selected seats" badges that aren't
     surfaced anywhere else.
 
-Why no Playwright?
-------------------
-SeatPlan is fully server-side rendered. The master listing emits all
-~125 production cards in a single response, and — critically — emits a
-companion `<script type="application/ld+json">` TheaterEvent block for
-each card, in the same DOM order, with rich data: venue, geographic
-coordinates, run dates, AggregateOffer price range, description and
-typical age range. So one HTTP GET gives us:
+How we fetch (WAF-solving Chromium)
+-----------------------------------
+SeatPlan is fully server-side rendered, so we never need Playwright to
+*render* anything — but seatplan.com now fronts its catalogue with AWS
+WAF, which answers a plain HTTP GET with a JavaScript challenge (HTTP
+202 + window.gokuProps) or a hard CloudFront 403 for datacenter egress
+IPs, and refuses to serve HTML until it sees a browser-solved
+aws-waf-token cookie. A `requests` client — even through a clean-IP
+proxy — can't run that challenge JS, so the master-listing GET comes
+back 403 and the whole scrape aborts on request #1.
+
+The fix mirrors seatplan_availability.py's fetch-mode "browser": warm
+one headless-Chromium context that solves the WAF challenge once, then
+pull every page's SSR HTML with an *in-page* fetch() (so each request
+carries the earned token), and hand that raw HTML to the exact same
+parsers as before. The UA, stealth script and resource-blocking are
+lifted verbatim from the availability pass so both halves of the
+pipeline present an identical browser identity to the WAF. The legacy
+requests-via-proxy path is retained as an automatic fallback for when
+Chromium is unavailable or the runner IP is hard-blocked at the WAF
+edge (and is used unconditionally with --fetch-mode requests).
+
+The reason one fetch per page suffices is unchanged: the master listing
+emits all ~125 production cards in a single response, and — critically —
+emits a companion `<script type="application/ld+json">` TheaterEvent
+block for each card, in the same DOM order, with rich data: venue,
+geographic coordinates, run dates, AggregateOffer price range,
+description and typical age range. So one HTTP GET gives us:
 
   * 125 card HTML chunks (image, title, "from £X.XX", optional rating
     avg, optional "Opens DATE" footer)
@@ -101,7 +121,9 @@ Output is a single JSON file:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
+import threading
 import html
 import json
 import logging
@@ -442,6 +464,322 @@ def build_session(
     s.mount("https://", adapter)
     s.mount("http://", adapter)
     return s
+
+
+# ---------------------------------------------------------------------------
+# WAF-solving browser fetcher  (primary fetch path)
+# ---------------------------------------------------------------------------
+#
+# seatplan.com gates its catalogue behind AWS WAF: a plain requests GET
+# (even through a clean-IP proxy) is met with a JS challenge (HTTP 202 +
+# window.gokuProps) or a hard CloudFront 403, because it can't present a
+# browser-solved aws-waf-token cookie. So the primary fetch path is a single
+# warmed headless-Chromium context that solves the challenge once, after
+# which *in-page* fetch() calls carry the token and return the raw SSR HTML
+# the existing parsers expect.
+#
+# This is the same technique seatplan_availability.py's fetch-mode "browser"
+# uses; the UA, stealth script and resource-blocking are lifted verbatim so
+# both halves of the pipeline look identical to the WAF.
+#
+# The fetcher runs Playwright on its own event loop in a daemon thread and
+# exposes a synchronous, thread-safe .get(url, timeout=...) that quacks like
+# requests.Session.get (returns a _BrowserResponse with .ok / .status_code /
+# .text / .raise_for_status). That lets it drop straight into
+# fetch_master_and_tags / fetch_all_details — including the latter's
+# ThreadPoolExecutor — without touching any parsing or orchestration code.
+# Page operations are serialised through one asyncio.Lock, so the executor's
+# worker threads queue on fetching (fine for ~130 pages) but still parse in
+# parallel once each .get() returns.
+
+# Browser identity — lifted verbatim from seatplan_availability.py so the
+# scrape and the availability/chip passes present the same client to the WAF.
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+BROWSER_STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+window.chrome = window.chrome || { runtime: {} };
+Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3, 4, 5] });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-GB', 'en'] });
+"""
+BROWSER_BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+
+BROWSER_NAV_TIMEOUT_MS  = 30_000
+BROWSER_RESOLVE_SLEEP_S = 5.0     # let the challenge JS solve + set the cookie
+BROWSER_FETCH_ATTEMPTS  = 3       # per-URL tries; re-solve the token between tries
+BROWSER_FETCH_TIMEOUT_S = 120.0   # Python-side budget for one .get (incl. re-solves)
+
+# In-page fetch of one URL. Returns {status, text, challenge}; `challenge`
+# flags an AWS WAF interstitial body so a challenge served with a 2xx is still
+# treated as a miss in Python. A hard 20s AbortController cap guarantees the
+# evaluate() resolves (and the lock releases) even if a URL hangs.
+_BROWSER_FETCH_JS = r"""
+async (u) => {
+  const ctrl = new AbortController();
+  const tid = setTimeout(() => ctrl.abort(), 20000);
+  try {
+    const r = await fetch(u, {credentials: 'include', signal: ctrl.signal,
+                              headers: {'Accept':
+                                'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'}});
+    const t = await r.text();
+    clearTimeout(tid);
+    const challenge = (t.indexOf('gokuProps') !== -1)
+                   || (t.indexOf('awswaf') !== -1)
+                   || (t.indexOf('challenge-container') !== -1);
+    return {status: r.status, text: t, challenge: challenge};
+  } catch (e) {
+    clearTimeout(tid);
+    return {status: -1, text: '', challenge: false};
+  }
+}
+"""
+
+
+class _BrowserResponse:
+    """Minimal requests.Response stand-in for the browser fetch path.
+
+    Carries just enough surface for the existing call sites:
+    fetch_master_and_tags checks `.ok` then logs via _log_http_diagnostic
+    (which reads `.status_code`, `.reason`, `.headers`, `.text`), and
+    fetch_show_detail calls `.raise_for_status()` and inspects
+    `e.response.status_code`. A WAF challenge (or a -1 transient from a thrown
+    in-page fetch) is reported as NOT ok so those paths treat it as a failure
+    exactly as they would a real 4xx.
+    """
+
+    def __init__(self, url: str, status_code: int, text: str,
+                 *, challenge: bool = False, reason: str = "") -> None:
+        self.url = url
+        self.status_code = status_code
+        self.text = text or ""
+        self.challenge = challenge
+        self.reason = reason or (
+            "WAF challenge" if challenge else
+            ("transport error" if status_code < 0 else "")
+        )
+        # Header introspection isn't reliably available from an in-page fetch;
+        # _log_http_diagnostic handles an empty mapping gracefully and the body
+        # is the deciding signal anyway.
+        self.headers: dict[str, str] = {}
+
+    @property
+    def content(self) -> bytes:
+        return self.text.encode("utf-8", "replace")
+
+    @property
+    def ok(self) -> bool:
+        return (not self.challenge) and (200 <= self.status_code < 400)
+
+    def raise_for_status(self) -> None:
+        if not self.ok:
+            err = requests.HTTPError(
+                f"{self.status_code} {self.reason} for url {self.url}".strip()
+            )
+            err.response = self  # type: ignore[assignment]
+            raise err
+
+
+class _BrowserFetcher:
+    """A WAF-solving Chromium fetcher with a requests.Session-like .get().
+
+    Build it via build_browser_fetcher() (which calls .start() and returns
+    None if the browser can't be used this run), pass it anywhere a
+    requests.Session is expected, and call .close() when done.
+    """
+
+    def __init__(self, warm_url: str) -> None:
+        self._warm_url = warm_url
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop.run_forever, name="seatplan-browser",
+            daemon=True,
+        )
+        self._lock: asyncio.Lock | None = None
+        self._pw = None
+        self._browser = None
+        self._context = None
+        self._page = None
+
+    # -- public, synchronous, thread-safe ---------------------------------
+
+    def start(self) -> bool:
+        """Launch Chromium and prime the WAF token. Returns False if Chromium
+        is unavailable or the runner IP is hard-blocked at the WAF edge — the
+        caller should then fall back to the requests path."""
+        self._thread.start()
+        try:
+            return bool(self._submit(self._async_start(), timeout=120))
+        except Exception as e:  # pragma: no cover - defensive
+            log.error("browser fetcher: startup failed — %s: %s",
+                      type(e).__name__, e)
+            return False
+
+    def get(self, url: str, timeout: float | None = None, **kwargs):
+        """Fetch `url`'s HTML through the warmed context. Signature mirrors
+        requests.Session.get so this object is a drop-in; extra kwargs are
+        ignored (the browser carries its own headers/cookies)."""
+        try:
+            status, text, challenge, reason = self._submit(
+                self._async_get(url), timeout=BROWSER_FETCH_TIMEOUT_S + 15)
+        except Exception as e:
+            status, text, challenge = -1, "", False
+            reason = f"fetch error: {type(e).__name__}"
+        return _BrowserResponse(url, status, text,
+                                challenge=challenge, reason=reason)
+
+    def close(self) -> None:
+        try:
+            self._submit(self._async_close(), timeout=30)
+        except Exception:
+            pass
+        try:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        except Exception:
+            pass
+
+    # -- loop plumbing ----------------------------------------------------
+
+    def _submit(self, coro, *, timeout: float | None):
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return fut.result(timeout)
+
+    # -- async internals (run on self._loop) ------------------------------
+
+    async def _async_start(self) -> bool:
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as e:
+            log.error("browser fetcher: Playwright not importable — %s", e)
+            log.error("  run: python -m playwright install chromium")
+            return False
+
+        self._lock = asyncio.Lock()
+        self._pw = await async_playwright().start()
+        try:
+            self._browser = await self._pw.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+        except Exception as e:
+            log.error("browser fetcher: could not launch Chromium — %s", e)
+            log.error("  run: python -m playwright install chromium")
+            return False
+
+        self._context = await self._browser.new_context(
+            viewport={"width": 1400, "height": 900},
+            user_agent=BROWSER_UA, locale="en-GB", timezone_id="Europe/London",
+            extra_http_headers={"Accept-Language": "en-GB,en;q=0.9"},
+        )
+        await self._context.route("**/*", self._block_heavy)
+        await self._context.add_init_script(BROWSER_STEALTH_JS)
+        self._page = await self._context.new_page()
+
+        await self._solve_token()
+        probe = await self._probe_status()
+        if probe in (403, -1):
+            # Re-solve once in case it was a transient hiccup, then re-probe.
+            await self._solve_token()
+            probe = await self._probe_status()
+        try:
+            names = sorted({c["name"] for c in await self._context.cookies()})
+        except Exception:
+            names = []
+        log.info("browser fetcher: token primed; warm-up probe HTTP %s; "
+                 "context cookies: %s", probe, names or "(none)")
+        if probe in (403, -1):
+            log.warning("browser fetcher: runner IP appears hard-blocked at "
+                        "the WAF edge (warm-up probe HTTP %s) — falling back "
+                        "to the requests path", probe)
+            return False
+        return True
+
+    async def _block_heavy(self, route) -> None:
+        try:
+            if route.request.resource_type in BROWSER_BLOCKED_RESOURCE_TYPES:
+                await route.abort()
+            else:
+                await route.continue_()
+        except Exception:
+            # Route may already be resolved if the page closed mid-request.
+            pass
+
+    async def _solve_token(self) -> None:
+        """Navigate to a real seatplan.com page so Chromium runs the AWS WAF
+        challenge JS and (re)banks the aws-waf-token cookie on the context."""
+        try:
+            await self._page.goto(self._warm_url, wait_until="domcontentloaded",
+                                  timeout=BROWSER_NAV_TIMEOUT_MS)
+        except Exception as e:
+            log.warning("browser fetcher: token nav error — %s",
+                        type(e).__name__)
+        await asyncio.sleep(BROWSER_RESOLVE_SLEEP_S)
+
+    async def _probe_status(self) -> int:
+        """In-page fetch of the warm URL; return its HTTP status (or -1 on a
+        throw). 403 / -1 means the runner IP is hard-blocked at the WAF edge —
+        the browser can solve a *challenge* (202) but not an IP block."""
+        try:
+            return await self._page.evaluate(
+                """async (u) => { try {
+                     const r = await fetch(u, {credentials:'include',
+                                               headers:{'Accept':'text/html'}});
+                     return r.status;
+                   } catch (e) { return -1; } }""",
+                self._warm_url,
+            )
+        except Exception:
+            return -1
+
+    async def _async_get(self, url: str):
+        assert self._lock is not None
+        async with self._lock:
+            attempt = 0
+            while True:
+                try:
+                    r = await self._page.evaluate(_BROWSER_FETCH_JS, url)
+                except Exception:
+                    r = {"status": -1, "text": "", "challenge": False}
+                status = r.get("status", -1)
+                text = r.get("text") or ""
+                challenge = bool(r.get("challenge")) or status == 202
+                transient = status == -1  # in-page fetch threw; not a WAF verdict
+                if (challenge or transient) and attempt < BROWSER_FETCH_ATTEMPTS - 1:
+                    attempt += 1
+                    await self._solve_token()
+                    continue
+                reason = ("WAF challenge" if challenge
+                          else ("transport error" if transient
+                                else ("" if 200 <= status < 400
+                                      else f"HTTP {status}")))
+                return status, text, challenge, reason
+
+    async def _async_close(self) -> None:
+        for obj in (self._context, self._browser):
+            try:
+                if obj is not None:
+                    await obj.close()
+            except Exception:
+                pass
+        try:
+            if self._pw is not None:
+                await self._pw.stop()
+        except Exception:
+            pass
+
+
+def build_browser_fetcher(warm_url: str = MASTER_URL) -> "_BrowserFetcher | None":
+    """Construct and prime a _BrowserFetcher, or return None if the browser
+    can't be used this run (Chromium missing, or runner IP hard-blocked)."""
+    fetcher = _BrowserFetcher(warm_url)
+    if fetcher.start():
+        return fetcher
+    try:
+        fetcher.close()
+    except Exception:
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -2100,25 +2438,58 @@ def main(argv: list[str] | None = None) -> int:
              "request. Defaults to $OLT_PROXY_TOKEN. Must match "
              "the PROXY_TOKEN secret bound on the Cloudflare Worker.",
     )
+    p.add_argument(
+        "--fetch-mode", choices=("browser", "requests"), default="browser",
+        help="How to fetch seatplan.com. 'browser' (default) drives a "
+             "WAF-solving headless Chromium and pulls each page's HTML via an "
+             "in-page fetch() — the only thing that gets past AWS WAF from a "
+             "cloud-CI IP. 'requests' forces the legacy requests path "
+             "(optionally via --proxy-url); it is also used automatically as "
+             "the fallback when Chromium is unavailable or the runner IP is "
+             "hard-blocked at the WAF edge.",
+    )
     args = p.parse_args(argv)
 
-    if args.proxy_url:
-        log.info("Routing SeatPlan requests via proxy: %s", args.proxy_url)
-        if not args.proxy_token:
-            log.warning("--proxy-url is set but --proxy-token is empty — "
-                        "the worker will reject the request with 401")
-    else:
-        log.info("Going direct to seatplan.com (no proxy). If you start "
-                 "seeing empty results / 2031-byte stub pages, the runner "
-                 "subnet is probably on Cloudflare's blocklist; set "
-                 "OLT_PROXY_URL/OLT_PROXY_TOKEN to route via "
-                 "the worker instead.")
+    def _build_requests_session() -> requests.Session:
+        if args.proxy_url:
+            log.info("Routing SeatPlan requests via proxy: %s", args.proxy_url)
+            if not args.proxy_token:
+                log.warning("--proxy-url is set but --proxy-token is empty — "
+                            "the worker will reject the request with 401")
+        else:
+            log.info("Going direct to seatplan.com (no proxy). If you start "
+                     "seeing empty results / 2031-byte stub pages, the runner "
+                     "subnet is probably on Cloudflare's blocklist; set "
+                     "OLT_PROXY_URL/OLT_PROXY_TOKEN to route via "
+                     "the worker instead.")
+        return build_session(
+            pool_size=max(args.concurrency, 8),
+            proxy_url=args.proxy_url,
+            proxy_token=args.proxy_token,
+        )
 
-    session = build_session(
-        pool_size=max(args.concurrency, 8),
-        proxy_url=args.proxy_url,
-        proxy_token=args.proxy_token,
-    )
+    # Primary fetch path: a WAF-solving headless Chromium. seatplan.com fronts
+    # its catalogue with AWS WAF, so a plain requests GET (even via a clean-IP
+    # proxy) is met with a JS challenge / CloudFront 403 it can't solve. The
+    # browser solves the challenge once and fetches each page's SSR HTML
+    # in-page so it carries the earned aws-waf-token. We fall back to the
+    # requests path automatically if Chromium is unavailable or the runner IP
+    # is hard-blocked at the WAF edge (and always with --fetch-mode requests).
+    browser_fetcher: "_BrowserFetcher | None" = None
+    if args.fetch_mode == "browser":
+        log.info("Fetch mode: browser — warming a WAF-solving Chromium "
+                 "context (direct from this host; proxy unused unless we "
+                 "fall back)")
+        browser_fetcher = build_browser_fetcher(MASTER_URL)
+        if browser_fetcher is None:
+            log.warning("Browser fetch unavailable this run — falling back to "
+                        "the requests path over the full scrape")
+
+    if browser_fetcher is not None:
+        session: requests.Session = browser_fetcher  # type: ignore[assignment]
+    else:
+        session = _build_requests_session()
+
     t_start = time.monotonic()
     scraped_at = datetime.now(timezone.utc)
     deadline = (t_start + args.max_runtime_seconds
@@ -2137,10 +2508,14 @@ def main(argv: list[str] | None = None) -> int:
         )
     except requests.RequestException as e:
         log.error("Master listing fetch failed: %s — aborting (previous output preserved).", e)
+        if browser_fetcher is not None:
+            browser_fetcher.close()
         return EXIT_HARD_FAIL
 
     if not master_cards:
         log.error("No shows found on master listing — aborting (previous output preserved).")
+        if browser_fetcher is not None:
+            browser_fetcher.close()
         return EXIT_HARD_FAIL
 
     cards_to_fetch = master_cards
@@ -2157,6 +2532,11 @@ def main(argv: list[str] | None = None) -> int:
         scraped_at=scraped_at,
         deadline=deadline,
     )
+
+    # Network work is done; release the browser (stages 3+ do no fetching).
+    if browser_fetcher is not None:
+        browser_fetcher.close()
+        browser_fetcher = None
 
     # Stage 3: sanity checks + previous-run compare + data validation
     warnings = run_sanity_checks(shows, failures, master_count=len(cards_to_fetch))
