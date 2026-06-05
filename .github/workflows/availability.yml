@@ -1,0 +1,419 @@
+name: Availability refresh
+
+# Lightweight, frequent availability refresh -- the guarantee that the
+# published site only advertises performances that are STILL on sale, at
+# their still-current lowest price.
+#
+# It does NOT re-scrape the catalogue. It downloads the per-source JSONs
+# from the most recent successful Full scrape (scrape.yml's `all-scrapers`
+# artifact), re-runs each source's availability probe to mark anything
+# that has sold out / been pulled from sale since that full scrape, then
+# dedupes and commits the refreshed unified.json. ~2-5 minutes depending
+# on which sources are enabled.
+#
+# Trigger: workflow_dispatch only, driven by cron-job.org on a tight
+# cadence (every few minutes). Booking sites pull a performance from sale
+# 30-120 minutes before the door and tight cheapest-tier inventory can
+# sell out at any time, so this runs far more often than a full scrape to
+# keep `available` / lowest-price accurate between full runs (a cheapest-
+# tier seat can sell out, or a whole performance get pulled from sale,
+# minutes after a full scrape recorded it as available).
+#
+# Concurrency: shares the `scrape-and-refresh` group with scrape.yml so a
+# refresh never races the full scrape's commit to main (cancel-in-progress
+# is false, so whichever is queued waits its turn). Because the group is
+# shared, no full run can commit while a refresh holds the group, and
+# find_run below always resolves to the latest *completed* full scrape --
+# so a refresh can never clobber a fresher catalogue with stale data.
+#
+# Sources (what this refresh re-probes):
+#   * OLT, TTD, LoveTheatre -- requests-based and fast (~1-2 min total).
+#     Always refreshed. This is the default: a light, quick refresh that
+#     barely dents the shared concurrency lock, so it doesn't slow the
+#     full scrape down.
+#   * SeatPlan + TodayTix -- OPT-IN (skip_*_avail default to true / off).
+#     Both need a Playwright/Chromium browser pass, which makes a refresh
+#     nearly as heavy as a full scrape and -- because of the shared lock --
+#     would steal runtime from the full scrape. Since the full scrape is
+#     maxed out and already re-probes SeatPlan + TodayTix inline every run,
+#     leaving them off here keeps this layer cheap while the full scrape
+#     guarantees their freshness. Flip skip_seatplan_avail /
+#     skip_todaytix_avail to 'false' to make this a complete standalone
+#     refresh (e.g. if you ever stop maxing the full scrape).
+
+on:
+  workflow_dispatch:
+    inputs:
+      within_days:
+        description: 'Refresh perfs within N days of today (OLT / LoveTheatre / TodayTix)'
+        required: false
+        default: '2'
+      skip_todaytix_avail:
+        description: 'Skip TodayTix availability (Playwright; heavy). Default true -- full scrape covers it.'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      skip_seatplan_avail:
+        description: 'Skip SeatPlan availability (Playwright; heavy). Default true -- full scrape covers it.'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      skip_publish:
+        description: 'Skip committing the unified output (artifacts still uploaded)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+# contents: write -> publish step's commit to main.
+# actions: read   -> download the all-scrapers artifact from a prior full run.
+permissions:
+  contents: write
+  actions: read
+
+# Shared with scrape.yml. See the header note above: this serialises the
+# availability refresh against the full scrape so their commits to main
+# never race and a refresh never overwrites a newer catalogue.
+concurrency:
+  group: scrape-and-refresh
+  cancel-in-progress: false
+
+jobs:
+  availability_refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repo (for the availability scripts)
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: scraper/requirements.txt
+
+      - name: Install Python dependencies
+        run: pip install -r scraper/requirements.txt
+
+      # ------------------------------------------------------------------
+      # Find the latest successful Full scrape and download its
+      # all-scrapers artifact. scrape.yml is full-only, so the most recent
+      # successful run that produced one is simply the most recent
+      # successful run -- no event filtering needed.
+      # ------------------------------------------------------------------
+      - name: Find latest full-scrape run
+        id: find_run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RUN_ID=$(gh run list \
+            --workflow=scrape.yml \
+            --status=success \
+            --limit=30 \
+            --json databaseId \
+            --jq '.[0].databaseId')
+          if [ -z "${RUN_ID:-}" ] || [ "$RUN_ID" = "null" ]; then
+            echo "::error::No successful run of scrape.yml found. Trigger a full scrape before running the availability refresh."
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Using all-scrapers artifact from full-scrape run $RUN_ID"
+
+      - name: Download per-source JSONs (all-scrapers from latest full scrape)
+        uses: actions/download-artifact@v4
+        with:
+          name: all-scrapers
+          path: data/
+          run-id: ${{ steps.find_run.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+
+      - name: List downloaded source files
+        run: |
+          ls -la data/ || true
+          for f in data/*.json; do
+            if [ -f "$f" ]; then
+              echo "  $f ($(wc -c < "$f") bytes)"
+            fi
+          done
+
+      # Resolve "should we run SeatPlan?" once: file present AND not opted
+      # out. Used to gate the Playwright install + cache + SeatPlan step.
+      - name: Compute source flags
+        id: flags
+        run: |
+          if [ -f data/seatplan.json ] && [ "${{ inputs.skip_seatplan_avail }}" != "true" ]; then
+            echo "have_seatplan=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_seatplan=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "have_seatplan resolved to: $(grep have_seatplan "$GITHUB_OUTPUT" | tail -1)"
+
+      # ------------------------------------------------------------------
+      # Per-source availability re-probes. Each step is independent, gated
+      # on its source file's presence, and continue-on-error: a hard exit
+      # from any one script logs but doesn't abort -- dedupe still runs on
+      # the partially-refreshed data. These invocations mirror the full
+      # scrape's in-matrix availability steps.
+      # ------------------------------------------------------------------
+
+      - name: Refresh OLT availability
+        if: hashFiles('data/olt.json') != ''
+        continue-on-error: true
+        env:
+          OLT_PROXY_URL: ${{ secrets.OLT_PROXY_URL }}
+          OLT_PROXY_TOKEN: ${{ secrets.OLT_PROXY_TOKEN }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          WITHIN="${{ inputs.within_days || '2' }}"
+          python scraper/olt_availability.py \
+            --in data/olt.json \
+            --within-days "$WITHIN" \
+            --concurrency 8
+
+      - name: Refresh TTD availability
+        if: hashFiles('data/ttd.json') != ''
+        continue-on-error: true
+        run: |
+          python scraper/ttd_availability.py \
+            --in data/ttd.json \
+            --concurrency 8
+
+      - name: Refresh LoveTheatre availability
+        if: hashFiles('data/lovetheatre.json') != ''
+        continue-on-error: true
+        run: |
+          WITHIN="${{ inputs.within_days || '2' }}"
+          python scraper/lovetheatre_availability.py \
+            --in data/lovetheatre.json \
+            --within-days "$WITHIN" \
+            --concurrency 8
+
+      - name: Cache Playwright browsers
+        # Cache the Chromium download so the install below is ~instant on
+        # every run after the first for a given requirements.txt. Keyed on
+        # the requirements hash so a Playwright version bump busts it. Only
+        # needed when TodayTix or SeatPlan availability is enabled.
+        if: (hashFiles('data/todaytix.json') != '' && inputs.skip_todaytix_avail != 'true') || steps.flags.outputs.have_seatplan == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('scraper/requirements.txt') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+
+      - name: Install Playwright Chromium
+        # Needed by the TodayTix chip pass and/or the SeatPlan browser pass.
+        if: (hashFiles('data/todaytix.json') != '' && inputs.skip_todaytix_avail != 'true') || steps.flags.outputs.have_seatplan == 'true'
+        run: playwright install --with-deps chromium
+
+      - name: Refresh TodayTix availability
+        if: hashFiles('data/todaytix.json') != '' && inputs.skip_todaytix_avail != 'true'
+        continue-on-error: true
+        run: |
+          WITHIN="${{ inputs.within_days || '2' }}"
+          python scraper/todaytix_availability.py \
+            --in data/todaytix.json \
+            --window-days "$WITHIN" \
+            --workers 2
+
+      - name: Restore SeatPlan chip + price cache
+        # Same cache as the full scrape (shared key prefix across workflows
+        # on the default branch). The price cache is the safety net: a
+        # blocked SeatPlan run carries last-known prices forward instead of
+        # reverting to catalogue lowPrice, so persisting it across the
+        # frequent refreshes is what keeps prices from flapping.
+        if: steps.flags.outputs.have_seatplan == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            scraper/data/chip_cache_seatplan.json
+            scraper/data/seatplan_price_cache.json
+          key: chip-cache-seatplan-${{ github.run_id }}
+          restore-keys: |
+            chip-cache-seatplan-
+
+      - name: Refresh SeatPlan availability
+        # Browser-mode price/availability verification, identical to the
+        # full scrape's SeatPlan verify step: one WAF-solved Chromium
+        # context fetches every ticketing URL in-page so the aws-waf-token
+        # rides along; on a runner IP the WAF hard-blocks (403) it falls
+        # back to the requests-via-Lambda proxy (clean IP, grace-window
+        # slice) and the price cache carries the rest. Note: the input file
+        # is the downloaded data/seatplan.json, while the caches live under
+        # scraper/data/ to match the full scrape's cache layout (so the
+        # shared chip-cache-seatplan- cache lines up).
+        if: steps.flags.outputs.have_seatplan == 'true'
+        continue-on-error: true
+        env:
+          # SeatPlan goes via the AWS Lambda proxy (clean IP) for the
+          # requests fallback; the env var is named OLT_PROXY_URL because
+          # that's what the script reads -- only the value differs.
+          OLT_PROXY_URL: ${{ secrets.SEATPLAN_PROXY_URL }}
+          OLT_PROXY_TOKEN: ${{ secrets.SEATPLAN_PROXY_TOKEN }}
+        run: |
+          mkdir -p scraper/data
+          python scraper/seatplan_availability.py \
+            --in data/seatplan.json \
+            --chip-cache scraper/data/chip_cache_seatplan.json \
+            --price-cache scraper/data/seatplan_price_cache.json \
+            --fetch-mode browser \
+            --concurrency 12 \
+            --max-seconds 780
+
+      - name: Upload patched per-source files
+        # Different name from the full scrape's "all-scrapers" so dedupe
+        # reads the freshly-patched files. Don't overwrite "all-scrapers" --
+        # that's the baseline the NEXT availability run downloads.
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-scrapers-patched
+          path: data/
+          if-no-files-found: error
+          retention-days: 7
+
+  dedupe:
+    needs: availability_refresh
+    if: always() && needs.availability_refresh.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dedupe dependencies
+        run: pip install rapidfuzz pyyaml
+
+      - name: Download patched per-source files
+        uses: actions/download-artifact@v4
+        with:
+          name: all-scrapers-patched
+          path: data/
+
+      - name: Sanity-check inputs
+        run: |
+          ls -la data/
+          n=$(ls data/*.json 2>/dev/null | wc -l)
+          echo "Source JSON files present: $n"
+          if [ "$n" -lt 2 ]; then
+            echo "::warning::only $n source file(s) -- dedupe will produce mostly singletons"
+          fi
+
+      - name: Run dedupe
+        run: |
+          mkdir -p dedupe_output
+          OVERRIDES=""
+          if [ -f scraper/analysis/overrides.yaml ]; then
+            OVERRIDES="--overrides scraper/analysis/overrides.yaml"
+          elif [ -f scraper/analysis/overrides.json ]; then
+            OVERRIDES="--overrides scraper/analysis/overrides.json"
+          fi
+          python scraper/analysis/dedupe.py data/ --out dedupe_output $OVERRIDES
+
+      - name: Summarise result
+        run: |
+          python -c "
+          import json
+          with open('dedupe_output/unified.json') as f:
+              u = json.load(f)
+          print(f\"shows={u['show_count']}  performances={u['performance_count']}\")
+          "
+
+      - name: Upload unified-shows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unified-shows
+          path: dedupe_output/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    # Commit unified.json to main. CF Pages picks up the commit and
+    # rebuilds the site with the fresh data baked in.
+    needs: dedupe
+    if: always() && needs.dedupe.result == 'success' && inputs.skip_publish != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+
+      - name: Download unified output
+        uses: actions/download-artifact@v4
+        with:
+          name: unified-shows
+          path: dedupe_output/
+
+      - name: Set up Python for history update
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Commit and push to main
+        # Last-writer-wins with retry, identical to scrape.yml's publish.
+        # The shared concurrency group already serialises full vs refresh
+        # runs, so under normal operation this pushes on the first attempt;
+        # the retry is the safety net for anything outside that lock (human
+        # commits, other workflows). update_price_history runs INSIDE the
+        # loop, after `git reset --hard origin/main`, so a snapshot from a
+        # run that won the race is rebased onto rather than overwritten.
+        run: |
+          set -e
+          MSG_PREFIX="data: availability refresh"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          MAX_ATTEMPTS=5
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            git fetch origin main
+            git reset --hard origin/main
+
+            mkdir -p public/data
+            cp dedupe_output/unified.json public/data/unified.json
+
+            python scraper/analysis/update_price_history.py \
+              --unified public/data/unified.json \
+              --history-in public/data/price_history.json \
+              --out public/data/price_history.json
+
+            git add public/data/unified.json public/data/price_history.json
+
+            if git diff --cached --quiet; then
+              echo "No changes to commit."
+              exit 0
+            fi
+
+            git commit -m "$MSG_PREFIX ($(date -u +%Y-%m-%dT%H:%MZ))"
+            if git push origin main; then
+              echo "Pushed on attempt $i."
+              exit 0
+            fi
+            echo "Push rejected on attempt $i (concurrent push?). Retrying..."
+            sleep 2
+          done
+          echo "::error::Failed to push after $MAX_ATTEMPTS attempts."
+          exit 1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
