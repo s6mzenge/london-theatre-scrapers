@@ -635,29 +635,62 @@ def _ttd_price_to(p: dict) -> float | None:
 # prefer its values; otherwise we fall back to the SSR snapshot.
 #
 # verified_price_source semantics (set by todaytix_availability.py):
-#   "chips"           — chip pass extracted live prices; trust these
-#   "no_chips_found"  — page loaded but no chips visible
-#                       (likely sold out / off-sale / lottery-only)
-#                       → fall back to SSR low_price_value
-#   "fetch_failed"    — browser navigation or render error
-#                       → fall back to SSR low_price_value
-#   (missing field)   — chip pass didn't run on this showtime
-#                       (not suspect, or outside window) → SSR value
+#   "chips"           — live API returned available priced bands; trust
+#                       verified_min_price / verified_max_price
+#   "sold_out"        — live API checked this showtime and it's unbuyable
+#                       (every band zero seats, or booking closed past
+#                       availableUntil) → TodayTix has no price for it:
+#                       drop it from the cross-source min (like SeatPlan
+#                       "no_seats") and mark it unavailable, instead of
+#                       advertising the stale SSR low_price_value
+#   "fetch_failed"    — live API errored / showtime absent / no per-band
+#                       seat info (schema drift) → fall back to the SSR
+#                       low_price_value (itself cheapest-available-or-None
+#                       as of the last snapshot)
+#   "no_chips_found"  — legacy value from the old browser pass; treated as
+#                       a fall-back-to-SSR case for backward compatibility
+#   (missing field)   — availability pass didn't run → SSR low_price_value
+#
+# verified_available (bool | None), also set by the availability pass, is
+# True for "chips", False for "sold_out", and absent/None otherwise; the
+# "available" helper below prefers it over the SSR seat count.
 
 def _todaytix_price_from(p: dict) -> float | None:
-    if p.get("verified_price_source") == "chips":
+    source = p.get("verified_price_source")
+    if source == "chips":
         verified = p.get("verified_min_price")
         if verified is not None:
             return verified
+    if source == "sold_out":
+        # Checked live and unbuyable — drop it from the cross-source min
+        # (mirrors SeatPlan "no_seats") rather than advertising the stale
+        # SSR floor for a seat nobody can buy.
+        return None
     return p.get("low_price_value")
 
 
 def _todaytix_price_to(p: dict) -> float | None:
-    # The SSR snapshot never carries an upper bound — only the chip
-    # pass gives us one (highest visible chip).
-    if p.get("verified_price_source") == "chips":
+    # Only the live pass gives an upper bound (most-expensive available
+    # band); the SSR snapshot never carries one.
+    source = p.get("verified_price_source")
+    if source == "chips":
         return p.get("verified_max_price")
+    if source == "sold_out":
+        return None
     return None
+
+
+def _todaytix_available(p: dict) -> bool | None:
+    # The live availability pass is authoritative when it ran:
+    #   "chips"    → verified_available True
+    #   "sold_out" → verified_available False
+    # When it didn't run (or only failed to fetch), verified_available is
+    # absent/None and we fall back to the SSR per-showtime seat count.
+    verified = p.get("verified_available")
+    if isinstance(verified, bool):
+        return verified
+    seats = p.get("seats_available")
+    return (seats > 0) if isinstance(seats, int) else None
 
 
 PERF_SCHEMAS: dict[str, dict[str, Any]] = {
@@ -670,8 +703,7 @@ PERF_SCHEMAS: dict[str, dict[str, Any]] = {
         "price_to":   _todaytix_price_to,
         "currency":   lambda p: p.get("currency"),
         "book_url":   lambda p: p.get("booking_url") or p.get("book_url"),
-        "available":  lambda p: (p.get("seats_available", 0) > 0)
-                                if isinstance(p.get("seats_available"), int) else None,
+        "available":  _todaytix_available,
     },
     "olt": {
         "date":       lambda p: p.get("date"),
