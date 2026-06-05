@@ -27,19 +27,18 @@ name: Availability refresh
 # so a refresh can never clobber a fresher catalogue with stale data.
 #
 # Sources (what this refresh re-probes):
-#   * OLT, TTD, LoveTheatre -- requests-based and fast (~1-2 min total).
-#     Always refreshed. This is the default: a light, quick refresh that
-#     barely dents the shared concurrency lock, so it doesn't slow the
-#     full scrape down.
-#   * SeatPlan + TodayTix -- OPT-IN (skip_*_avail default to true / off).
-#     Both need a Playwright/Chromium browser pass, which makes a refresh
-#     nearly as heavy as a full scrape and -- because of the shared lock --
-#     would steal runtime from the full scrape. Since the full scrape is
-#     maxed out and already re-probes SeatPlan + TodayTix inline every run,
-#     leaving them off here keeps this layer cheap while the full scrape
-#     guarantees their freshness. Flip skip_seatplan_avail /
-#     skip_todaytix_avail to 'false' to make this a complete standalone
-#     refresh (e.g. if you ever stop maxing the full scrape).
+#   * OLT, TTD, LoveTheatre -- requests-based and fast. Always refreshed.
+#   * TodayTix -- on by default (skip_todaytix_avail=false). Needs a
+#     Playwright/Chromium chip pass, so a default refresh runs ~2-3 min and
+#     installs Chromium (cached after the first run).
+#   * SeatPlan -- OPT-IN (skip_seatplan_avail defaults to true / off). Its
+#     browser price-verification is the single heaviest step and makes a
+#     refresh nearly as heavy as a full scrape; since the full scrape is
+#     maxed out and re-probes SeatPlan inline every run, leaving it off here
+#     keeps this layer lighter while the full scrape guarantees SeatPlan's
+#     freshness. Flip skip_seatplan_avail to 'false' to include it (e.g. if
+#     you ever stop maxing the full scrape). within_days bounds the OLT /
+#     LoveTheatre / TodayTix re-check window (default 5 days out).
 
 on:
   workflow_dispatch:
@@ -47,11 +46,11 @@ on:
       within_days:
         description: 'Refresh perfs within N days of today (OLT / LoveTheatre / TodayTix)'
         required: false
-        default: '2'
+        default: '5'
       skip_todaytix_avail:
-        description: 'Skip TodayTix availability (Playwright; heavy). Default true -- full scrape covers it.'
+        description: 'Skip TodayTix availability (Playwright; heavy). Default false -- it runs.'
         required: false
-        default: 'true'
+        default: 'false'
         type: choice
         options:
           - 'false'
