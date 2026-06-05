@@ -1,91 +1,48 @@
 name: Full scrape
 
-# Two modes in one workflow, sharing dedupe + publish:
+# Full catalogue scrape: runs every scraper from scratch, followed by its
+# in-matrix availability pass (SeatPlan price/chip verification, OLT
+# verifier, TTD seat verification, LoveTheatre + TodayTix availability),
+# dedupes, and commits unified.json. ~3-6 minutes.
 #
-#   * FULL mode — runs every scraper from scratch followed by its in-matrix
-#     availability pass (chip caches, OLT verifier, TTD seat verification,
-#     etc), dedupes, commits unified.json. Slow (~3-6 minutes). Trigger:
-#     manual only, either from the Actions tab ("Run workflow" button) or
-#     via the GitHub REST API workflow_dispatch endpoint (what external
-#     schedulers like cron-job.org call). This is the original behaviour.
+# Trigger: manual only -- the "Run workflow" button in the Actions tab, or
+# a workflow_dispatch via the GitHub REST API (what an external scheduler
+# like cron-job.org calls). Run this as often as the runner allows: each
+# run re-fetches the full catalogue + prices AND re-probes availability
+# inline, so the published data reflects what's actually on sale at scrape
+# time. A separate, lighter workflow (availability.yml) re-probes
+# availability between full runs on its own cron-job.org cadence.
 #
-#   * AVAILABILITY mode — downloads the per-source artifact from the most
-#     recent FULL run and re-runs the lightweight availability scripts
-#     (olt_availability, ttd_availability, lovetheatre_availability, plus
-#     todaytix_availability if not opted out). Skips the expensive chip
-#     passes — those caught their share of edge cases at the last full
-#     scrape; this mode targets the more common "perf sold out / pulled
-#     from sale since scrape time" drift. Fast (~1-3 minutes). Trigger:
-#     cron every 30 minutes, plus manual via the same dispatch UI with
-#     mode=availability.
+# Concurrency: this workflow and availability.yml share ONE concurrency
+# group (scrape-and-refresh) so their commits to main never race.
 #
-# Why one workflow instead of two
-# -------------------------------
-# Dedupe + publish are identical in both modes. Splitting would mean
-# duplicating that logic or factoring it into a reusable workflow — both
-# add maintenance overhead for a single shared site that publishes one
-# JSON file. The cost of integration is one extra `setup` job, an `if:`
-# clause on each downstream job, and the availability_refresh job.
-#
-# Why the periodic refresh exists
-# -------------------------------
-# Booking sites pull a performance from sale 30-120 minutes before the
-# door, and tight cheapest-tier inventory can sell out at any time.
-# Without periodic refresh between full scrapes, unified.json keeps
-# advertising performances whose booking pages have closed. The 22 May
-# 2026 14:00 *Cursed Child* matinee was the canonical case: all four
-# sources reported available at scrape time, all four were 404 / "No
-# seats" / removed-from-calendar by the 14:00 box-office cutoff.
-#
-# About OLT: officiallondontheatre.com 403s requests from cloud IP
-# ranges (Azure / GitHub Actions) on every URL, HTML and wp-json API
-# alike. We route the scraper through a Cloudflare Worker reverse
-# proxy deployed under the user's CF account -- not in the blocked
-# range -- which rewrites the path onto the OLT origin and forwards
-# the response. Auth is a shared secret (X-Proxy-Auth header).
-# Credentials live in the OLT_PROXY_URL / OLT_PROXY_TOKEN repository
-# secrets and are exposed to the scraper + availability steps below.
-# If the proxy ever goes down or the secrets are missing, flip
-# skip_olt to 'true' to keep cloud runs green and fall back to running
-# OLT locally with `python scraper/olt_scraper.py`.
+# About OLT: officiallondontheatre.com 403s requests from cloud IP ranges
+# (Azure / GitHub Actions) on every URL, HTML and wp-json API alike. We
+# route the scraper through a Cloudflare Worker reverse proxy deployed
+# under the user's CF account -- not in the blocked range -- which rewrites
+# the path onto the OLT origin and forwards the response. Auth is a shared
+# secret (X-Proxy-Auth header). Credentials live in the OLT_PROXY_URL /
+# OLT_PROXY_TOKEN repository secrets. If the proxy goes down or the secrets
+# are missing, flip skip_olt to 'true' to keep cloud runs green.
 #
 # What's committed vs not:
 #   * public/data/unified.json (~35MB) is committed -- it's what the
 #     website reads.
-#   * Per-source raw JSONs (~130MB total) are NOT committed -- they
-#     exist only as the `all-scrapers` GitHub Actions artifact with
-#     30-day retention, for debugging AND as the input to availability-
-#     mode runs (downloaded via the GitHub Actions API).
+#   * Per-source raw JSONs are NOT committed -- they exist only as the
+#     `all-scrapers` GitHub Actions artifact (30-day retention), for
+#     debugging AND as the input to availability.yml runs.
 #   * report.txt and review.json from dedupe are in the `unified-shows`
-#     artifact (same 30-day retention) and not committed.
+#     artifact (30-day retention) and not committed.
 
 on:
-  schedule:
-    # Availability-mode refresh, every 30 minutes. The cron expression
-    # is the discriminator: the setup job sees event_name == "schedule"
-    # and forces mode=availability. GitHub Actions cron can drift by a
-    # few minutes under load — don't depend on this hitting the wall
-    # clock exactly. Scheduled workflows only run on the default branch
-    # and only if the repo has had activity in the last 60 days.
-    - cron: '*/30 * * * *'
-
   workflow_dispatch:
     inputs:
-      mode:
-        description: 'full = scrape from scratch (slow); availability = refresh from latest full run (fast)'
-        required: false
-        default: 'full'
-        type: choice
-        options:
-          - 'full'
-          - 'availability'
-      # ----- full-mode inputs (ignored in availability mode) -----
       limit:
-        description: '[full] Per-scraper limit (leave empty for full scrape)'
+        description: 'Per-scraper limit (leave empty for full scrape)'
         required: false
         default: ''
       skip_browser:
-        description: '[full] Skip the Playwright scraper (todaytix)'
+        description: 'Skip the Playwright scrapers (todaytix, seatplan)'
         required: false
         default: 'false'
         type: choice
@@ -93,7 +50,7 @@ on:
           - 'false'
           - 'true'
       skip_olt:
-        description: '[full] Skip OLT (set true only if the Cloudflare Worker proxy is down or its secrets are missing)'
+        description: 'Skip OLT (set true only if the Cloudflare Worker proxy is down or its secrets are missing)'
         required: false
         default: 'false'
         type: choice
@@ -101,27 +58,13 @@ on:
           - 'false'
           - 'true'
       drop_ghost_listings:
-        description: '[full] Drop dedupe clusters with 0 performances (stale/announced-only shows)'
+        description: 'Drop dedupe clusters with 0 performances (stale/announced-only shows)'
         required: false
         default: 'false'
         type: choice
         options:
           - 'false'
           - 'true'
-      # ----- availability-mode inputs (ignored in full mode) -----
-      within_days:
-        description: '[availability] Refresh perfs within N days of today'
-        required: false
-        default: '2'
-      skip_todaytix_avail:
-        description: '[availability] Skip TodayTix availability (Playwright; slower)'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
-      # ----- shared input -----
       skip_publish:
         description: 'Skip committing the unified output (artifacts still uploaded)'
         required: false
@@ -131,48 +74,21 @@ on:
           - 'false'
           - 'true'
 
-# `actions: read` lets the availability_refresh job download artifacts
-# from a previous run of this workflow. `contents: write` is for the
-# publish step.
+# `contents: write` is for the publish step's commit to main.
 permissions:
   contents: write
-  actions: read
 
-# Both modes end with a commit to main; back-to-back commits would race.
-# Serialise everything through one concurrency group. cancel-in-progress
-# is false so a queued availability refresh waits for an in-flight full
-# scrape to finish rather than being cancelled (cancelling would lose
-# the refresh entirely).
+# This workflow and availability.yml both end with a commit to main;
+# back-to-back commits would race. Both share ONE concurrency group so
+# they serialise. cancel-in-progress is false so a queued run waits for an
+# in-flight one to finish rather than being cancelled (cancelling would
+# lose that run's refresh entirely).
 concurrency:
   group: scrape-and-refresh
   cancel-in-progress: false
 
 jobs:
-  # ---------------------------------------------------------------------
-  # setup: pick the mode and expose it as an output every other job
-  # branches on. Cron fires → availability; everything else uses the
-  # workflow_dispatch input (default: full).
-  # ---------------------------------------------------------------------
-  setup:
-    runs-on: ubuntu-latest
-    timeout-minutes: 1
-    outputs:
-      mode: ${{ steps.pick.outputs.mode }}
-    steps:
-      - name: Pick mode
-        id: pick
-        run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            MODE="availability"
-          else
-            MODE="${{ inputs.mode || 'full' }}"
-          fi
-          echo "Selected mode: $MODE  (event=${{ github.event_name }})"
-          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-
   scrape:
-    needs: setup
-    if: needs.setup.outputs.mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -501,8 +417,8 @@ jobs:
           retention-days: 30
 
   combine:
-    needs: [setup, scrape]
-    if: always() && needs.setup.outputs.mode == 'full'
+    needs: scrape
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -529,170 +445,9 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # =====================================================================
-  # AVAILABILITY MODE: download the latest full-mode all-scrapers artifact,
-  # re-probe per-source availability (without re-scraping or running chip
-  # passes), re-upload under a different name so dedupe knows which to read.
-  # =====================================================================
-  availability_refresh:
-    needs: setup
-    if: needs.setup.outputs.mode == 'availability'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    steps:
-      - name: Check out repo (for the availability scripts)
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: pip
-          cache-dependency-path: scraper/requirements.txt
-
-      - name: Install Python dependencies
-        run: pip install -r scraper/requirements.txt
-
-      # ------------------------------------------------------------------
-      # Find the latest FULL-mode run and download its all-scrapers.
-      # Heuristic: filter `gh run list` to event != "schedule", since
-      # scheduled runs always execute in availability mode (per the
-      # setup job above). A manual workflow_dispatch with mode=availability
-      # would slip past this filter — but the availability scripts are
-      # idempotent against an already-patched file, so the worst case is
-      # benign (we re-patch the same data).
-      # ------------------------------------------------------------------
-      - name: Find latest full-mode run
-        id: find_run
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # Pull up to 30 successful runs and pick the first whose event
-          # isn't a schedule. 30 is generous — a full scrape happens at
-          # least daily in practice.
-          RUN_ID=$(gh run list \
-            --workflow=scrape.yml \
-            --status=success \
-            --limit=30 \
-            --json databaseId,event \
-            --jq 'map(select(.event != "schedule")) | .[0].databaseId')
-          if [ -z "${RUN_ID:-}" ] || [ "$RUN_ID" = "null" ]; then
-            echo "::error::No successful full-mode run found in the last 30 successful runs of scrape.yml. Trigger a full run before scheduling availability."
-            exit 1
-          fi
-          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-          echo "Using full-mode artifacts from run $RUN_ID"
-
-      - name: Download per-source JSONs (all-scrapers from prior full run)
-        uses: actions/download-artifact@v4
-        with:
-          name: all-scrapers
-          path: data/
-          run-id: ${{ steps.find_run.outputs.run_id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          repository: ${{ github.repository }}
-
-      - name: List downloaded source files
-        run: |
-          ls -la data/ || true
-          for f in data/*.json; do
-            if [ -f "$f" ]; then
-              size=$(wc -c < "$f")
-              echo "  $f ($size bytes)"
-            fi
-          done
-
-      # ------------------------------------------------------------------
-      # Per-source availability re-probes. Each step is independent and
-      # gated on the source file's presence (some full runs skip OLT via
-      # the skip_olt input). Soft-failure: a hard exit from any one
-      # script logs a warning but doesn't abort — dedupe will still run
-      # with the partially-refreshed data.
-      #
-      # Chip passes (SeatPlan, TodayTix) are deliberately NOT re-run here.
-      # They caught their share of edge cases at the most recent full
-      # scrape; the cron refresh targets the more common "perf sold out /
-      # pulled from sale since scrape time" drift, which the lightweight
-      # availability scripts handle without Playwright. Running chip
-      # passes every 30 min would multiply Playwright cost and bot-
-      # detection exposure for marginal gain.
-      # ------------------------------------------------------------------
-
-      - name: Refresh OLT availability
-        if: hashFiles('data/olt.json') != ''
-        env:
-          OLT_PROXY_URL: ${{ secrets.OLT_PROXY_URL }}
-          OLT_PROXY_TOKEN: ${{ secrets.OLT_PROXY_TOKEN }}
-          PYTHONUNBUFFERED: "1"
-        continue-on-error: true
-        run: |
-          WITHIN="${{ inputs.within_days || '2' }}"
-          python scraper/olt_availability.py \
-            --in data/olt.json \
-            --within-days "$WITHIN" \
-            --concurrency 8
-
-      - name: Refresh TTD availability
-        if: hashFiles('data/ttd.json') != ''
-        continue-on-error: true
-        run: |
-          python scraper/ttd_availability.py \
-            --in data/ttd.json \
-            --concurrency 8
-
-      - name: Refresh LoveTheatre availability
-        if: hashFiles('data/lovetheatre.json') != ''
-        continue-on-error: true
-        run: |
-          WITHIN="${{ inputs.within_days || '2' }}"
-          python scraper/lovetheatre_availability.py \
-            --in data/lovetheatre.json \
-            --within-days "$WITHIN" \
-            --concurrency 8
-
-      - name: Install Playwright (for TodayTix)
-        # TodayTix availability needs Playwright for its chip pass on
-        # suspect showtimes. Most refresh runs see ~few suspects in the
-        # 2-day window so the install cost dominates; opt out via the
-        # skip_todaytix_avail input if rate-limit / bot-detection
-        # pressure becomes a problem.
-        if: hashFiles('data/todaytix.json') != '' && inputs.skip_todaytix_avail != 'true'
-        run: playwright install --with-deps chromium
-
-      - name: Refresh TodayTix availability
-        if: hashFiles('data/todaytix.json') != '' && inputs.skip_todaytix_avail != 'true'
-        continue-on-error: true
-        run: |
-          WITHIN="${{ inputs.within_days || '2' }}"
-          python scraper/todaytix_availability.py \
-            --in data/todaytix.json \
-            --window-days "$WITHIN" \
-            --workers 2
-
-      # SeatPlan availability is NOT refreshed here. Its first pass is
-      # requests-based but is followed inside the same script by a
-      # Playwright chip pass that we want to keep scoped to the full
-      # scrape's chip-cache pipeline. If you do see same-day staleness
-      # on a SeatPlan-only show, add a `python scraper/seatplan_availability.py
-      # --in data/seatplan.json --skip-chips --include-past` step here.
-
-      - name: Upload patched per-source files
-        # Different name from full-mode's "all-scrapers" so dedupe knows
-        # which to pull. Don't overwrite "all-scrapers" — that would
-        # invalidate the historical-marker filter the next availability
-        # run uses to find a full-mode baseline.
-        uses: actions/upload-artifact@v4
-        with:
-          name: all-scrapers-patched
-          path: data/
-          if-no-files-found: error
-          retention-days: 7
-
   dedupe:
-    needs: [setup, combine, availability_refresh]
-    if: always() && ((needs.setup.outputs.mode == 'full' && needs.combine.result == 'success') || (needs.setup.outputs.mode == 'availability' && needs.availability_refresh.result == 'success'))
+    needs: combine
+    if: always() && needs.combine.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -709,18 +464,10 @@ jobs:
       - name: Install dedupe dependencies
         run: pip install rapidfuzz pyyaml
 
-      - name: Download per-source files (full mode)
-        if: needs.setup.outputs.mode == 'full'
+      - name: Download per-source files
         uses: actions/download-artifact@v4
         with:
           name: all-scrapers
-          path: data/
-
-      - name: Download per-source files (availability mode)
-        if: needs.setup.outputs.mode == 'availability'
-        uses: actions/download-artifact@v4
-        with:
-          name: all-scrapers-patched
           path: data/
 
       - name: Sanity-check inputs
@@ -776,7 +523,7 @@ jobs:
   publish:
     # Commit the unified.json to main. CF Pages picks up the commit and
     # rebuilds the site with the fresh data baked in.
-    needs: [setup, dedupe]
+    needs: dedupe
     if: always() && needs.dedupe.result == 'success' && inputs.skip_publish != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -840,12 +587,7 @@ jobs:
         # correct placement.
         run: |
           set -e
-          MODE="${{ needs.setup.outputs.mode }}"
-          if [ "$MODE" = "availability" ]; then
-            MSG_PREFIX="data: availability refresh"
-          else
-            MSG_PREFIX="data: refresh from full scrape"
-          fi
+          MSG_PREFIX="data: refresh from full scrape"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
