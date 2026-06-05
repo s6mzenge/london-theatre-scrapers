@@ -105,25 +105,31 @@ jobs:
         run: pip install -r scraper/requirements.txt
 
       # ------------------------------------------------------------------
-      # Find the latest successful Full scrape and download its
-      # all-scrapers artifact. scrape.yml is full-only, so the most recent
-      # successful run that produced one is simply the most recent
-      # successful run -- no event filtering needed.
+      # Find a Full scrape to refresh from and download its all-scrapers
+      # artifact. We walk recent successful scrape.yml runs newest-first
+      # and take the first that actually HAS a (non-expired) all-scrapers
+      # artifact -- this skips any legacy availability-mode runs left in
+      # the history from the old dual-mode workflow, which only ever
+      # uploaded all-scrapers-patched.
       # ------------------------------------------------------------------
-      - name: Find latest full-scrape run
+      - name: Find latest full-scrape run with an all-scrapers artifact
         id: find_run
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          RUN_ID=$(gh run list \
-            --workflow=scrape.yml \
-            --status=success \
-            --limit=30 \
-            --json databaseId \
-            --jq '.[0].databaseId')
-          if [ -z "${RUN_ID:-}" ] || [ "$RUN_ID" = "null" ]; then
-            echo "::error::No successful run of scrape.yml found. Trigger a full scrape before running the availability refresh."
+          RUN_ID=""
+          for id in $(gh run list --workflow=scrape.yml --status=success --limit=30 --json databaseId --jq '.[].databaseId'); do
+            count=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/artifacts" \
+              --jq '[.artifacts[] | select(.name=="all-scrapers" and .expired==false)] | length' 2>/dev/null || echo 0)
+            if [ "${count:-0}" -gt 0 ]; then
+              RUN_ID="$id"
+              break
+            fi
+            echo "run $id has no all-scrapers artifact; skipping"
+          done
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::No successful Full scrape with an all-scrapers artifact in the last 30 runs. Run the full-only scrape.yml at least once first."
             exit 1
           fi
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
