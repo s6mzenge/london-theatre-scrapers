@@ -27,26 +27,38 @@ import {
 // with the bundle, and a Pages redeploy after every scrape is what
 // makes it fresh.
 //
-// price_history.json is a sibling file written by the same workflow:
-// an append-only per-(show, date, time) snapshot log of how prices
-// moved across scrapes, pruned to drop performances whose date is
-// strictly past in London local time. We fetch it in parallel and
-// attach it to the loaded unified object as `data.priceHistory` so
-// every existing consumer continues to work unchanged. Components
-// that want history data read `data.priceHistory` (it may be null on
-// first deploy or on a 404).
+// Price history is written by the same workflow but is now SHARDED BY
+// MONTH and committed pre-gzipped (the old single price_history.json
+// crossed GitHub's 100 MB-per-file push limit). The layout is:
+//
+//   data/price_history/index.json          — manifest (plaintext, tiny)
+//   data/price_history/<YYYY-MM>.json.gz    — one shard per perf month
+//
+// We fetch the manifest, then fetch + gunzip every listed monthly shard
+// in parallel and merge them back into a single
+// `{ shows: { <show_id>: { "<date>T<time>": [snapshots] } } }` map. That
+// reconstructs exactly the shape the old monolith had, so we attach it to
+// the loaded unified object as `data.priceHistory` and every existing
+// consumer (getPriceHistory / getPriceChange below) works unchanged. It
+// may be null on the first deploy before the workflow has produced shards,
+// or if the manifest 404s — the helpers degrade to empty arrays.
+//
+// (Bucket keys are month-disjoint across shards — a given performance's
+// date determines its month — so merging can't collide.)
 const BASE = (import.meta.env && import.meta.env.BASE_URL) || '/'
 const UNIFIED_URL = `${BASE}data/unified.json.gz`
-const HISTORY_URL = `${BASE}data/price_history.json.gz`
+const HISTORY_DIR = `${BASE}data/price_history/`
+const HISTORY_MANIFEST_URL = `${HISTORY_DIR}index.json`
 
 export async function loadUnifiedData() {
-  // Fire both fetches in parallel. We catch the history-fetch failure
-  // here so a missing or 404'd history file is never fatal — we just
-  // boot the site without it (the helpers below degrade to empty arrays).
-  const [unifiedRes, historyRes] = await Promise.all([
+  // Fire the unified fetch and the (multi-request) history load in
+  // parallel. We catch the history failure here so a missing/404'd
+  // manifest or shard is never fatal — we just boot the site without
+  // history and the helpers degrade to empty arrays.
+  const [unifiedRes, priceHistory] = await Promise.all([
     fetch(UNIFIED_URL, { cache: 'default' }),
-    fetch(HISTORY_URL, { cache: 'default' }).catch((err) => {
-      console.warn('[STAGE] price history fetch failed', err)
+    _loadPriceHistory().catch((err) => {
+      console.warn('[STAGE] price history load failed; continuing without', err)
       return null
     }),
   ])
@@ -55,21 +67,6 @@ export async function loadUnifiedData() {
     throw new Error(`Failed to fetch ${UNIFIED_URL}: HTTP ${unifiedRes.status}`)
   }
   const data = await _gunzipJSON(unifiedRes)
-
-  let priceHistory = null
-  if (historyRes && historyRes.ok) {
-    try {
-      priceHistory = await _gunzipJSON(historyRes)
-    } catch (err) {
-      // Decode failed — log and continue. The site stays functional
-      // without history; only the history-aware features lose their data.
-      console.warn('[STAGE] price history failed to decode; continuing without', err)
-    }
-  } else if (historyRes && !historyRes.ok && historyRes.status !== 404) {
-    // 404 is expected on the very first deploy before the workflow has
-    // produced a history file. Anything else is worth a console note.
-    console.warn(`[STAGE] price history fetch returned HTTP ${historyRes.status}`)
-  }
 
   // Attach BEFORE filterToUpcomingShows. That filter spreads `data`
   // into a new object (`{...data, shows: upcoming, ...}`), which
@@ -88,6 +85,70 @@ export async function loadUnifiedData() {
   // App-level show lookup) automatically sees only upcoming shows
   // without having to add its own filter.
   return filterToUpcomingShows(data, todayISO())
+}
+
+// Load the sharded price history: fetch the manifest, then fetch + gunzip
+// every listed monthly shard in parallel and merge them into one
+// `{ generated_at, schema_version, shows }` object matching the old
+// monolith's shape. Returns null when there's nothing to load (manifest
+// 404 on first deploy, or unreadable manifest) so the caller can attach
+// `data.priceHistory = null` and let the helpers degrade gracefully.
+// Individual shard failures are tolerated — a missing month just means
+// that month's perfs have no history this session, not a hard error.
+async function _loadPriceHistory() {
+  const manRes = await fetch(HISTORY_MANIFEST_URL, { cache: 'default' })
+  if (!manRes.ok) {
+    // 404 is expected before the workflow has produced any shards.
+    if (manRes.status !== 404) {
+      console.warn(`[STAGE] price history manifest HTTP ${manRes.status}`)
+    }
+    return null
+  }
+
+  let manifest
+  try {
+    manifest = await manRes.json()
+  } catch (err) {
+    console.warn('[STAGE] price history manifest failed to parse', err)
+    return null
+  }
+
+  const months = Array.isArray(manifest && manifest.months) ? manifest.months : []
+  const base = {
+    generated_at: (manifest && manifest.generated_at) || null,
+    schema_version: manifest && manifest.schema_version,
+    shows: {},
+  }
+  if (months.length === 0) return base
+
+  const shards = await Promise.all(
+    months.map(async (m) => {
+      try {
+        const r = await fetch(`${HISTORY_DIR}${m}.json.gz`, { cache: 'default' })
+        if (!r.ok) {
+          console.warn(`[STAGE] price history shard ${m} HTTP ${r.status}`)
+          return null
+        }
+        return await _gunzipJSON(r)
+      } catch (err) {
+        console.warn(`[STAGE] price history shard ${m} failed to load`, err)
+        return null
+      }
+    }),
+  )
+
+  // Merge per-show bucket maps. Keys are month-disjoint across shards, so
+  // a plain Object.assign per show can't clobber another month's buckets.
+  const shows = base.shows
+  for (const shard of shards) {
+    const shardShows = shard && shard.shows
+    if (!shardShows) continue
+    for (const sid in shardShows) {
+      const dst = shows[sid] || (shows[sid] = {})
+      Object.assign(dst, shardShows[sid])
+    }
+  }
+  return base
 }
 
 // Shared gunzip helper. Decompress in JS rather than relying on
