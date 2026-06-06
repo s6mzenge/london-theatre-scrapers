@@ -1,17 +1,29 @@
 #!/usr/bin/env node
 // Gzip-compress dist/data/*.json after Vite build.
 //
-// Two files are committed in public/data/ and need this treatment:
-//   * unified.json       — the catalogue + per-perf prices (the main bundle)
-//   * price_history.json — append-only per-perf snapshot log
+// Only ONE file needs build-time gzipping now:
+//   * unified.json — the catalogue + per-perf prices (the main bundle).
+//     Committed raw in public/data/, ~25-33 MiB and trending up. Vite
+//     copies it to dist/data/unified.json; we gzip it here and drop the
+//     raw so only the .gz ships.
 //
-// Both are >> 1 MiB raw and gzip to a small fraction of that. Cloudflare
-// Pages caps individual files at 25 MiB; unified.json is ~25-33 MiB raw
-// today and trending up, so gzipping is genuinely required, not just an
-// optimisation. Browsers decompress transparently when the response
-// carries Content-Encoding: gzip (set via public/_headers), but on this
-// site we explicitly use DecompressionStream in src/lib/data.js because
-// CF Pages doesn't honour that header from _headers for static assets.
+// Price history is NO LONGER handled here. It used to be a single
+// price_history.json that we gzipped at build time, but it crossed
+// GitHub's hard 100 MB-per-file push limit. It's now stored as
+// per-month shards committed ALREADY gzipped under
+// public/data/price_history/<YYYY-MM>.json.gz, plus a tiny plaintext
+// index.json manifest (see scraper/analysis/update_price_history.py).
+// Vite copies that whole directory into dist/data/price_history/ verbatim,
+// so there is nothing to compress here — the shards are serve-ready as-is,
+// and the client decompresses each with DecompressionStream exactly like
+// unified.json.gz (src/lib/data.js).
+//
+// Cloudflare Pages caps individual files at 25 MiB; unified.json.gz and
+// every monthly shard are comfortably under that. Browsers decompress
+// transparently when the response carries Content-Encoding: gzip, but on
+// this site we explicitly use DecompressionStream in src/lib/data.js
+// because CF Pages doesn't honour that header from _headers for static
+// assets.
 import { readFileSync, writeFileSync, unlinkSync, existsSync } from 'node:fs'
 import { gzipSync } from 'node:zlib'
 
@@ -36,8 +48,3 @@ function gzipOne(srcPath, { required }) {
 
 // unified.json is required; the build is broken without it.
 gzipOne('dist/data/unified.json', { required: true })
-
-// price_history.json is optional on the very first deploy after this
-// feature lands (the workflow will start producing it on the next
-// scrape), so we don't hard-fail if it's absent yet.
-gzipOne('dist/data/price_history.json', { required: false })
