@@ -1,0 +1,33 @@
+name: TodayTix discovery probe
+
+# Standalone, read-only diagnostic. Interrogates GET /api/v2/shows?location=2
+# from a GitHub (US-based) runner to decide whether the flaky Playwright
+# listing-scroll can be replaced with deterministic API pagination: it reports
+# the response shape, page size, which pagination mechanism advances, a full
+# walk vs the reported/listing totals, and whether id+slug pairs are buildable.
+# Changes nothing. Run it manually from the Actions tab (Run workflow), then
+# paste the job log back.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discovery-probe:
+    runs-on: ubuntu-latest          # same US-based runner class as the scrape
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Probe /api/v2/shows pagination from this runner
+        run: python scraper/todaytix_discovery_probe.py
