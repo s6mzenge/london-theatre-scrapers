@@ -243,20 +243,23 @@ jobs:
           # fixes that: it fetches every ticketing URL through ONE headless-
           # Chromium context that has solved the WAF challenge (the same
           # mechanism the chip pass uses), so the aws-waf-token rides along on
-          # each in-page fetch, direct from the runner IP. BUT a fast burst
-          # trips the WAF's rate rule and invalidates the token mid-sweep
-          # (observed at --concurrency 12: the token died after ~160 fetches
-          # and every later request 202'd). So the in-page fetch pool is paced
-          # down to --concurrency 4 to stay nearer the rate the WAF tolerates
-          # (the scraper above clears the same IP reliably at ~1 req/s via
-          # navigations). --shuffle randomises order so a different slice lands
-          # within --max-seconds each run; with --price-cache, coverage rolls
-          # toward full over several runs and perfs not refreshed this run
-          # carry their last real price instead of reverting to catalogue
-          # lowPrice. --max-seconds 780 is the wall-clock budget for the slice.
-          # The chip pass below is unaffected (Playwright, runner-direct,
-          # continue-on-error). Chromium is already installed for the chip
-          # pass, so no extra setup is needed here.
+          # each in-page fetch, direct from the runner IP. The catch: the
+          # aws-waf-token has a SHORT post-solve window, and firing a
+          # concurrent pool of fetches drains it fast — once it dies the pool
+          # can't recover (every later request 202s). Counter-intuitively,
+          # lower concurrency is WORSE here: it squeezes fewer fetches out of
+          # the single token-window before it closes (observed: --concurrency
+          # 12 -> 161 fresh, --concurrency 4 -> 19). So 12 is the best the
+          # pool model manages; --shuffle rolls which slice lands fresh each
+          # run and --price-cache carries the rest (perfs not refreshed keep
+          # their last real price instead of reverting to catalogue lowPrice).
+          # --max-seconds 780 is the wall-clock budget. The chip pass below is
+          # unaffected (Playwright, runner-direct, continue-on-error).
+          #
+          # NOTE: the durable fix is to fetch the way seatplan_scraper.py does
+          # — serialized (one in-page fetch at a time, ~1 req/s) with an
+          # immediate token re-solve + retry on each 202 — which sustains
+          # without dying. That is a code change to the browser pass, pending.
           #
           # The proxy env below is UNUSED in browser mode (which goes direct);
           # it's retained so reverting to --fetch-mode requests (burst + shuffle
@@ -270,7 +273,7 @@ jobs:
             --price-cache scraper/data/seatplan_price_cache.json \
             --fetch-mode browser \
             --shuffle \
-            --concurrency 4 \
+            --concurrency 12 \
             --max-seconds 780
 
       - name: Verify OLT per-performance availability
