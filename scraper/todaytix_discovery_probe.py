@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """
-todaytix_discovery_probe.py  (v2 — scope & reliability drill-down)
-==================================================================
+todaytix_discovery_probe.py  (v2.1 — scope & reliability, hardened)
+===================================================================
 
 READ-ONLY DIAGNOSTIC. Makes no repo changes. Run on a US GitHub runner.
 
-v1 already proved the big thing: GET /api/v2/shows?location=2 paginates via
-offset/limit, reports total=236, returns the whole catalogue in one call with
-limit=500, and every show carries id + slug. v2 drills into the three details
-needed to switch discovery onto the API *correctly* rather than by guesswork:
+v1 proved the big thing: GET /api/v2/shows?location=2 paginates via offset/limit,
+reports total=236, returns the whole catalogue in one call with limit=500, and
+every show carries id + slug. v2 drills into the three details needed to switch
+discovery onto the API correctly:
 
-  [1] DUP / ID-LESS analysis — why a 236-entry response yielded only 225 unique
-      ids, and whether offset-paging reliably reaches the same full set.
+  [1] DUP / ID-LESS analysis + offset-paging reliability (236 raw vs 225 unique).
   [2] CATEGORY / TYPE distribution — the API over-returns vs the ~200-show
-      theatre listing (it includes attractions like "st-pauls-cathedral"), so
-      we need to see the category / productType / isPyos / isGa split to define
-      a "theatre only" filter that matches the current scrape's scope.
-  [3] SLUG GAPS — which shows lack a slug (so /london/shows/{id}-{slug} can't be
-      built for them), and what they are (experiences? real theatre?).
+      theatre listing (includes attractions like "st-pauls-cathedral"), so we
+      need the category / productType / isPyos / isGa split to define a
+      "theatre only" filter that matches the current scrape's scope.
+  [3] SLUG GAPS — which shows lack a slug and what they are.
 
-Prints a SUMMARY with the likely theatre-show count after filtering. Paste the
-whole output back.
+HARDENING (the prior run hit a transient EMPTY response and aborted): every
+request now retries empty / non-JSON bodies itself — urllib3's Retry only
+catches 5xx, not a 200 with an empty body — prints the HTTP status + a body
+snippet when a response is unusable, makes offset-paging the primary path with
+the single bulk call as a cross-check, and only gives up if everything fails.
 
 Usage:
     python scraper/todaytix_discovery_probe.py
@@ -33,6 +34,7 @@ import argparse
 import collections
 import json
 import sys
+import time
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -44,7 +46,8 @@ except Exception:  # pragma: no cover
 
 SHOWS_URL = "https://api.todaytix.com/api/v2/shows"
 LONDON = 2
-TIMEOUT = 25.0
+TIMEOUT = 30.0
+TRIES = 4  # per-call attempts on empty / non-JSON bodies
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -78,20 +81,43 @@ def extract_shows(payload) -> list[dict]:
     return []
 
 
-def get(session, **params):
+def fetch_json(session, *, tries: int = TRIES, **params) -> dict:
+    """GET /shows with self-retry on empty / non-JSON / unexpected bodies.
+
+    A parsed dict carrying 'data' and/or 'pagination' (even with data == [])
+    is a valid response and ends the retry loop — that is how end-of-pages
+    looks. Anything else (empty body, HTML challenge, connection error) is
+    retried with backoff. Returns the last attempt's diagnostics on failure.
+    """
     p = {"location": LONDON}
     p.update(params)
-    try:
-        r = session.get(SHOWS_URL, params=p, timeout=TIMEOUT)
-        j = r.json()
-    except Exception as e:
-        return [], None, f"{type(e).__name__}: {str(e)[:100]}"
-    pag = j.get("pagination") if isinstance(j, dict) else None
-    return extract_shows(j), pag, None
+    last = {"ok": False, "status": None, "shows": [], "pag": None,
+            "body": "", "error": "no attempt"}
+    for attempt in range(tries):
+        try:
+            r = session.get(SHOWS_URL, params=p, timeout=TIMEOUT)
+        except Exception as e:
+            last = {"ok": False, "status": None, "shows": [], "pag": None,
+                    "body": "", "error": f"{type(e).__name__}: {str(e)[:120]}"}
+            time.sleep(0.8 * (attempt + 1))
+            continue
+        body = r.text or ""
+        try:
+            j = r.json()
+        except Exception:
+            j = None
+        if isinstance(j, dict) and ("data" in j or "pagination" in j):
+            return {"ok": True, "status": r.status_code,
+                    "shows": extract_shows(j),
+                    "pag": j.get("pagination"), "body": "", "error": None}
+        last = {"ok": False, "status": r.status_code, "shows": [], "pag": None,
+                "body": body[:200].replace("\n", " "),
+                "error": "empty/non-JSON/unexpected body"}
+        time.sleep(0.8 * (attempt + 1))
+    return last
 
 
 def label(v):
-    """Compact label for a category/productType-ish value."""
     if isinstance(v, dict):
         return v.get("name") or v.get("slug") or v.get("type") or "(dict)"
     if isinstance(v, list):
@@ -106,11 +132,9 @@ def cat_name(sh: dict) -> str:
     return label(sh.get("category"))
 
 
-def analyse(shows: list[dict]):
-    """Dedup by id; return (unique_shows, stats)."""
+def dedup(shows: list[dict]):
     by_id: dict = {}
-    dups = 0
-    idless = 0
+    dups = idless = 0
     for sh in shows:
         i = sh.get("id")
         if i is None:
@@ -120,71 +144,80 @@ def analyse(shows: list[dict]):
             dups += 1
         else:
             by_id[i] = sh
-    return list(by_id.values()), {"raw": len(shows), "unique": len(by_id),
-                                  "dups": dups, "idless": idless}
+    return by_id, dups, idless
 
 
 def probe() -> int:
     s = build_session()
     print("=" * 74)
-    print("TodayTix discovery probe v2 — /api/v2/shows?location=2 scope & reliability")
+    print("TodayTix discovery probe v2.1 — /api/v2/shows?location=2 scope & reliability")
     print("=" * 74)
 
-    # --- [1] retrieval: single big call vs offset paging -------------------
+    # --- [1] retrieval -----------------------------------------------------
     print("\n[1] RETRIEVAL & DUP / ID-LESS ANALYSIS")
-    big_shows, big_pag, err = get(s, limit=500)
-    if err:
-        print(f"    limit=500 call failed: {err}")
-        return 1
-    total = (big_pag or {}).get("total")
-    big_unique, big_stats = analyse(big_shows)
-    print(f"    single call (limit=500): raw entries={big_stats['raw']}, "
-          f"unique ids={big_stats['unique']}, duplicate-id rows={big_stats['dups']}, "
-          f"id-less rows={big_stats['idless']}   (pagination.total={total})")
 
-    # offset paging in pages of 50
+    big = fetch_json(s, limit=500)
+    if big["ok"]:
+        by_id, dups, idless = dedup(big["shows"])
+        total = (big["pag"] or {}).get("total")
+        print(f"    single call (limit=500): status={big['status']}, "
+              f"raw entries={len(big['shows'])}, unique ids={len(by_id)}, "
+              f"dup-id rows={dups}, id-less rows={idless}  (pagination.total={total})")
+        big_unique = by_id
+    else:
+        print(f"    single call (limit=500): FAILED status={big['status']} "
+              f"error={big['error']!r} body[:200]={big['body']!r}")
+        print("    (continuing with offset paging, which is the path we'd ship anyway)")
+        big_unique = {}
+        total = None
+
+    # offset paging in pages of 50 (primary, robust path)
     paged: dict = {}
-    pages = 0
-    offset = 0
-    limit = 50
-    cap = ((total or 300) // limit) + 3
+    pages = empty_pages = failed_pages = 0
+    offset, limit = 0, 50
+    cap = ((total or 300) // limit) + 4
     while pages < cap:
-        chunk, _pag, e2 = get(s, limit=limit, offset=offset)
+        chunk = fetch_json(s, limit=limit, offset=offset)
         pages += 1
-        if e2 or not chunk:
+        if not chunk["ok"]:
+            failed_pages += 1
+            print(f"    [page offset={offset}] FAILED status={chunk['status']} "
+                  f"error={chunk['error']!r} body[:120]={chunk['body'][:120]!r}")
             break
+        if total is None and chunk["pag"]:
+            total = (chunk["pag"] or {}).get("total")
+            cap = ((total or 300) // limit) + 4
+        if not chunk["shows"]:
+            empty_pages += 1
+            break  # past the end
         before = len(paged)
-        for sh in chunk:
+        for sh in chunk["shows"]:
             i = sh.get("id")
             if i is not None:
                 paged.setdefault(i, sh)
-        if len(chunk) < limit and len(paged) == before:
-            break
-        if len(paged) == before and len(chunk) < limit:
-            break
         offset += limit
         if total and offset >= total:
-            # one more page to be safe, then stop
-            chunk, _p, e3 = get(s, limit=limit, offset=offset)
-            pages += 1
-            if not e3 and chunk:
-                for sh in chunk:
-                    i = sh.get("id")
-                    if i is not None:
-                        paged.setdefault(i, sh)
             break
-    print(f"    offset paging (limit=50): pages={pages}, unique ids collected={len(paged)}")
+    print(f"    offset paging (limit=50): pages={pages}, unique ids collected={len(paged)}, "
+          f"empty_pages={empty_pages}, failed_pages={failed_pages}  (pagination.total={total})")
 
-    # canonical set = union of both methods (most complete)
+    # canonical = union of whatever succeeded
     canon: dict = dict(paged)
-    for sh in big_unique:
-        canon.setdefault(sh["id"], sh)
+    for i, sh in big_unique.items():
+        canon.setdefault(i, sh)
     shows = list(canon.values())
     print(f"    CANONICAL unique shows (union of both methods): {len(shows)}")
-    if big_stats["unique"] != len(paged):
-        print(f"    NOTE: single-call unique ({big_stats['unique']}) != paged unique "
+    if big["ok"] and len(big_unique) != len(paged):
+        print(f"    NOTE: single-call unique ({len(big_unique)}) != paged unique "
               f"({len(paged)}) — result set is mildly non-deterministic; paging+dedup "
               f"is the robust path.")
+
+    if not shows:
+        print("\nVERDICT: could not retrieve any shows this run (transient API/WAF "
+              "response — see status/body above). The API is reachable in principle "
+              "(v1 succeeded); just re-run the Action. Discovery stays on the scroll "
+              "until a clean pull.")
+        return 1
 
     # --- [2] category / type distribution ----------------------------------
     print("\n[2] CATEGORY / TYPE DISTRIBUTION  (theatre vs experience?)")
@@ -200,10 +233,8 @@ def probe() -> int:
     dist(lambda sh: label(sh.get("admissionType")), "admissionType")
     dist(lambda sh: label(sh.get("inventorySelectionMode")), "inventorySelectionMode")
 
-    # cross-tab category × seat-selection signals
     print("\n    cross-tab by category.name  (count | isPyos=T | isGa=T | regAvail=T | slug-less):")
     cats = collections.Counter(cat_name(sh) for sh in shows)
-    rows = []
     for cn, _ in cats.most_common(40):
         grp = [sh for sh in shows if cat_name(sh) == cn]
         n_pyos = sum(1 for sh in grp if sh.get("isPyos") is True)
@@ -211,12 +242,11 @@ def probe() -> int:
         n_reg = sum(1 for sh in grp if sh.get("areRegularTicketsAvailable") is True)
         n_noslug = sum(1 for sh in grp if not sh.get("slug"))
         ex = next((sh.get("slug") or sh.get("name") for sh in grp), "")
-        rows.append((cn, len(grp), n_pyos, n_ga, n_reg, n_noslug, ex))
-    for cn, n, p, g, rg, ns, ex in rows:
-        print(f"        {cn:22.22} {n:4d} | {p:4d} | {g:4d} | {rg:4d} | {ns:4d}   e.g. {ex}")
+        print(f"        {cn:22.22} {len(grp):4d} | {n_pyos:4d} | {n_ga:4d} | "
+              f"{n_reg:4d} | {n_noslug:4d}   e.g. {ex}")
 
     # --- [3] slug gaps ------------------------------------------------------
-    print("\n[3] SLUG GAPS  (shows we can't build /london/shows/{id}-{slug} for)")
+    print("\n[3] SLUG GAPS  (cannot build /london/shows/{id}-{slug} for these)")
     noslug = [sh for sh in shows if not sh.get("slug")]
     print(f"    shows with NO slug: {len(noslug)} of {len(shows)}")
     for sh in noslug[:30]:
@@ -224,9 +254,6 @@ def probe() -> int:
               f"name={str(sh.get('name') or sh.get('displayName'))[:40]}")
 
     # --- SUMMARY ------------------------------------------------------------
-    # crude theatre vs non-theatre guess: theatre ~ has a slug AND isPyos (or
-    # reg tickets) — just an estimate for the log; final filter decided from
-    # the tables above.
     theatre_est = [sh for sh in shows if sh.get("slug") and (
         sh.get("isPyos") is True or sh.get("areRegularTicketsAvailable") is True)]
     print("\n" + "=" * 74)
@@ -245,35 +272,75 @@ def probe() -> int:
 
 # --- offline selftest -------------------------------------------------------
 
+class _FakeResp:
+    def __init__(self, status, payload, raw_text=None):
+        self.status_code = status
+        self._payload = payload
+        self.text = raw_text if raw_text is not None else (
+            json.dumps(payload) if payload is not None else "")
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("No JSON")
+        return self._payload
+
+
+class _FakeSession:
+    """Returns queued responses in order, to exercise the retry loop."""
+    def __init__(self, queue):
+        self.queue = list(queue)
+
+    def get(self, url, params=None, timeout=None):
+        return self.queue.pop(0)
+
+
 def selftest() -> int:
     print("SELFTEST (offline)\n")
-    sample = [
-        {"id": 1, "slug": "ham", "name": "Hamilton",
-         "category": {"name": "Musicals"}, "productType": "SHOW",
-         "isPyos": True, "isGa": False, "areRegularTicketsAvailable": True,
-         "admissionType": "TIMED", "inventorySelectionMode": "PYOS"},
-        {"id": 1, "slug": "ham", "name": "Hamilton dup", "category": {"name": "Musicals"}},  # dup id
-        {"id": 2, "slug": None, "name": "St Paul's", "category": {"name": "Attractions"},
-         "productType": "EXPERIENCE", "isPyos": False, "isGa": True,
-         "areRegularTicketsAvailable": True},
-        {"slug": "x", "name": "no-id"},  # id-less
-    ]
-    uniq, st = analyse(sample)
-    assert st["raw"] == 4 and st["unique"] == 2 and st["dups"] == 1 and st["idless"] == 1, st
+
+    # retry loop: two empty bodies, then a good one
+    good = {"code": 200, "data": [{"id": 1, "slug": "a"}],
+            "pagination": {"total": 1, "offset": 0, "limit": 50}}
+    sess = _FakeSession([_FakeResp(200, None, ""),        # empty body -> retry
+                         _FakeResp(200, None, "<html>"),  # non-JSON -> retry
+                         _FakeResp(200, good)])           # good -> stop
+    # patch sleep to no-op
+    orig_sleep = time.sleep
+    time.sleep = lambda *_: None
+    try:
+        res = fetch_json(sess, tries=4, limit=50)
+    finally:
+        time.sleep = orig_sleep
+    assert res["ok"] and len(res["shows"]) == 1 and res["pag"]["total"] == 1, res
+
+    # all-empty -> failure with diagnostics
+    sess2 = _FakeSession([_FakeResp(403, None, "blocked")] * 4)
+    time.sleep = lambda *_: None
+    try:
+        res2 = fetch_json(sess2, tries=4, limit=50)
+    finally:
+        time.sleep = orig_sleep
+    assert not res2["ok"] and res2["status"] == 403 and "blocked" in res2["body"], res2
+
+    # end-of-pages: empty data list is a VALID response (not retried)
+    sess3 = _FakeSession([_FakeResp(200, {"data": [], "pagination": {"total": 1}})])
+    res3 = fetch_json(sess3, tries=4, limit=50, offset=999)
+    assert res3["ok"] and res3["shows"] == [], res3
+
+    # dedup + labels
+    by_id, dups, idless = dedup([{"id": 1}, {"id": 1}, {"slug": "x"}, {"id": 2}])
+    assert len(by_id) == 2 and dups == 1 and idless == 1
     assert label({"name": "Musicals"}) == "Musicals"
     assert label(["a", {"name": "b"}]) == "a+b"
-    assert label(None) == "(none)"
-    assert cat_name(sample[0]) == "Musicals"
-    assert cat_name(sample[2]) == "Attractions"
-    noslug = [sh for sh in uniq if not sh.get("slug")]
-    assert len(noslug) == 1 and noslug[0]["name"] == "St Paul's"
-    print("  analyse (raw/unique/dups/idless), label, cat_name, slug-gap: OK")
+    assert cat_name({"category": {"name": "Plays"}}) == "Plays"
+
+    print("  fetch_json retry-on-empty / fail-with-diagnostics / end-of-pages: OK")
+    print("  dedup + label + cat_name: OK")
     print("\nSELFTEST: PASS")
     return 0
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Probe v2: scope & reliability of /api/v2/shows.")
+    ap = argparse.ArgumentParser(description="Probe v2.1: scope & reliability of /api/v2/shows.")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args(argv)
     return selftest() if args.selftest else probe()
