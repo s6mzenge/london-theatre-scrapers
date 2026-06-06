@@ -584,10 +584,12 @@ jobs:
         # attempt. The retry is the safety net for anything outside that
         # lock (human commits, other workflows touching main, etc).
         #
-        # Both unified.json and price_history.json are committed --
-        # report.txt and review.json stay as workflow artifacts. The
-        # website reads both committed files; see scripts/gzip-data.mjs
-        # for the build-time gzip step that ships them to the CDN.
+        # unified.json (raw) and the per-month price-history shards
+        # (public/data/price_history/<YYYY-MM>.json.gz + index.json) are
+        # committed -- report.txt and review.json stay as workflow
+        # artifacts. unified.json is gzipped at build time by
+        # scripts/gzip-data.mjs; the history shards are committed already
+        # gzipped and shipped to the CDN as-is.
         #
         # The price-history update lives INSIDE the retry loop, after
         # `git reset --hard origin/main` and before `git add`. That's
@@ -617,15 +619,21 @@ jobs:
             # Append a snapshot for any (show, date, time) whose price
             # payload moved vs its last recorded entry; prune buckets
             # whose perf date is strictly past in London local time;
-            # prune show_ids no longer in unified. Idempotent w.r.t.
-            # unified.generated_at, so a re-iteration of this loop on
-            # the same dedupe output never produces duplicate entries.
+            # prune show_ids no longer in unified. Writes per-month gzip
+            # shards under public/data/price_history/ (+ index.json), and
+            # on the first run migrates from — and deletes — the legacy
+            # monolithic public/data/price_history.json. Idempotent w.r.t.
+            # unified.generated_at, so a re-iteration of this loop on the
+            # same dedupe output never produces duplicate entries.
             python scraper/analysis/update_price_history.py \
               --unified public/data/unified.json \
-              --history-in public/data/price_history.json \
-              --out public/data/price_history.json
+              --history-dir public/data/price_history
 
-            git add public/data/unified.json public/data/price_history.json
+            # Stage everything under public/data: the regenerated
+            # unified.json, the changed month shards + manifest, any shard
+            # removed as a month emptied, and (on the migration run) the
+            # deletion of the old price_history.json monolith.
+            git add -A public/data
 
             if git diff --cached --quiet; then
               echo "No changes to commit."
@@ -633,9 +641,22 @@ jobs:
             fi
 
             git commit -m "$MSG_PREFIX ($(date -u +%Y-%m-%dT%H:%MZ))"
-            if git push origin main; then
+
+            # Distinguish a retryable concurrent-push race from a fatal
+            # pre-receive rejection (e.g. GitHub's 100 MB-per-file limit).
+            # Retrying the latter is pointless — each iteration rebuilds
+            # the same blob and fails identically, which is exactly how the
+            # old monolith wedged this job for an entire run — so bail
+            # immediately and surface it.
+            if push_out="$(git push origin main 2>&1)"; then
+              echo "$push_out"
               echo "Pushed on attempt $i."
               exit 0
+            fi
+            echo "$push_out"
+            if echo "$push_out" | grep -qiE "exceeds GitHub's file size limit|GH001: Large files detected"; then
+              echo "::error::Push rejected by a file-size limit; retrying cannot help. Check public/data for an oversized blob (price history should be sharded under public/data/price_history/)."
+              exit 1
             fi
             echo "Push rejected on attempt $i (concurrent push?). Retrying..."
             sleep 2
