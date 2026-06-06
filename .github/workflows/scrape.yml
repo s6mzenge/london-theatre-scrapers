@@ -243,14 +243,20 @@ jobs:
           # fixes that: it fetches every ticketing URL through ONE headless-
           # Chromium context that has solved the WAF challenge (the same
           # mechanism the chip pass uses), so the aws-waf-token rides along on
-          # each in-page fetch and ALL ~1,100 performances verify every run,
-          # direct from the runner IP. --concurrency 12 is the in-page fetch
-          # pool; --max-seconds is a safety cap (a sweep finishes in ~30-60s);
-          # --price-cache is the safety net (if a run partially fails, perfs
+          # each in-page fetch, direct from the runner IP. BUT a fast burst
+          # trips the WAF's rate rule and invalidates the token mid-sweep
+          # (observed at --concurrency 12: the token died after ~160 fetches
+          # and every later request 202'd). So the in-page fetch pool is paced
+          # down to --concurrency 4 to stay nearer the rate the WAF tolerates
+          # (the scraper above clears the same IP reliably at ~1 req/s via
+          # navigations). --shuffle randomises order so a different slice lands
+          # within --max-seconds each run; with --price-cache, coverage rolls
+          # toward full over several runs and perfs not refreshed this run
           # carry their last real price instead of reverting to catalogue
-          # lowPrice). The chip pass below is unaffected (Playwright, runner-
-          # direct, continue-on-error). Chromium is already installed for the
-          # chip pass, so no extra setup is needed here.
+          # lowPrice. --max-seconds 780 is the wall-clock budget for the slice.
+          # The chip pass below is unaffected (Playwright, runner-direct,
+          # continue-on-error). Chromium is already installed for the chip
+          # pass, so no extra setup is needed here.
           #
           # The proxy env below is UNUSED in browser mode (which goes direct);
           # it's retained so reverting to --fetch-mode requests (burst + shuffle
@@ -263,7 +269,8 @@ jobs:
             --chip-cache scraper/data/chip_cache_seatplan.json \
             --price-cache scraper/data/seatplan_price_cache.json \
             --fetch-mode browser \
-            --concurrency 12 \
+            --shuffle \
+            --concurrency 4 \
             --max-seconds 780
 
       - name: Verify OLT per-performance availability
