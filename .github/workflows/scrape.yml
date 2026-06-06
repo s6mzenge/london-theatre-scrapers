@@ -550,6 +550,20 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Coverage gate — block a collapsed scrape from going live
+        # Refuse to overwrite the live unified.json if any source's show
+        # count has collapsed versus what's currently published — e.g. the
+        # TodayTix listing discovering 54/200 shows on a flaky run. A
+        # non-zero exit fails the job HERE, before the copy in the next
+        # step, so the live data is left untouched and yesterday's complete
+        # file keeps serving. Pure stdlib; compares per-source show counts
+        # plus global totals against public/data/unified.json, and fails
+        # open only when there is no live baseline to compare against.
+        run: |
+          python scraper/analysis/coverage_gate.py \
+            --new dedupe_output/unified.json \
+            --live public/data/unified.json
+
       - name: Commit and push to main
         # Last-writer-wins with retry. unified.json is regenerated from
         # scratch each run, so two parallel builds produce two complete,
