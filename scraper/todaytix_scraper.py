@@ -71,6 +71,43 @@ LISTING_URL = f"{BASE_URL}/london/category/all-shows"
 SHOW_URL_TEMPLATE = f"{BASE_URL}/london/shows/{{id}}-{{slug}}"
 BOOKING_URL_BASE = f"{BASE_URL}/booking/seating-plan"
 
+# --- API-based discovery ---------------------------------------------------
+# The listing page is the only thing that needs a real browser (the catalogue
+# is lazy-loaded as you scroll, which once raced to 54/200). TodayTix's own
+# JSON API exposes the whole catalogue deterministically, so discovery can run
+# on plain `requests` and the scroll becomes a fallback, not the default path.
+#
+#   GET https://api.todaytix.com/api/v2/shows?location=2   (2 = London)
+#
+# Measured behaviour (probe, US runner):
+#   * paginates via offset/limit; the param is specifically `limit`
+#     (pageSize/perPage are ignored). limit=500 returns the whole catalogue
+#     (~236 entries) in one call.
+#   * total reported in pagination.total.
+#   * the result set is MILDLY NON-DETERMINISTIC per request — a single pull
+#     returns ~221-233 of the 236 distinct shows (a few duplicate / dropped
+#     rows from sort instability), so we union a handful of pulls to converge.
+#   * productType cleanly separates scope: "SHOW" (~190 theatre shows, matching
+#     the /london/category/all-shows listing) vs "ATTRACTION" (St Paul's,
+#     London Eye, Legoland, …) and "GIFT_CARD". We keep only SHOW.
+#   * every show carries id + slug, EXCEPT a handful (observed: CATS,
+#     Romeo & Juliet, La traviata) that come back slug-less; for those we
+#     derive a slug from the name. The detail fetch follows redirects, so an
+#     id-correct /london/shows/{id}-{slug} resolves regardless.
+# Some egress regions occasionally return an empty / non-JSON body on a 200;
+# urllib3's Retry only covers 5xx, so _api_fetch_shows retries those itself.
+API_SHOWS_URL = "https://api.todaytix.com/api/v2/shows"
+API_LOCATION_LONDON = 2
+API_PULL_LIMIT = 500          # one call returns the whole catalogue
+API_MAX_PULLS = 3             # union this many pulls to converge on all shows
+API_TRIES_PER_CALL = 4        # self-retry on empty / non-JSON bodies
+API_TIMEOUT = 30.0
+API_SHOW_PRODUCT_TYPE = "SHOW"  # keep only these; drop ATTRACTION / GIFT_CARD
+
+# Below this many discovered shows, 'auto' falls back to the Playwright scroll
+# (a healthy SHOW pull is ~190; this floor only trips on a real failure).
+DISCOVERY_MIN_SHOWS = 150
+
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -230,7 +267,170 @@ class ScrapeReport:
 
 
 # ---------------------------------------------------------------------------
-# Step 1 — Listing discovery via Playwright
+# Step 1 (preferred) — Listing discovery via the JSON API
+# ---------------------------------------------------------------------------
+
+
+def _slugify(name: str) -> str:
+    """Best-effort slug for shows the API returns without one.
+
+    Produces the same charset the listing slugs use ([a-z0-9-]), e.g.
+    "Romeo & Juliet" -> "romeo-and-juliet", "CATS" -> "cats". The detail
+    fetch follows redirects, so an id-correct URL resolves even if this
+    differs slightly from TodayTix's canonical slug.
+    """
+    s = (name or "").strip().lower().replace("&", " and ")
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    return re.sub(r"-{2,}", "-", s).strip("-")
+
+
+def _api_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": DEFAULT_HEADERS["User-Agent"],
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-GB,en;q=0.9",
+        "Referer": f"{BASE_URL}/",
+        "Origin": BASE_URL,
+        # GBP is the default for location=2, but pin it belt-and-suspenders.
+        "X-TT-Currency": "GBP",
+    })
+    retry = Retry(
+        total=RETRY_TOTAL,
+        backoff_factor=RETRY_BACKOFF,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+def _api_fetch_shows(
+    session: requests.Session,
+    *,
+    limit: int,
+    offset: int = 0,
+    tries: int = API_TRIES_PER_CALL,
+) -> tuple[list[dict], dict | None]:
+    """One /shows call, self-retrying empty / non-JSON / unexpected bodies.
+
+    Returns (shows, pagination). On total failure returns ([], None). A parsed
+    dict carrying 'data' and/or 'pagination' counts as a valid response (urllib3
+    Retry only covers 5xx; a 200 with an empty body slips through, so we guard
+    it here — the same resilience the production path needs).
+    """
+    params: dict[str, Any] = {"location": API_LOCATION_LONDON, "limit": limit}
+    if offset:
+        params["offset"] = offset
+    for attempt in range(tries):
+        try:
+            r = session.get(API_SHOWS_URL, params=params, timeout=API_TIMEOUT)
+        except requests.RequestException as e:
+            log.info("  api call error (%s); retrying", type(e).__name__)
+            time.sleep(0.8 * (attempt + 1))
+            continue
+        try:
+            j = r.json()
+        except Exception:
+            j = None
+        if isinstance(j, dict) and ("data" in j or "pagination" in j):
+            data = j.get("data")
+            shows = [x for x in data if isinstance(x, dict)] if isinstance(data, list) else []
+            return shows, j.get("pagination")
+        snippet = (r.text or "")[:120].replace("\n", " ")
+        log.info("  api call returned unusable body (status=%s, body[:120]=%r); retrying",
+                 r.status_code, snippet)
+        time.sleep(0.8 * (attempt + 1))
+    return [], None
+
+
+def discover_show_links_api(
+    *,
+    limit: int = API_PULL_LIMIT,
+    max_pulls: int = API_MAX_PULLS,
+) -> tuple[list[tuple[int, str]], int | None]:
+    """Discover every London theatre show via the JSON API.
+
+    Same return contract as discover_show_links: a (pairs, expected_total)
+    tuple where pairs is a list of (show_id, slug). Unions up to `max_pulls`
+    bulk pulls (the catalogue is mildly non-deterministic per request, so one
+    pull misses a few), keeps only productType == "SHOW", and builds (id, slug)
+    pairs — slug from the API when present, derived from the name otherwise.
+
+    expected_total is the theatre-show count we expect to fetch (NOT the
+    ~236 all-products total, which would falsely trip the coverage warning).
+    Raises RuntimeError if no shows could be retrieved at all.
+    """
+    session = _api_session()
+    by_id: dict[int, dict] = {}
+    reported_total: int | None = None
+
+    log.info("Discovering shows via the TodayTix JSON API (location=%d)", API_LOCATION_LONDON)
+    for pull in range(1, max_pulls + 1):
+        shows, pag = _api_fetch_shows(session, limit=limit)
+        if pag and isinstance(pag.get("total"), int):
+            reported_total = pag["total"]
+        before = len(by_id)
+        for sh in shows:
+            i = sh.get("id")
+            if isinstance(i, int):
+                by_id.setdefault(i, sh)
+        added = len(by_id) - before
+        log.info("  api pull %d/%d: %d rows, +%d new (unique so far=%d, catalogue total=%s)",
+                 pull, max_pulls, len(shows), added, len(by_id), reported_total)
+        if not shows:
+            continue  # transient empty pull — spend remaining budget
+        if reported_total and len(by_id) >= reported_total:
+            break     # got the whole catalogue
+        if added == 0:
+            break     # a non-empty pull that added nothing => converged
+
+    catalogue = list(by_id.values())
+    if not catalogue:
+        raise RuntimeError("API discovery retrieved no shows (every pull empty/failed)")
+
+    # Keep theatre shows only. productType == "SHOW" matches the
+    # /london/category/all-shows scope; ATTRACTION and GIFT_CARD are dropped.
+    shows_only = [
+        sh for sh in catalogue
+        if str(sh.get("productType") or "").upper() == API_SHOW_PRODUCT_TYPE
+    ]
+    dropped = len(catalogue) - len(shows_only)
+
+    pairs: list[tuple[int, str]] = []
+    derived = skipped = 0
+    for sh in shows_only:
+        i = sh.get("id")
+        if not isinstance(i, int):
+            continue
+        slug = sh.get("slug")
+        if not slug:
+            slug = _slugify(sh.get("name") or sh.get("displayName") or sh.get("showName") or "")
+            if not slug:
+                skipped += 1
+                continue
+            derived += 1
+        pairs.append((i, slug))
+
+    # Deterministic order, run to run (the API's own order is shuffled).
+    pairs.sort(key=lambda p: p[0])
+
+    log.info(
+        "  api discovery: %d theatre shows (productType=%s); dropped %d non-theatre "
+        "(attractions/gift cards); %d slug(s) derived from name%s; catalogue total=%s",
+        len(pairs), API_SHOW_PRODUCT_TYPE, dropped, derived,
+        f", {skipped} skipped (no id/name)" if skipped else "", reported_total,
+    )
+    # expected_total = theatre shows we expect to fetch (so coverage checks
+    # compare like-for-like, not against the 236 all-products figure).
+    return pairs, len(pairs)
+
+
+# ---------------------------------------------------------------------------
+# Step 1 (fallback) — Listing discovery via Playwright
 # ---------------------------------------------------------------------------
 
 def discover_show_links(
@@ -965,27 +1165,59 @@ def main(argv: list[str] | None = None) -> int:
                    help="Show the Playwright browser window (default: headless).")
     p.add_argument("--network-idle-ms", type=int, default=SCROLL_NETWORK_IDLE_MS,
                    help=f"Network-idle window between scrolls in ms (default: {SCROLL_NETWORK_IDLE_MS}).")
+    p.add_argument("--discovery", choices=["auto", "api", "scroll"], default="auto",
+                   help="How to discover shows: 'api' (fast, deterministic JSON API, no "
+                        "browser), 'scroll' (legacy Playwright listing scroll), or 'auto' "
+                        "(default: API first, with automatic scroll fallback if the API "
+                        "path fails or under-delivers).")
     args = p.parse_args(argv)
 
-    # Step 1: discover all show URLs via real browser
-    try:
-        pairs, expected_total = discover_show_links(
-            LISTING_URL,
-            headless=not args.headed,
-            network_idle_ms=args.network_idle_ms,
-        )
-    except ImportError:
-        log.error(
-            "Playwright is required. Install with:  pip install playwright "
-            "&& playwright install chromium"
-        )
-        return 2
-    except Exception as e:
-        log.error("Listing discovery failed: %s", e)
-        return 1
+    # Step 1: discover all show (id, slug) pairs.
+    # 'auto' (default) uses the fast, deterministic JSON API and falls back to
+    # the legacy Playwright listing scroll only if the API path fails or
+    # under-delivers. '--discovery api' forces the API path (no fallback);
+    # '--discovery scroll' forces the legacy browser scroll.
+    pairs: list[tuple[int, str]] = []
+    expected_total: int | None = None
+
+    if args.discovery in ("auto", "api"):
+        try:
+            pairs, expected_total = discover_show_links_api()
+        except Exception as e:
+            if args.discovery == "api":
+                log.error("API discovery failed: %s", e)
+                return 1
+            log.warning("API discovery failed (%s) — falling back to the Playwright scroll", e)
+            pairs, expected_total = [], None
+        else:
+            if args.discovery == "auto" and len(pairs) < DISCOVERY_MIN_SHOWS:
+                log.warning(
+                    "API discovery returned only %d shows (< floor %d) — falling back "
+                    "to the Playwright scroll", len(pairs), DISCOVERY_MIN_SHOWS)
+                pairs, expected_total = [], None
+            else:
+                log.info("Discovery via API: %d theatre shows", len(pairs))
+
+    if not pairs and args.discovery != "api":
+        # Legacy scroll: forced via --discovery scroll, or an 'auto' fallback.
+        try:
+            pairs, expected_total = discover_show_links(
+                LISTING_URL,
+                headless=not args.headed,
+                network_idle_ms=args.network_idle_ms,
+            )
+        except ImportError:
+            log.error(
+                "Playwright is required for scroll discovery. Install with:  "
+                "pip install playwright && playwright install chromium"
+            )
+            return 2
+        except Exception as e:
+            log.error("Listing discovery (scroll) failed: %s", e)
+            return 1
 
     if not pairs:
-        log.error("No shows discovered on listing — aborting (preserving any previous output).")
+        log.error("No shows discovered — aborting (preserving any previous output).")
         return 1
 
     if args.limit is not None:
