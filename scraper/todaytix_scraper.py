@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import re
 import sys
 import time
@@ -85,8 +86,10 @@ BOOKING_URL_BASE = f"{BASE_URL}/booking/seating-plan"
 #     (~236 entries) in one call.
 #   * total reported in pagination.total.
 #   * the result set is MILDLY NON-DETERMINISTIC per request — a single pull
-#     returns ~221-233 of the 236 distinct shows (a few duplicate / dropped
-#     rows from sort instability), so we union a handful of pulls to converge.
+#     surfaces ~95% of the ~236 distinct shows (a few duplicate / dropped
+#     rows from sort instability). Repeating the *same* request returns the
+#     same cached slice, so we union two DIFFERENT access patterns — a bulk
+#     pull and an offset sweep, each cache-busted — to converge on all of it.
 #   * productType cleanly separates scope: "SHOW" (~190 theatre shows, matching
 #     the /london/category/all-shows listing) vs "ATTRACTION" (St Paul's,
 #     London Eye, Legoland, …) and "GIFT_CARD". We keep only SHOW.
@@ -98,8 +101,8 @@ BOOKING_URL_BASE = f"{BASE_URL}/booking/seating-plan"
 # urllib3's Retry only covers 5xx, so _api_fetch_shows retries those itself.
 API_SHOWS_URL = "https://api.todaytix.com/api/v2/shows"
 API_LOCATION_LONDON = 2
-API_PULL_LIMIT = 500          # one call returns the whole catalogue
-API_MAX_PULLS = 3             # union this many pulls to converge on all shows
+API_PULL_LIMIT = 500          # one bulk call returns the whole catalogue
+API_PAGE_LIMIT = 50           # page size for the offset sweep that mops up
 API_TRIES_PER_CALL = 4        # self-retry on empty / non-JSON bodies
 API_TIMEOUT = 30.0
 API_SHOW_PRODUCT_TYPE = "SHOW"  # keep only these; drop ATTRACTION / GIFT_CARD
@@ -314,6 +317,7 @@ def _api_fetch_shows(
     limit: int,
     offset: int = 0,
     tries: int = API_TRIES_PER_CALL,
+    cache_bust: bool = True,
 ) -> tuple[list[dict], dict | None]:
     """One /shows call, self-retrying empty / non-JSON / unexpected bodies.
 
@@ -321,10 +325,16 @@ def _api_fetch_shows(
     dict carrying 'data' and/or 'pagination' counts as a valid response (urllib3
     Retry only covers 5xx; a 200 with an empty body slips through, so we guard
     it here — the same resilience the production path needs).
+
+    cache_bust appends a random `_cb` (same convention as the availability
+    pass) so each call is a CloudFront origin MISS — repeating an identical
+    request otherwise returns the same cached slice, which defeats the union.
     """
     params: dict[str, Any] = {"location": API_LOCATION_LONDON, "limit": limit}
     if offset:
         params["offset"] = offset
+    if cache_bust:
+        params["_cb"] = str(random.randint(1, 10 ** 9))
     for attempt in range(tries):
         try:
             r = session.get(API_SHOWS_URL, params=params, timeout=API_TIMEOUT)
@@ -349,16 +359,19 @@ def _api_fetch_shows(
 
 def discover_show_links_api(
     *,
-    limit: int = API_PULL_LIMIT,
-    max_pulls: int = API_MAX_PULLS,
+    bulk_limit: int = API_PULL_LIMIT,
+    page_limit: int = API_PAGE_LIMIT,
 ) -> tuple[list[tuple[int, str]], int | None]:
     """Discover every London theatre show via the JSON API.
 
     Same return contract as discover_show_links: a (pairs, expected_total)
-    tuple where pairs is a list of (show_id, slug). Unions up to `max_pulls`
-    bulk pulls (the catalogue is mildly non-deterministic per request, so one
-    pull misses a few), keeps only productType == "SHOW", and builds (id, slug)
-    pairs — slug from the API when present, derived from the name otherwise.
+    tuple where pairs is a list of (show_id, slug). The result set is mildly
+    non-deterministic per request, so we union two DIFFERENT, cache-busted
+    access patterns — a bulk pull and an offset sweep — which together cover
+    the whole catalogue (repeating the identical bulk request just returns the
+    same cached slice). Then keep only productType == "SHOW" and build
+    (id, slug) pairs — slug from the API when present, derived from the name
+    otherwise (the detail fetch follows redirects, so an id-correct URL works).
 
     expected_total is the theatre-show count we expect to fetch (NOT the
     ~236 all-products total, which would falsely trip the coverage warning).
@@ -368,29 +381,61 @@ def discover_show_links_api(
     by_id: dict[int, dict] = {}
     reported_total: int | None = None
 
-    log.info("Discovering shows via the TodayTix JSON API (location=%d)", API_LOCATION_LONDON)
-    for pull in range(1, max_pulls + 1):
-        shows, pag = _api_fetch_shows(session, limit=limit)
-        if pag and isinstance(pag.get("total"), int):
-            reported_total = pag["total"]
+    def _absorb(shows: list[dict]) -> int:
         before = len(by_id)
         for sh in shows:
             i = sh.get("id")
             if isinstance(i, int):
                 by_id.setdefault(i, sh)
-        added = len(by_id) - before
-        log.info("  api pull %d/%d: %d rows, +%d new (unique so far=%d, catalogue total=%s)",
-                 pull, max_pulls, len(shows), added, len(by_id), reported_total)
-        if not shows:
-            continue  # transient empty pull — spend remaining budget
-        if reported_total and len(by_id) >= reported_total:
-            break     # got the whole catalogue
-        if added == 0:
-            break     # a non-empty pull that added nothing => converged
+        return len(by_id) - before
+
+    def _note_total(pag: dict | None) -> None:
+        nonlocal reported_total
+        if pag and isinstance(pag.get("total"), int):
+            reported_total = pag["total"]
+
+    def _have_all() -> bool:
+        return reported_total is not None and len(by_id) >= reported_total
+
+    log.info("Discovering shows via the TodayTix JSON API (location=%d)", API_LOCATION_LONDON)
+
+    # Pass 1 — bulk pull: one request returns all ~236 rows (~95% unique).
+    shows, pag = _api_fetch_shows(session, limit=bulk_limit)
+    _note_total(pag)
+    log.info("  bulk pull (limit=%d): %d rows, +%d new (unique=%d, catalogue total=%s)",
+             bulk_limit, len(shows), _absorb(shows), len(by_id), reported_total)
+
+    # Pass 2 — offset sweep: different request URLs surface a different slice,
+    # so the union with the bulk pull converges on the whole catalogue. Stop
+    # the moment we've reached the reported total.
+    if not _have_all():
+        offset = 0
+        ceiling = (reported_total or 400) + page_limit
+        while offset < ceiling:
+            chunk, pag = _api_fetch_shows(session, limit=page_limit, offset=offset)
+            _note_total(pag)
+            if reported_total:
+                ceiling = reported_total + page_limit
+            if not chunk:
+                break  # past the end
+            added = _absorb(chunk)
+            log.info("  paged sweep offset=%d: %d rows, +%d new (unique=%d)",
+                     offset, len(chunk), added, len(by_id))
+            offset += page_limit
+            if _have_all():
+                break
+
+    # Pass 3 — one more bulk pull to mop up any stragglers if still short.
+    if not _have_all():
+        shows, pag = _api_fetch_shows(session, limit=bulk_limit)
+        _note_total(pag)
+        log.info("  bulk pull #2 (limit=%d): %d rows, +%d new (unique=%d, catalogue total=%s)",
+                 bulk_limit, len(shows), _absorb(shows), len(by_id), reported_total)
 
     catalogue = list(by_id.values())
     if not catalogue:
         raise RuntimeError("API discovery retrieved no shows (every pull empty/failed)")
+    log.info("  retrieved %d unique shows of %s reported", len(catalogue), reported_total)
 
     # Keep theatre shows only. productType == "SHOW" matches the
     # /london/category/all-shows scope; ATTRACTION and GIFT_CARD are dropped.
