@@ -274,8 +274,7 @@ jobs:
             --chip-cache scraper/data/chip_cache_seatplan.json \
             --price-cache scraper/data/seatplan_price_cache.json \
             --fetch-mode browser \
-            --shuffle \
-            --concurrency 12 \
+            --concurrency 1 \
             --max-seconds 780
 
       - name: Upload patched per-source files
