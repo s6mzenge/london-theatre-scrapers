@@ -1,43 +1,38 @@
 #!/usr/bin/env python3
 """
-todaytix_discovery_probe.py — can the Playwright listing-scroll be replaced
-with deterministic API pagination?
-===========================================================================
+todaytix_discovery_probe.py  (v2 — scope & reliability drill-down)
+==================================================================
 
-READ-ONLY DIAGNOSTIC. Makes no changes to any repo file; writes nothing.
-Intended to run on a US GitHub runner (same place todaytix_api_check passes),
-because api.todaytix.com is geo-aware. It hits
+READ-ONLY DIAGNOSTIC. Makes no repo changes. Run on a US GitHub runner.
 
-    GET https://api.todaytix.com/api/v2/shows?location=2     (2 = London)
+v1 already proved the big thing: GET /api/v2/shows?location=2 paginates via
+offset/limit, reports total=236, returns the whole catalogue in one call with
+limit=500, and every show carries id + slug. v2 drills into the three details
+needed to switch discovery onto the API *correctly* rather than by guesswork:
 
-and reports EVERYTHING needed to decide whether discovery can move off the
-flaky browser scroll onto the API:
+  [1] DUP / ID-LESS analysis — why a 236-entry response yielded only 225 unique
+      ids, and whether offset-paging reliably reaches the same full set.
+  [2] CATEGORY / TYPE distribution — the API over-returns vs the ~200-show
+      theatre listing (it includes attractions like "st-pauls-cathedral"), so
+      we need to see the category / productType / isPyos / isGa split to define
+      a "theatre only" filter that matches the current scrape's scope.
+  [3] SLUG GAPS — which shows lack a slug (so /london/shows/{id}-{slug} can't be
+      built for them), and what they are (experiences? real theatre?).
 
-  1. response shape + a sample show's fields
-  2. the default page size (how many shows one call returns)
-  3. which pagination mechanism actually ADVANCES the result set —
-     page-number / offset / limit-bump / cursor — vs is silently ignored
-  4. a full walk with the working mechanism: how many unique show ids we can
-     collect, vs the total the API reports, vs the listing page's own
-     pagination.total (~200) when reachable
-  5. whether each show carries the id + slug/url we need to rebuild the
-     /london/shows/{id}-{slug} pairs the current scraper produces
-
-Then it prints a VERDICT. Paste the whole output back and the discovery switch
-can be designed from measured facts.
+Prints a SUMMARY with the likely theatre-show count after filtering. Paste the
+whole output back.
 
 Usage:
-    python scraper/todaytix_discovery_probe.py            # the real probe
-    python scraper/todaytix_discovery_probe.py --selftest # offline, no network
+    python scraper/todaytix_discovery_probe.py
+    python scraper/todaytix_discovery_probe.py --selftest   # offline
 """
 
 from __future__ import annotations
 
 import argparse
+import collections
 import json
-import re
 import sys
-from pathlib import Path  # noqa: F401  (kept for parity / future use)
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -48,11 +43,10 @@ except Exception:  # pragma: no cover
     from requests.packages.urllib3.util.retry import Retry  # type: ignore
 
 SHOWS_URL = "https://api.todaytix.com/api/v2/shows"
-LISTING_URL = "https://www.todaytix.com/london/shows"
-LONDON_LOCATION = 2
+LONDON = 2
 TIMEOUT = 25.0
 
-BASE_HEADERS = {
+HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
                    "Chrome/124.0.0.0 Safari/537.36"),
@@ -63,22 +57,10 @@ BASE_HEADERS = {
     "X-TT-Currency": "GBP",
 }
 
-# key-name heuristics --------------------------------------------------------
-ID_KEYS = ("id", "showId", "show_id")
-SLUG_KEYS = ("slug", "showSlug", "seoSlug", "urlSlug")
-URL_KEYS = ("url", "webUrl", "shareUrl", "canonicalUrl", "href", "deeplink")
-NAME_KEYS = ("name", "showName", "title", "displayName")
-CATEGORY_KEYS = ("category", "categories", "type", "showType", "genre", "tags")
-AVAIL_KEYS = ("isAvailable", "available", "status", "saleStatus", "onSale")
-PAGINATION_HINT = ("pag", "total", "count", "page", "next", "cursor",
-                   "offset", "limit", "hasmore", "has_more")
-
-
-# --- generic helpers --------------------------------------------------------
 
 def build_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update(BASE_HEADERS)
+    s.headers.update(HEADERS)
     retry = Retry(total=3, backoff_factor=0.6,
                   status_forcelist=(429, 500, 502, 503, 504),
                   allowed_methods=frozenset({"GET"}), raise_on_status=False)
@@ -88,368 +70,213 @@ def build_session() -> requests.Session:
     return s
 
 
-def _first(d: dict, keys) -> tuple[str | None, object]:
-    """Return (key, value) for the first present, non-empty key in `keys`."""
-    if not isinstance(d, dict):
-        return None, None
-    for k in keys:
-        if k in d and d[k] not in (None, "", [], {}):
-            return k, d[k]
-    return None, None
-
-
 def extract_shows(payload) -> list[dict]:
-    """Find the list of show-like dicts in a response of unknown shape."""
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        return [x for x in payload["data"] if isinstance(x, dict)]
     if isinstance(payload, list):
         return [x for x in payload if isinstance(x, dict)]
-    if not isinstance(payload, dict):
-        return []
-    data = payload.get("data")
-    if isinstance(data, list):
-        return [x for x in data if isinstance(x, dict)]
-    if isinstance(data, dict):
-        # e.g. {"data": {"shows": [...]}} or {"data": {"results": [...]}}
-        for v in data.values():
-            if isinstance(v, list) and v and isinstance(v[0], dict):
-                return v
-    # last resort: the longest top-level list of dicts
-    best: list[dict] = []
-    for v in payload.values():
-        if isinstance(v, list) and v and isinstance(v[0], dict) and len(v) > len(best):
-            best = v
-    return best
+    return []
 
 
-def extract_pagination(payload) -> dict | None:
-    """Find a dict whose keys look like pagination metadata."""
-    if not isinstance(payload, dict):
-        return None
-    # direct, common spots
-    for key in ("pagination", "meta", "_meta", "page", "paging"):
-        v = payload.get(key)
-        if isinstance(v, dict) and any(
-                any(h in str(k).lower() for h in PAGINATION_HINT) for k in v):
-            return {key: v} if key != "pagination" else v
-    # any nested dict that looks paginationy
-    for k, v in payload.items():
-        if isinstance(v, dict) and sum(
-                1 for kk in v if any(h in str(kk).lower() for h in PAGINATION_HINT)) >= 2:
-            return {k: v}
-    # scalar pagination fields sitting at the top level
-    flat = {k: v for k, v in payload.items()
-            if not isinstance(v, (list, dict))
-            and any(h in str(k).lower() for h in PAGINATION_HINT)}
-    return flat or None
-
-
-def find_total(obj) -> int | None:
-    """Recursively find a plausible 'total count' integer."""
-    found: list[int] = []
-
-    def walk(o):
-        if isinstance(o, dict):
-            for k, v in o.items():
-                kl = str(k).lower()
-                if isinstance(v, int) and ("total" in kl or kl in
-                                           ("count", "totalcount", "numresults", "resultcount")):
-                    found.append(v)
-                walk(v)
-        elif isinstance(o, list):
-            for x in o:
-                walk(x)
-
-    walk(obj)
-    # the largest such integer is the most likely catalogue total
-    return max(found) if found else None
-
-
-def show_ids(shows: list[dict]) -> list:
-    out = []
-    for sh in shows:
-        _, v = _first(sh, ID_KEYS)
-        if v is not None:
-            out.append(v)
-    return out
-
-
-def fetch(session, params: dict):
-    """Return a dict describing one /shows call."""
-    p = {"location": LONDON_LOCATION}
+def get(session, **params):
+    p = {"location": LONDON}
     p.update(params)
     try:
         r = session.get(SHOWS_URL, params=p, timeout=TIMEOUT)
-    except Exception as e:
-        return {"params": p, "ok": False, "status": None,
-                "error": f"{type(e).__name__}: {str(e)[:120]}",
-                "shows": [], "ids": [], "pagination": None, "json": None}
-    try:
         j = r.json()
-    except Exception:
-        j = None
-    shows = extract_shows(j) if j is not None else []
-    return {
-        "params": p, "ok": r.status_code == 200, "status": r.status_code,
-        "error": None, "shows": shows, "ids": show_ids(shows),
-        "pagination": extract_pagination(j) if j is not None else None,
-        "top_keys": list(j.keys()) if isinstance(j, dict) else f"(type {type(j).__name__})",
-        "json": j,
-    }
+    except Exception as e:
+        return [], None, f"{type(e).__name__}: {str(e)[:100]}"
+    pag = j.get("pagination") if isinstance(j, dict) else None
+    return extract_shows(j), pag, None
 
 
-def compare(base_ids, other_ids):
-    b, o = set(map(str, base_ids)), set(map(str, other_ids))
-    new = o - b
-    return {"n": len(other_ids), "n_new_vs_base": len(new),
-            "identical_to_base": (b == o and len(o) > 0)}
+def label(v):
+    """Compact label for a category/productType-ish value."""
+    if isinstance(v, dict):
+        return v.get("name") or v.get("slug") or v.get("type") or "(dict)"
+    if isinstance(v, list):
+        names = [label(x) for x in v]
+        return "+".join(n for n in names if n) or "(empty)"
+    if v is None:
+        return "(none)"
+    return str(v)
 
 
-# --- the probe --------------------------------------------------------------
+def cat_name(sh: dict) -> str:
+    return label(sh.get("category"))
+
+
+def analyse(shows: list[dict]):
+    """Dedup by id; return (unique_shows, stats)."""
+    by_id: dict = {}
+    dups = 0
+    idless = 0
+    for sh in shows:
+        i = sh.get("id")
+        if i is None:
+            idless += 1
+            continue
+        if i in by_id:
+            dups += 1
+        else:
+            by_id[i] = sh
+    return list(by_id.values()), {"raw": len(shows), "unique": len(by_id),
+                                  "dups": dups, "idless": idless}
+
 
 def probe() -> int:
     s = build_session()
-    print("=" * 72)
-    print("TodayTix discovery probe — GET /api/v2/shows?location=2 (London)")
-    print("=" * 72)
+    print("=" * 74)
+    print("TodayTix discovery probe v2 — /api/v2/shows?location=2 scope & reliability")
+    print("=" * 74)
 
-    # 1) BASE CALL ----------------------------------------------------------
-    base = fetch(s, {})
-    print("\n[1] BASE CALL")
-    print(f"    status        : {base['status']}  ok={base['ok']}  error={base['error']}")
-    print(f"    top-level keys: {base['top_keys']}")
-    print(f"    shows returned: {len(base['shows'])}   (this is the default page size)")
-    print(f"    pagination    : {json.dumps(base['pagination'], default=str)[:300]}")
-    if not base["ok"] or not base["shows"]:
-        print("\nVERDICT: could not read a shows list from the base call — the API may be "
-              "geo-gated here, rate-limited, or shaped differently than expected. "
-              "Re-run on a US runner; if it still fails, discovery stays on the scroll.")
-        if base["json"] is not None:
-            print("    raw (trimmed):", json.dumps(base["json"], default=str)[:600])
+    # --- [1] retrieval: single big call vs offset paging -------------------
+    print("\n[1] RETRIEVAL & DUP / ID-LESS ANALYSIS")
+    big_shows, big_pag, err = get(s, limit=500)
+    if err:
+        print(f"    limit=500 call failed: {err}")
         return 1
+    total = (big_pag or {}).get("total")
+    big_unique, big_stats = analyse(big_shows)
+    print(f"    single call (limit=500): raw entries={big_stats['raw']}, "
+          f"unique ids={big_stats['unique']}, duplicate-id rows={big_stats['dups']}, "
+          f"id-less rows={big_stats['idless']}   (pagination.total={total})")
 
-    page_size = len(base["shows"])
-    sample = base["shows"][0]
-    print(f"\n    sample show — all keys: {sorted(sample.keys())}")
-    print("    sample show (trimmed):")
-    print("      " + json.dumps(sample, default=str)[:700])
+    # offset paging in pages of 50
+    paged: dict = {}
+    pages = 0
+    offset = 0
+    limit = 50
+    cap = ((total or 300) // limit) + 3
+    while pages < cap:
+        chunk, _pag, e2 = get(s, limit=limit, offset=offset)
+        pages += 1
+        if e2 or not chunk:
+            break
+        before = len(paged)
+        for sh in chunk:
+            i = sh.get("id")
+            if i is not None:
+                paged.setdefault(i, sh)
+        if len(chunk) < limit and len(paged) == before:
+            break
+        if len(paged) == before and len(chunk) < limit:
+            break
+        offset += limit
+        if total and offset >= total:
+            # one more page to be safe, then stop
+            chunk, _p, e3 = get(s, limit=limit, offset=offset)
+            pages += 1
+            if not e3 and chunk:
+                for sh in chunk:
+                    i = sh.get("id")
+                    if i is not None:
+                        paged.setdefault(i, sh)
+            break
+    print(f"    offset paging (limit=50): pages={pages}, unique ids collected={len(paged)}")
 
-    idk, idv = _first(sample, ID_KEYS)
-    slugk, slugv = _first(sample, SLUG_KEYS)
-    urlk, urlv = _first(sample, URL_KEYS)
-    namek, namev = _first(sample, NAME_KEYS)
-    catk, catv = _first(sample, CATEGORY_KEYS)
-    availk, availv = _first(sample, AVAIL_KEYS)
-    print("\n    field mapping (key -> sample value):")
-    print(f"      id       : {idk!r:>14} -> {idv!r}")
-    print(f"      slug     : {slugk!r:>14} -> {str(slugv)[:60]!r}")
-    print(f"      url      : {urlk!r:>14} -> {str(urlv)[:80]!r}")
-    print(f"      name     : {namek!r:>14} -> {str(namev)[:60]!r}")
-    print(f"      category : {catk!r:>14} -> {str(catv)[:80]!r}")
-    print(f"      available: {availk!r:>14} -> {availv!r}")
+    # canonical set = union of both methods (most complete)
+    canon: dict = dict(paged)
+    for sh in big_unique:
+        canon.setdefault(sh["id"], sh)
+    shows = list(canon.values())
+    print(f"    CANONICAL unique shows (union of both methods): {len(shows)}")
+    if big_stats["unique"] != len(paged):
+        print(f"    NOTE: single-call unique ({big_stats['unique']}) != paged unique "
+              f"({len(paged)}) — result set is mildly non-deterministic; paging+dedup "
+              f"is the robust path.")
 
-    reported_total = find_total(base["json"])
-    print(f"\n    API-reported total (best guess): {reported_total}")
+    # --- [2] category / type distribution ----------------------------------
+    print("\n[2] CATEGORY / TYPE DISTRIBUTION  (theatre vs experience?)")
 
-    # 2) PAGINATION EXPERIMENTS --------------------------------------------
-    print("\n[2] PAGINATION EXPERIMENTS  (does the param ADVANCE, or get ignored?)")
-    experiments = {}
+    def dist(fn, title, topn=30):
+        c = collections.Counter(fn(sh) for sh in shows)
+        print(f"    {title}:")
+        for k, n in c.most_common(topn):
+            print(f"        {n:4d}  {k}")
 
-    e_page2 = fetch(s, {"page": 2})
-    experiments["page=2"] = e_page2
-    c = compare(base["ids"], e_page2["ids"])
-    print(f"    page=2            : n={c['n']:4d}  new_vs_base={c['n_new_vs_base']:4d}  "
-          f"identical_to_base={c['identical_to_base']}  "
-          f"-> {'ADVANCES' if c['n_new_vs_base'] else ('IGNORED' if c['identical_to_base'] else 'empty/odd')}")
+    dist(cat_name, "category.name")
+    dist(lambda sh: label(sh.get("productType")), "productType")
+    dist(lambda sh: label(sh.get("admissionType")), "admissionType")
+    dist(lambda sh: label(sh.get("inventorySelectionMode")), "inventorySelectionMode")
 
-    e_off = fetch(s, {"offset": page_size, "limit": page_size})
-    experiments[f"offset={page_size}&limit={page_size}"] = e_off
-    c = compare(base["ids"], e_off["ids"])
-    print(f"    offset={page_size}&limit={page_size}: n={c['n']:4d}  new_vs_base={c['n_new_vs_base']:4d}  "
-          f"identical_to_base={c['identical_to_base']}  "
-          f"-> {'ADVANCES' if c['n_new_vs_base'] else ('IGNORED' if c['identical_to_base'] else 'empty/odd')}")
+    # cross-tab category × seat-selection signals
+    print("\n    cross-tab by category.name  (count | isPyos=T | isGa=T | regAvail=T | slug-less):")
+    cats = collections.Counter(cat_name(sh) for sh in shows)
+    rows = []
+    for cn, _ in cats.most_common(40):
+        grp = [sh for sh in shows if cat_name(sh) == cn]
+        n_pyos = sum(1 for sh in grp if sh.get("isPyos") is True)
+        n_ga = sum(1 for sh in grp if sh.get("isGa") is True)
+        n_reg = sum(1 for sh in grp if sh.get("areRegularTicketsAvailable") is True)
+        n_noslug = sum(1 for sh in grp if not sh.get("slug"))
+        ex = next((sh.get("slug") or sh.get("name") for sh in grp), "")
+        rows.append((cn, len(grp), n_pyos, n_ga, n_reg, n_noslug, ex))
+    for cn, n, p, g, rg, ns, ex in rows:
+        print(f"        {cn:22.22} {n:4d} | {p:4d} | {g:4d} | {rg:4d} | {ns:4d}   e.g. {ex}")
 
-    bump_param = None
-    for pname in ("limit", "pageSize", "perPage", "per_page"):
-        e_bump = fetch(s, {pname: 500})
-        n = len(e_bump["shows"])
-        grew = n > page_size
-        print(f"    {pname}=500        : n={n:4d}  "
-              f"-> {'GROWS (single-call bulk!)' if grew else 'no effect'}")
-        if grew and bump_param is None:
-            bump_param = pname
-            experiments[f"{pname}=500"] = e_bump
+    # --- [3] slug gaps ------------------------------------------------------
+    print("\n[3] SLUG GAPS  (shows we can't build /london/shows/{id}-{slug} for)")
+    noslug = [sh for sh in shows if not sh.get("slug")]
+    print(f"    shows with NO slug: {len(noslug)} of {len(shows)}")
+    for sh in noslug[:30]:
+        print(f"        id={sh.get('id')!s:>8}  cat={cat_name(sh):20.20}  "
+              f"name={str(sh.get('name') or sh.get('displayName'))[:40]}")
 
-    # cursor?
-    cursor_note = "none found"
-    pg = base["pagination"] or {}
-    pj = json.dumps(pg, default=str).lower()
-    if any(t in pj for t in ("cursor", "next", "after", "hasmore", "has_more")):
-        cursor_note = json.dumps(pg, default=str)[:200]
-    print(f"    cursor/next token : {cursor_note}")
-
-    # 3) DECIDE MECHANISM + FULL WALK --------------------------------------
-    print("\n[3] FULL WALK with the best working mechanism")
-    mechanism = None
-    if bump_param:
-        mechanism = f"limit-bump ({bump_param})"
-    elif compare(base["ids"], e_page2["ids"])["n_new_vs_base"] > 0:
-        mechanism = "page"
-    elif compare(base["ids"], e_off["ids"])["n_new_vs_base"] > 0:
-        mechanism = "offset"
-    print(f"    chosen mechanism  : {mechanism or 'NONE (only one page retrievable)'}")
-
-    all_ids: list = []
-    seen: set = set()
-
-    def add(ids):
-        added = 0
-        for i in ids:
-            k = str(i)
-            if k not in seen:
-                seen.add(k)
-                all_ids.append(i)
-                added += 1
-        return added
-
-    add(base["ids"])
-    pages_fetched = 1
-
-    if mechanism and mechanism.startswith("limit-bump"):
-        big = fetch(s, {bump_param: 1000})
-        pages_fetched += 1
-        add(big["ids"])
-    elif mechanism == "page":
-        for pg_no in range(2, 41):  # cap 40 pages
-            e = fetch(s, {"page": pg_no})
-            pages_fetched += 1
-            if not e["shows"] or add(e["ids"]) == 0:
-                break
-    elif mechanism == "offset":
-        off = page_size
-        for _ in range(40):  # cap
-            e = fetch(s, {"offset": off, "limit": page_size})
-            pages_fetched += 1
-            if not e["shows"] or add(e["ids"]) == 0:
-                break
-            off += page_size
-
-    print(f"    pages fetched     : {pages_fetched}")
-    print(f"    unique shows found: {len(all_ids)}")
-    print(f"    API-reported total: {reported_total}")
-    if all_ids:
-        print(f"    first 5 ids       : {all_ids[:5]}")
-        print(f"    last 5 ids        : {all_ids[-5:]}")
-
-    # 4) LISTING CROSS-CHECK (best-effort) ---------------------------------
-    print("\n[4] LISTING CROSS-CHECK  (what does the website itself report?)")
-    listing_total = None
-    try:
-        r = s.get(LISTING_URL, timeout=TIMEOUT,
-                  headers={"Accept": "text/html,application/xhtml+xml"})
-        m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
-                      r.text, re.S)
-        if m:
-            nd = json.loads(m.group(1))
-            listing_total = find_total(nd)
-        print(f"    listing page status: {r.status_code}; "
-              f"pagination.total (best guess): {listing_total}")
-    except Exception as e:
-        print(f"    (could not read listing page here: {type(e).__name__}: {str(e)[:80]})")
-
-    # 5) (id, slug) BUILDABILITY -------------------------------------------
-    print("\n[5] CAN WE BUILD /london/shows/{id}-{slug} PAIRS?")
-    have_id = idk is not None
-    have_slug = slugk is not None
-    have_url = urlk is not None
-    print(f"    id present: {have_id} ({idk})   slug present: {have_slug} ({slugk})   "
-          f"url present: {have_url} ({urlk})")
-    print("    samples (id | slug | url):")
-    for sh in base["shows"][:5]:
-        _, i = _first(sh, ID_KEYS)
-        _, sl = _first(sh, SLUG_KEYS)
-        _, u = _first(sh, URL_KEYS)
-        print(f"      {str(i):>8} | {str(sl)[:40]:<40} | {str(u)[:70]}")
-
-    # VERDICT ---------------------------------------------------------------
-    print("\n" + "=" * 72)
-    print("VERDICT")
-    print("=" * 72)
-    enough = False
-    if listing_total and all_ids:
-        enough = len(all_ids) >= listing_total * 0.98
-    elif reported_total and all_ids:
-        enough = len(all_ids) >= reported_total * 0.98
-    can_build = have_id and (have_slug or have_url)
-
-    if mechanism and enough and can_build:
-        print(f"  VIABLE ✅  API discovery can replace the scroll.")
-        print(f"    mechanism      : {mechanism}")
-        print(f"    page size      : {page_size}")
-        print(f"    collected      : {len(all_ids)} unique shows "
-              f"(reported total {reported_total}, listing {listing_total})")
-        print(f"    id+slug/url    : yes — pairs are buildable from "
-              f"{idk!r} + {slugk or urlk!r}")
-        print("  Next: I'll wire API discovery into todaytix_scraper.py behind a flag,")
-        print("  with the scroll kept as automatic fallback.")
-    else:
-        print("  NEEDS A LOOK ⚠️  — one or more prerequisites unmet:")
-        print(f"    pagination mechanism found: {bool(mechanism)} ({mechanism})")
-        print(f"    reached full catalogue   : {enough} "
-              f"(collected {len(all_ids)} vs listing {listing_total} / reported {reported_total})")
-        print(f"    id + slug/url buildable  : {can_build}")
-        print("  Paste this whole output back — the field names / shape above tell us")
-        print("  exactly what to adjust (different param names, a cursor walk, or a")
-        print("  filter if the API returns more than the listing's theatre shows).")
+    # --- SUMMARY ------------------------------------------------------------
+    # crude theatre vs non-theatre guess: theatre ~ has a slug AND isPyos (or
+    # reg tickets) — just an estimate for the log; final filter decided from
+    # the tables above.
+    theatre_est = [sh for sh in shows if sh.get("slug") and (
+        sh.get("isPyos") is True or sh.get("areRegularTicketsAvailable") is True)]
+    print("\n" + "=" * 74)
+    print("SUMMARY")
+    print("=" * 74)
+    print(f"    canonical unique shows           : {len(shows)}")
+    print(f"    with a usable slug               : {sum(1 for sh in shows if sh.get('slug'))}")
+    print(f"    rough 'theatre' estimate         : {len(theatre_est)} "
+          f"(has slug AND isPyos|regTickets)  [final filter TBD from tables]")
+    print(f"    pagination.total reported        : {total}")
+    print("    -> If the theatre estimate lands near the listing's ~200, the filter is")
+    print("       'has slug + isPyos/regTickets'; the category table confirms which")
+    print("       category names are attractions/experiences to drop.")
     return 0
 
 
 # --- offline selftest -------------------------------------------------------
 
 def selftest() -> int:
-    print("SELFTEST: parsing + decision helpers (offline, no TodayTix)\n")
-
-    # extract_shows across shapes
-    assert len(extract_shows({"data": [{"id": 1}, {"id": 2}]})) == 2
-    assert len(extract_shows({"data": {"shows": [{"id": 1}]}})) == 1
-    assert len(extract_shows([{"id": 9}])) == 1
-    assert extract_shows({"x": 5}) == []
-
-    # pagination + total
-    pg = extract_pagination({"data": [], "pagination": {"page": 1, "totalCount": 200}})
-    assert pg and "totalCount" in json.dumps(pg)
-    assert find_total({"pagination": {"totalCount": 200, "page": 1}}) == 200
-    assert find_total({"a": {"total": 50}, "b": {"resultCount": 200}}) == 200
-
-    # field detection
-    sh = {"id": 43861, "slug": "arcadia", "showName": "Arcadia",
-          "isAvailable": True, "categories": ["Play"]}
-    assert _first(sh, ID_KEYS)[1] == 43861
-    assert _first(sh, SLUG_KEYS)[1] == "arcadia"
-    assert _first(sh, NAME_KEYS)[1] == "Arcadia"
-    assert _first(sh, AVAIL_KEYS)[0] == "isAvailable"
-
-    # compare / mechanism logic
-    base_ids = list(range(0, 20))
-    page2_ids = list(range(20, 40))         # disjoint -> advances
-    same_ids = list(range(0, 20))           # identical -> ignored
-    assert compare(base_ids, page2_ids)["n_new_vs_base"] == 20
-    assert compare(base_ids, same_ids)["identical_to_base"] is True
-    assert compare(base_ids, same_ids)["n_new_vs_base"] == 0
-
-    # find_total ignores non-total ints
-    assert find_total({"pageSize": 20, "page": 3}) is None
-
-    print("  extract_shows / pagination / find_total / field-detection / compare: OK")
+    print("SELFTEST (offline)\n")
+    sample = [
+        {"id": 1, "slug": "ham", "name": "Hamilton",
+         "category": {"name": "Musicals"}, "productType": "SHOW",
+         "isPyos": True, "isGa": False, "areRegularTicketsAvailable": True,
+         "admissionType": "TIMED", "inventorySelectionMode": "PYOS"},
+        {"id": 1, "slug": "ham", "name": "Hamilton dup", "category": {"name": "Musicals"}},  # dup id
+        {"id": 2, "slug": None, "name": "St Paul's", "category": {"name": "Attractions"},
+         "productType": "EXPERIENCE", "isPyos": False, "isGa": True,
+         "areRegularTicketsAvailable": True},
+        {"slug": "x", "name": "no-id"},  # id-less
+    ]
+    uniq, st = analyse(sample)
+    assert st["raw"] == 4 and st["unique"] == 2 and st["dups"] == 1 and st["idless"] == 1, st
+    assert label({"name": "Musicals"}) == "Musicals"
+    assert label(["a", {"name": "b"}]) == "a+b"
+    assert label(None) == "(none)"
+    assert cat_name(sample[0]) == "Musicals"
+    assert cat_name(sample[2]) == "Attractions"
+    noslug = [sh for sh in uniq if not sh.get("slug")]
+    assert len(noslug) == 1 and noslug[0]["name"] == "St Paul's"
+    print("  analyse (raw/unique/dups/idless), label, cat_name, slug-gap: OK")
     print("\nSELFTEST: PASS")
     return 0
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Probe TodayTix /api/v2/shows for API-based discovery.")
-    ap.add_argument("--selftest", action="store_true", help="run offline self-tests and exit")
+    ap = argparse.ArgumentParser(description="Probe v2: scope & reliability of /api/v2/shows.")
+    ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args(argv)
-    if args.selftest:
-        return selftest()
-    return probe()
+    return selftest() if args.selftest else probe()
 
 
 if __name__ == "__main__":
