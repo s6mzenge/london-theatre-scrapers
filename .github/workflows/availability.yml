@@ -409,12 +409,16 @@ jobs:
             mkdir -p public/data
             cp dedupe_output/unified.json public/data/unified.json
 
+            # Per-month gzip shards under public/data/price_history/
+            # (+ index.json); on the first run, migrates from and deletes
+            # the legacy monolithic public/data/price_history.json.
             python scraper/analysis/update_price_history.py \
               --unified public/data/unified.json \
-              --history-in public/data/price_history.json \
-              --out public/data/price_history.json
+              --history-dir public/data/price_history
 
-            git add public/data/unified.json public/data/price_history.json
+            # Stage unified.json, the changed shards + manifest, any
+            # removed shard, and (migration run) the monolith's deletion.
+            git add -A public/data
 
             if git diff --cached --quiet; then
               echo "No changes to commit."
@@ -422,9 +426,20 @@ jobs:
             fi
 
             git commit -m "$MSG_PREFIX ($(date -u +%Y-%m-%dT%H:%MZ))"
-            if git push origin main; then
+
+            # A file-size pre-receive rejection is fatal, not a race —
+            # retrying rebuilds the same blob and fails identically. Bail
+            # immediately rather than burning all attempts (the failure
+            # mode the monolithic price_history.json used to cause).
+            if push_out="$(git push origin main 2>&1)"; then
+              echo "$push_out"
               echo "Pushed on attempt $i."
               exit 0
+            fi
+            echo "$push_out"
+            if echo "$push_out" | grep -qiE "exceeds GitHub's file size limit|GH001: Large files detected"; then
+              echo "::error::Push rejected by a file-size limit; retrying cannot help. Check public/data for an oversized blob (price history should be sharded under public/data/price_history/)."
+              exit 1
             fi
             echo "Push rejected on attempt $i (concurrent push?). Retrying..."
             sleep 2
