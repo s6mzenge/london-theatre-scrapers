@@ -96,6 +96,22 @@ SCROLL_HARD_TIMEOUT_MS = 4000  # cap per scroll iteration
 MAX_STALE_SCROLLS = 3
 MAX_SCROLL_ATTEMPTS = 80       # hard ceiling, ~5 minutes worst case
 
+# Anti-race hardening for the lazy loader. networkidle can return almost
+# instantly when the loader simply hasn't fired yet (there were <=2 in-flight
+# requests at the instant we checked), which let three no-op scrolls burn the
+# whole stale budget in well under a second and abandon discovery far below the
+# real total (observed once: 54/200, then 200/200 on the very next run once it
+# happened to wait ~4s). Two guards close the race:
+#   * SCROLL_MIN_DWELL_MS — a floor on the time spent per scroll, so the loader
+#     gets a real chance to start fetching before we judge the scroll "stale";
+#   * MAX_STALE_SCROLLS_LOW — a larger stale budget while we're well below the
+#     site-reported total, so a slow loader is given many patient (dwelled)
+#     scrolls, not three rushed ones, before we give up.
+# Both only ADD patience; neither can reduce coverage below today's behaviour.
+SCROLL_MIN_DWELL_MS = 1200       # min wall-time to spend on each scroll
+MAX_STALE_SCROLLS_LOW = 8        # stale budget while far below expected total
+LOW_COVERAGE_FRACTION = 0.80     # "far below" = under 80% of expected total
+
 # Resource types we never need for scraping. Blocking these cuts page
 # weight by ~80% and makes scrolling noticeably snappier — the lazy
 # loader fires faster because it's not competing with image downloads.
@@ -225,6 +241,8 @@ def discover_show_links(
     scroll_hard_timeout_ms: int = SCROLL_HARD_TIMEOUT_MS,
     max_stale: int = MAX_STALE_SCROLLS,
     max_attempts: int = MAX_SCROLL_ATTEMPTS,
+    min_dwell_ms: int = SCROLL_MIN_DWELL_MS,
+    max_stale_low: int = MAX_STALE_SCROLLS_LOW,
 ) -> tuple[list[tuple[int, str]], int | None]:
     """Open the listing page in a real browser, scroll to bottom repeatedly
     until no new shows appear, then return every unique (show_id, slug) pair.
@@ -392,18 +410,32 @@ def discover_show_links(
                 log.info("  scroll %d: %d unique shows%s", attempt, count, gap_note)
 
                 # Conservative fallback exit: count has been stuck for the
-                # full max_stale streak. This is the path for "we got
-                # significantly less than expected and don't know why" —
-                # we still stop, but log it as a concern.
-                if stale_streak >= max_stale:
+                # full stale streak. While we're well below the site-reported
+                # total, demand a LARGER stale streak (max_stale_low) before
+                # giving up — combined with the per-scroll min-dwell below,
+                # this gives a slow lazy loader many patient scrolls to fire
+                # rather than abandoning at the initial render (the 54/200
+                # failure). Once we're within LOW_COVERAGE_FRACTION of the
+                # target, the ordinary max_stale applies.
+                if (
+                    expected_total is not None
+                    and count < expected_total * LOW_COVERAGE_FRACTION
+                ):
+                    effective_max_stale = max(max_stale, max_stale_low)
+                else:
+                    effective_max_stale = max_stale
+                if stale_streak >= effective_max_stale:
                     if expected_total is not None and count < expected_total:
                         log.info(
                             "  count stable at %d for %d scrolls (expected %d) — "
                             "site likely reports more shows than it actually lazy-loads",
-                            count, max_stale, expected_total,
+                            count, effective_max_stale, expected_total,
                         )
                     else:
-                        log.info("  count stable for %d scrolls — done", max_stale)
+                        log.info(
+                            "  count stable for %d scrolls — done",
+                            effective_max_stale,
+                        )
                     break
 
                 # Scroll to bottom and wait for the lazy loader's network
@@ -412,6 +444,7 @@ def discover_show_links(
                 # `network_idle_ms`. The hard timeout is a safety net so
                 # one stuck analytics beacon can't hang us.
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                _scroll_started = time.monotonic()
                 try:
                     page.wait_for_load_state(
                         "networkidle", timeout=scroll_hard_timeout_ms,
@@ -420,6 +453,19 @@ def discover_show_links(
                     # Networkidle can time out on chatty sites; the
                     # stale-streak / expected-total exits handle this.
                     pass
+                # Floor the time spent on this scroll. If networkidle returned
+                # near-instantly (the loader hadn't fired yet), top up to
+                # min_dwell_ms so the lazy loader gets a real chance to start
+                # fetching before the next iteration judges the count stale.
+                # This is what the 54/200 run lacked: its scrolls fired in
+                # milliseconds and exhausted the stale budget before the loader
+                # ever ran.
+                _elapsed_ms = (time.monotonic() - _scroll_started) * 1000.0
+                if _elapsed_ms < min_dwell_ms:
+                    try:
+                        page.wait_for_timeout(min_dwell_ms - _elapsed_ms)
+                    except Exception:
+                        pass
 
             if expected_total is not None and len(ordered_pairs) < expected_total:
                 missing = expected_total - len(ordered_pairs)
