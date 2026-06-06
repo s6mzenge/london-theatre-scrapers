@@ -375,6 +375,17 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Coverage gate — block a collapsed scrape from going live
+        # Same guard as scrape.yml's publish: refuse to overwrite the live
+        # unified.json if any source's show count has collapsed versus
+        # what's currently published. A non-zero exit fails the job before
+        # the copy in the next step, leaving the live data untouched. Pure
+        # stdlib; fails open only when there is no live baseline.
+        run: |
+          python scraper/analysis/coverage_gate.py \
+            --new dedupe_output/unified.json \
+            --live public/data/unified.json
+
       - name: Commit and push to main
         # Last-writer-wins with retry, identical to scrape.yml's publish.
         # The shared concurrency group already serialises full vs refresh
