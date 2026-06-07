@@ -16,7 +16,6 @@ import { ShowLink } from '../lib/router.jsx'
 // Click a seller card to see the list of shows where it wins.
 
 const KNOWN_SELLERS = [
-  'seatplan',
   'todaytix',
   'lovetheatre',
   'olt',
