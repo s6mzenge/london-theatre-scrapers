@@ -330,15 +330,15 @@ BROWSER_REFUSAL_STREAK     = 12     # consecutive unrecoverable 202s => the WAF
                                     # price cache carry the remainder
 
 # Parallel WAF tokens. Each worker opens its OWN browser context (own cookie jar
-# => own aws-waf-token) and fetches at the gentle per-token rate above. The pool
-# model failed because it burst ONE token; this bursts N *independent* tokens, so
-# a single token never sees more than ~1 req/s. HYPOTHESIS: the WAF budget is per
-# token (the old pool cleared ~120 fetches on one token before the wall, which a
-# strict per-IP rate limit wouldn't allow) — if so, N tokens ~= N× throughput at
-# the same 4%-failure per-token rate, and the whole catalogue finishes inside the
-# budget. If the limit turns out to be per-IP instead, the 202 rate spikes like
-# the 0.2s test did — set BROWSER_WORKERS = 1 to revert to the proven serial pass.
-BROWSER_WORKERS            = 3      # independent WAF-solved contexts run in parallel
+# => own aws-waf-token). TESTED with 3 workers: decisively WORSE — all three died
+# after only 27 ok, each hitting 12 consecutive unrecoverable 202s in ~80s. The
+# WAF tracks the IP, NOT the token: concurrent tokens share the IP's fate (once
+# the IP trips, every token is challenged), and three workers re-solving at once
+# is a full-page-navigation storm that digs the block deeper, so re-solving stops
+# recovering. Per-token parallelism is a dead end on a single IP. Keep this at 1
+# (the proven serial pass, ~440-479 fresh/run, soonest-first); >1 would only help
+# if the workers had >1 egress IP between them (e.g. a residential-IP runner).
+BROWSER_WORKERS            = 1      # independent WAF-solved contexts run in parallel
 
 # In-page fetch pool. Single arg [items, conc] where items = [{idx, url}].
 # Returns [{idx, status, fire, challenge}] — `fire` is the matched
