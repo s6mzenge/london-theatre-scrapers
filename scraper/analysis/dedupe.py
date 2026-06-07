@@ -748,7 +748,12 @@ PERF_SCHEMAS: dict[str, dict[str, Any]] = {
         "price_from": _seatplan_price_from,
         "price_to":   _seatplan_price_to,
         "currency":   lambda p: p.get("currency"),
-        "book_url":   lambda p: p.get("book_url"),
+        # ~88% of SP perfs have no explicit book_url (only the next ~5
+        # "last minute" perfs per show do). verified_url is the per-perf
+        # ticketing page ({show}/tickets/{date}/{time}/) that the
+        # availability pass builds and attaches to every perf — a valid
+        # booking link — so fall back to it for full coverage.
+        "book_url":   lambda p: p.get("book_url") or p.get("verified_url"),
         "available":  _seatplan_available,
     },
     "ttd": {
