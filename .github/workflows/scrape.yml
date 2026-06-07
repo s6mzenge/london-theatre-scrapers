@@ -1,9 +1,9 @@
 name: Full scrape
 
 # Full catalogue scrape: runs every scraper from scratch, followed by its
-# in-matrix availability pass (SeatPlan price/chip verification, OLT
-# verifier, TTD seat verification, LoveTheatre + TodayTix availability),
-# dedupes, and commits unified.json. ~3-6 minutes.
+# in-matrix availability pass (OLT verifier, TTD seat verification,
+# LoveTheatre + TodayTix availability), dedupes, and commits
+# unified.json. ~3-6 minutes.
 #
 # Trigger: manual only -- the "Run workflow" button in the Actions tab, or
 # a workflow_dispatch via the GitHub REST API (what an external scheduler
@@ -42,7 +42,7 @@ on:
         required: false
         default: ''
       skip_browser:
-        description: 'Skip the Playwright scrapers (todaytix, seatplan)'
+        description: 'Skip the Playwright scrapers (todaytix)'
         required: false
         default: 'false'
         type: choice
@@ -99,7 +99,6 @@ jobs:
           - { name: todaytix,            script: scraper/todaytix_scraper.py,            playwright: true }
           - { name: olt,                 script: scraper/olt_scraper.py,                 playwright: false }
           - { name: lovetheatre,         script: scraper/lovetheatre_scraper.py,         playwright: false }
-          - { name: seatplan,            script: scraper/seatplan_scraper.py,            playwright: true  }
           - { name: ttd,                 script: scraper/ttd_scraper.py,                 playwright: false }
 
     steps:
@@ -140,16 +139,10 @@ jobs:
       - name: Run scraper
         if: steps.gate.outputs.run == 'true'
         env:
-          # SeatPlan is proxied via a separate AWS Lambda (SEATPLAN_PROXY_URL)
-          # because seatplan.com sits behind AWS / CloudFront + AWS WAF, which
-          # blocks the Cloudflare Worker's egress IPs. Routing SeatPlan through
-          # AWS's own egress (same cloud as the origin) sidesteps that block.
-          # Everything else (OLT, SeeTickets) keeps using the Cloudflare Worker
-          # via OLT_PROXY_URL. We keep the env var NAMED OLT_PROXY_URL (that's
-          # what every scraper reads); only its VALUE differs for the seatplan
-          # leg, which also uses its own dedicated token (SEATPLAN_PROXY_TOKEN).
-          OLT_PROXY_URL: ${{ matrix.name == 'seatplan' && secrets.SEATPLAN_PROXY_URL || secrets.OLT_PROXY_URL }}
-          OLT_PROXY_TOKEN: ${{ matrix.name == 'seatplan' && secrets.SEATPLAN_PROXY_TOKEN || secrets.OLT_PROXY_TOKEN }}
+          # OLT (and SeeTickets) route through the Cloudflare Worker reverse
+          # proxy via OLT_PROXY_URL; other sources ignore these vars.
+          OLT_PROXY_URL: ${{ secrets.OLT_PROXY_URL }}
+          OLT_PROXY_TOKEN: ${{ secrets.OLT_PROXY_TOKEN }}
         # Exit code policy (matches smoke_test.py):
         #   0 = clean
         #   2 = scraper wrote output, but flagged warnings (still success)
@@ -159,14 +152,6 @@ jobs:
           ARGS=""
           if [ -n "${{ inputs.limit }}" ]; then
             ARGS="--limit ${{ inputs.limit }}"
-          fi
-          # SeatPlan is proxied via the AWS Lambda, whose parallelism is bounded
-          # by the AWS account's "Concurrent executions" quota (low on new
-          # accounts, ~10). Cap SeatPlan workers below that so the Lambda doesn't
-          # return 429 ConcurrentInvocationLimitExceeded. Other sources are
-          # unaffected and keep the default 16.
-          if [ "${{ matrix.name }}" = "seatplan" ]; then
-            ARGS="$ARGS --concurrency 8"
           fi
           set +e
           python ${{ matrix.script }} $ARGS --out scraper/data/${{ matrix.name }}.json
@@ -193,85 +178,6 @@ jobs:
           fails = len((d.get('report') or {}).get('failures') or [])
           print(f'shows={d.get(\"show_count\")} perfs={perfs} warnings={warns} failures={fails}')
           "
-
-      - name: Restore SeatPlan chip-pass cache
-        # The chip cache stores prior chip-pass results keyed by
-        # (date|time|book_url) so the next run can skip extraction
-        # for perfs whose catalogue inputs haven't changed. At 15-min
-        # scrape cadence this drops steady-state chip-pass cost from
-        # ~250 extractions to ~5-20 (only the rows that actually
-        # changed inputs since last run). TTL is 24h — even unchanged
-        # rows get re-verified daily to catch source-side drift.
-        if: steps.gate.outputs.run == 'true' && matrix.name == 'seatplan'
-        uses: actions/cache@v4
-        with:
-          path: |
-            scraper/data/chip_cache_seatplan.json
-            scraper/data/seatplan_price_cache.json
-          key: chip-cache-seatplan-${{ github.run_id }}
-          restore-keys: |
-            chip-cache-seatplan-
-
-      - name: Verify SeatPlan per-performance prices
-        # The fireCrmEvent pass (requests-only) handles ~95% of perfs.
-        # The remaining ~5% — yard tiers, premium-default outliers —
-        # are re-verified by a Playwright chip pass that reads the
-        # actually-rendered price tiers from the booking page. That
-        # second pass needs Chromium, which is why the seatplan
-        # matrix entry has playwright: true even though the scraper
-        # itself doesn't use Playwright. Use --skip-chips to disable
-        # the chip pass if it ever misbehaves; fireCrmEvent values
-        # will be used for all perfs in that case.
-        #
-        # The fireCrmEvent pass now routes through the SeatPlan AWS Lambda
-        # (SEATPLAN_PROXY_URL, same egress as the scrape), so the previous
-        # "0/386 verified" failure from AWS-WAF/CloudFront blocking the
-        # Cloudflare Worker's egress is fixed. The chip pass
-        # is still direct — it uses Playwright, which doesn't share
-        # the requests-based proxy plumbing; if SeatPlan blocks the
-        # browser-driven chip pass, this step exits 2 but
-        # continue-on-error keeps the pipeline moving (dedupe falls
-        # back to fireCrmEvent values for those rows). That fallback
-        # is acceptable because the chip pass only runs on a small
-        # subset of suspect rows.
-        if: steps.gate.outputs.run == 'true' && matrix.name == 'seatplan'
-        continue-on-error: true
-        env:
-          # SeatPlan sits behind AWS WAF, which serves a JS challenge (HTTP 202)
-          # a plain HTTP client can't solve — so the requests-based fetcher only
-          # ever verified a slice per run. Browser mode (--fetch-mode browser)
-          # fixes that: it fetches every ticketing URL through ONE headless-
-          # Chromium context that has solved the WAF challenge (the same
-          # mechanism the chip pass uses), so the aws-waf-token rides along on
-          # each in-page fetch, direct from the runner IP. The token has a
-          # SHORT post-solve window: bursting it across a concurrent pool
-          # collapsed it after ~100-160 fetches (every later request 202'd),
-          # and lowering concurrency was WORSE (fewer fetches before the window
-          # closed). seatplan_scraper.py never hits this because it fetches ONE
-          # URL at a time and re-solves on each 202 — so the pass now does the
-          # same: --concurrency 1 (serial), paced near the scraper's proven
-          # ~1 req/s, re-solving the token on every challenge and retrying that
-          # URL. Performances are verified SOONEST-FIRST (the cheapest-available
-          # floor is almost always near-term), so the user-visible price stays
-          # fresh every run; the far tail that doesn't fit --max-seconds 780
-          # rolls over subsequent runs via --price-cache. If the WAF refuses
-          # this runner IP outright (a run of unrecoverable 202s) the pass stops
-          # fast and the cache carries the rest. The chip pass below is
-          # unaffected (Playwright, runner-direct, continue-on-error).
-          #
-          # The proxy env below is UNUSED in browser mode (which goes direct);
-          # it's retained so reverting to --fetch-mode requests (burst + shuffle
-          # + price-cache, the proven rolling fallback) is a one-flag change.
-          OLT_PROXY_URL: ${{ secrets.SEATPLAN_PROXY_URL }}
-          OLT_PROXY_TOKEN: ${{ secrets.SEATPLAN_PROXY_TOKEN }}
-        run: |
-          python scraper/seatplan_availability.py \
-            --in scraper/data/seatplan.json \
-            --chip-cache scraper/data/chip_cache_seatplan.json \
-            --price-cache scraper/data/seatplan_price_cache.json \
-            --fetch-mode browser \
-            --concurrency 1 \
-            --max-seconds 780
 
       - name: Verify OLT per-performance availability
         if: steps.gate.outputs.run == 'true' && matrix.name == 'olt'
@@ -352,10 +258,10 @@ jobs:
           PY
 
       - name: Restore TodayTix chip-pass cache
-        # See the SeatPlan cache step for rationale. Same TTL and
-        # restore-key strategy; separate cache because the cache key
-        # space (date|time|book_url) and input-hash inputs are
-        # source-specific.
+        # Caches prior chip-pass results keyed by (date|time|book_url)
+        # so the next run skips extraction for rows whose inputs haven't
+        # changed. 24h TTL; separate cache per source because the key
+        # space is source-specific.
         if: steps.gate.outputs.run == 'true' && matrix.name == 'todaytix'
         uses: actions/cache@v4
         with:
@@ -367,15 +273,16 @@ jobs:
       - name: Verify TodayTix per-performance prices
         # Runs the chip-pass second pass over showtimes whose SSR
         # snapshot looks suspect (cheapest band has <3 seats and
-        # within 14 days). This is the TT analogue of the SeatPlan
-        # chip pass — it catches inventory that sold out between
-        # scrape time and click time. The TT matrix entry already
+        # within 14 days). The chip pass catches inventory that sold
+        # out between scrape time and click time. The TT matrix entry already
         # has playwright: true (the scraper itself uses it), so
         # Chromium is provisioned in this job and no further
         # workflow change is needed. ~13 min on ~200 suspect rows
         # at the default 1 worker; bump --workers cautiously since
         # TodayTix is sensitive to bot detection.
-        # continue-on-error: see SeatPlan step above for rationale.
+        # continue-on-error: a source-side block shouldn't fail the
+        # pipeline; dedupe falls back to the scraper's own values for any
+        # rows this pass didn't verify.
         if: steps.gate.outputs.run == 'true' && matrix.name == 'todaytix'
         continue-on-error: true
         run: |
@@ -384,14 +291,18 @@ jobs:
             --chip-cache scraper/data/chip_cache_todaytix.json
 
       - name: Verify TTD per-performance prices
-        # continue-on-error: see SeatPlan step above for rationale.
+        # continue-on-error: a source-side block shouldn't fail the
+        # pipeline; dedupe falls back to the scraper's own values for any
+        # rows this pass didn't verify.
         if: steps.gate.outputs.run == 'true' && matrix.name == 'ttd'
         continue-on-error: true
         run: |
           python scraper/ttd_availability.py --in scraper/data/ttd.json
 
       - name: Verify TTD seat-plan prices (ground truth)
-        # continue-on-error: see SeatPlan step above for rationale.
+        # continue-on-error: a source-side block shouldn't fail the
+        # pipeline; dedupe falls back to the scraper's own values for any
+        # rows this pass didn't verify.
         if: steps.gate.outputs.run == 'true' && matrix.name == 'ttd'
         continue-on-error: true
         run: |
@@ -406,7 +317,9 @@ jobs:
         # /api/calendar/{show_id}/; the live calendar dropped it an
         # hour later as the box office cutoff approached; our cached
         # data kept saying available until this verifier ran.
-        # continue-on-error: see SeatPlan step above for rationale.
+        # continue-on-error: a source-side block shouldn't fail the
+        # pipeline; dedupe falls back to the scraper's own values for any
+        # rows this pass didn't verify.
         if: steps.gate.outputs.run == 'true' && matrix.name == 'lovetheatre'
         continue-on-error: true
         run: |
