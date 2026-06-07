@@ -818,14 +818,18 @@ class DetailFetcher:
                            date: str | None, time: str | None) -> str | None:
         if showtime_id is None:
             return None
-        # qt (quantity) is required by TodayTix's seating-plan page —
-        # without it, the page renders an empty "No seats available" state
-        # even when seats *are* available. We default to 2 (the most common
-        # booking size and TodayTix's own UI default); the user can adjust
+        # qt (quantity) is required by TodayTix's seating-plan page — without
+        # it the page renders an empty "No seats available" state even when
+        # seats *are* available. We send qt=1 so the page opens on a single
+        # ticket: the price we surface site-wide is the cheapest *single* seat
+        # (TodayTix's availability floor — e.g. a lone £23 restricted single),
+        # and qt=1 is the only quantity at which that exact seat is selectable.
+        # qt=2 would bounce the cheapest single-seat shows up to the next
+        # pair-able band on click-through (the £23→£39 jump). Users can raise
         # the quantity on the page itself.
         params: dict[str, Any] = {
             "product_id": show_id,
-            "qt": 2,
+            "qt": 1,
             "showtime_id": showtime_id,
         }
         if date:
