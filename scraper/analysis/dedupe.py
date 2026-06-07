@@ -317,7 +317,6 @@ SOURCE_PRIORITY = [
     "olt",
     "todaytix",
     "lovetheatre",
-    "seatplan",
     "ttd",
 ]
 
@@ -362,14 +361,6 @@ SHOW_SCHEMAS: dict[str, dict[str, Any]] = {
         "performances": lambda s: s.get("performances") or [],
         "description":  lambda s: s.get("description_full") or s.get("product_description"),
     },
-    "seatplan": {
-        "title":        lambda s: s.get("name"),
-        "venue":        lambda s: s.get("venue_name"),
-        "id":           lambda s: s.get("sku") or s.get("slug"),
-        "url":          lambda s: s.get("url") or s.get("detail_canonical"),
-        "performances": lambda s: s.get("performances") or [],
-        "description":  lambda s: s.get("description_full") or s.get("description_short"),
-    },
     "ttd": {
         "title":        lambda s: s.get("name"),
         "venue":        lambda s: s.get("venue_name") or s.get("venue_text"),
@@ -381,73 +372,6 @@ SHOW_SCHEMAS: dict[str, dict[str, Any]] = {
                                    or s.get("product_description"),
     },
 }
-
-
-# SeatPlan's detail-page JSON-LD repeats the *show-wide* lowPrice on every
-# performance (Globe yard-standing at £6 leaks onto matinees where the
-# yard isn't on sale). When seatplan_availability.py has run, each
-# performance carries the verified per-perf min/max scraped from the
-# ticketing page's inline fireCrmEvent payload — that's the real
-# currently-available range and we prefer it whenever it's present.
-#
-# As of the chip-pass extension, suspect rows (yard-tier phantoms,
-# fireCrmEvent default-tier outliers) also carry verified_chip_min /
-# verified_chip_max scraped from the booking page's rendered price
-# chips — that's a stricter extraction than fireCrmEvent and wins
-# whenever it's present.
-#
-# Priority (highest first):
-#   verified_chip_min   — chip pass extracted real chips
-#   verified_min_price  — fireCrmEvent extracted a value
-#   low_price           — JSON-LD "from £X" (marketing; often stale)
-#
-# verified_price_source semantics (set by seatplan_availability.py):
-#   "ticketing_page" — verified successfully; trust verified_min_price
-#   "no_seats"       — page loaded but no fireCrmEvent → not on sale
-#                      → drop SeatPlan's price from the cross-source min
-#                        (don't drag it down to a fake show-wide £6)
-#   "fetch_failed"   — network/HTTP failure → fall back to low_price
-#   "skipped"        — perf wasn't checked → fall back to low_price
-#   (missing field)  — availability pass never ran → fall back to low_price
-def _seatplan_price_from(p: dict) -> float | None:
-    # Chip pass wins when it successfully extracted chip data.
-    if p.get("verified_chip_source") == "chips":
-        chip_min = p.get("verified_chip_min")
-        if chip_min is not None:
-            return chip_min
-    source = p.get("verified_price_source")
-    if source == "no_seats":
-        return None
-    verified = p.get("verified_min_price")
-    if verified is not None:
-        return verified
-    return p.get("low_price")
-
-
-def _seatplan_price_to(p: dict) -> float | None:
-    # Chip pass wins for max as well — chips give us the real upper
-    # tier where fireCrmEvent often omits or undercounts it.
-    if p.get("verified_chip_source") == "chips":
-        chip_max = p.get("verified_chip_max")
-        if chip_max is not None:
-            return chip_max
-    if p.get("verified_price_source") == "no_seats":
-        return None
-    return p.get("verified_max_price")
-
-
-def _seatplan_available(p: dict) -> bool | None:
-    source = p.get("verified_price_source")
-    if source == "no_seats":
-        return False
-    if source == "ticketing_page" and p.get("verified_min_price") is not None:
-        return True
-    # No verified data (or fetch failed) — fall back to the JSON-LD
-    # availability hint from the detail page.
-    availability = p.get("availability")
-    if availability:
-        return "InStock" in availability
-    return None
 
 
 # OLT's data-cal (embedded in each show's detail page) lists every
@@ -734,27 +658,6 @@ PERF_SCHEMAS: dict[str, dict[str, Any]] = {
                   if isinstance(p.get("max_seats"), int)
                   else None)
         ),
-    },
-    "seatplan": {
-        "date":       lambda p: p.get("date"),
-        "time":       lambda p: p.get("time"),
-        # Use the helpers defined above. JSON-LD lowPrice is a SHOW-WIDE
-        # floor (lottery seats, restricted-view standing, etc.) that leaks
-        # onto every perf in the seatplan_scraper.py output. The per-perf
-        # truth is `verified_min_price`, set by seatplan_availability.py
-        # from the ticketing page's fireCrmEvent payload. The helpers
-        # encapsulate the verified_price_source semantics — wire them in
-        # rather than reimplementing the priority order inline.
-        "price_from": _seatplan_price_from,
-        "price_to":   _seatplan_price_to,
-        "currency":   lambda p: p.get("currency"),
-        # ~88% of SP perfs have no explicit book_url (only the next ~5
-        # "last minute" perfs per show do). verified_url is the per-perf
-        # ticketing page ({show}/tickets/{date}/{time}/) that the
-        # availability pass builds and attaches to every perf — a valid
-        # booking link — so fall back to it for full coverage.
-        "book_url":   lambda p: p.get("book_url") or p.get("verified_url"),
-        "available":  _seatplan_available,
     },
     "ttd": {
         "date":       lambda p: p.get("date"),
@@ -1083,7 +986,7 @@ def load_sources(path: Path) -> dict[str, dict]:
 
 
 def extract_records(sources_data: dict[str, dict]) -> list[SourceRecord]:
-    """Flatten the 7 source JSONs into a list of SourceRecord."""
+    """Flatten the per-source JSONs into a list of SourceRecord."""
     records: list[SourceRecord] = []
     for src, payload in sources_data.items():
         schema = SHOW_SCHEMAS[src]
