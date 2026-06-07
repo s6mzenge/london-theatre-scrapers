@@ -89,7 +89,8 @@ def perf_count(data: dict) -> int:
     return sum(len(sh.get("performances") or []) for sh in (data.get("shows") or []))
 
 
-def evaluate(new: dict, live: dict, *, min_fraction: float, min_live_count: int):
+def evaluate(new: dict, live: dict, *, min_fraction: float, min_live_count: int,
+             retired: frozenset[str] = frozenset()):
     """Return (ok: bool, lines: list[str], blocks: list[str])."""
     lines: list[str] = []
     blocks: list[str] = []
@@ -114,6 +115,15 @@ def evaluate(new: dict, live: dict, *, min_fraction: float, min_live_count: int)
     lines.append("  per-source show counts:")
     for src in sorted(set(live_counts) | set(new_counts)):
         lv, nv = live_counts.get(src, 0), new_counts.get(src, 0)
+        if src in retired:
+            # Intentionally removed source. Show it for visibility but never
+            # block on it — its drop to 0 is the expected end state, not a
+            # collapsed scrape. Harmless once the live baseline no longer
+            # carries it (it then won't appear here at all).
+            pct = f"{(nv / lv * 100):5.1f}%" if lv else "  n/a"
+            lines.append(
+                f"    {src:14s} live={lv:5d}  new={nv:5d}  ({pct} of live)  [retired]")
+            continue
         guarded = lv >= min_live_count
         floor = lv * min_fraction
         bad = guarded and nv < floor
@@ -140,6 +150,11 @@ def main(argv=None) -> int:
     ap.add_argument("--min-live-count", type=int, default=DEFAULT_MIN_LIVE_COUNT,
                     help=f"only guard sources with at least this many shows live "
                          f"(default {DEFAULT_MIN_LIVE_COUNT})")
+    ap.add_argument("--retired-sources", default="",
+                    help="comma-separated source names intentionally removed from the "
+                         "pipeline; exempt from the per-source collapse guard so the "
+                         "first publish after retiring a source isn't blocked. Harmless "
+                         "to leave set permanently.")
     ap.add_argument("--selftest", action="store_true", help="run offline self-tests and exit")
     args = ap.parse_args(argv)
 
@@ -162,10 +177,16 @@ def main(argv=None) -> int:
               f"({err_live or 'zero shows'}); nothing to compare, allowing publish.")
         return 0
 
+    retired = frozenset(s.strip() for s in args.retired_sources.split(",") if s.strip())
     ok, lines, blocks = evaluate(
-        new, live, min_fraction=args.min_fraction, min_live_count=args.min_live_count)
-    print(f"COVERAGE GATE  (block below {args.min_fraction:.0%} of live; "
-          f"sources guarded at >= {args.min_live_count} live shows)")
+        new, live, min_fraction=args.min_fraction, min_live_count=args.min_live_count,
+        retired=retired)
+    header = (f"COVERAGE GATE  (block below {args.min_fraction:.0%} of live; "
+              f"sources guarded at >= {args.min_live_count} live shows")
+    if retired:
+        header += f"; retired/exempt: {', '.join(sorted(retired))}"
+    header += ")"
+    print(header)
     for ln in lines:
         print(ln)
     if ok:
@@ -204,6 +225,11 @@ def selftest() -> int:
     ok, _, blocks = evaluate(mk(gone), live, min_fraction=F, min_live_count=M)
     assert not ok and any("seatplan" in b for b in blocks), blocks
 
+    # ...but a source listed as intentionally retired dropping to 0 must PASS.
+    ok, _, blocks = evaluate(mk(gone), live, min_fraction=F, min_live_count=M,
+                             retired=frozenset({"seatplan"}))
+    assert ok and not blocks, "retired source dropping to 0 should pass"
+
     small = dict(base); small["ttd"] = 210           # a few shows closed
     ok, _, _ = evaluate(mk(small), live, min_fraction=F, min_live_count=M)
     assert ok, "small natural drop should pass"
@@ -219,7 +245,7 @@ def selftest() -> int:
 
     print("coverage_gate selftest: PASS "
           "(identical/pass, todaytix-collapse/block, vanish/block, "
-          "small-drop/pass, tiny-skip/pass, global-collapse/block)")
+          "retired/pass, small-drop/pass, tiny-skip/pass, global-collapse/block)")
     return 0
 
 
