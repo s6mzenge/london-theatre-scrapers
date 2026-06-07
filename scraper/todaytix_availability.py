@@ -27,8 +27,9 @@ both the coverage gap (most showtimes were never checked) and the gating gap
 
 Per showtime it writes (consumed by analysis/dedupe.py):
 
-    verified_min_price      float | None   cheapest available band, live
-    verified_max_price      float | None   most-expensive available band, live
+    verified_min_price      float | None   cheapest band sellable as a block
+                                           of MIN_CONTIGUOUS seats, live
+    verified_max_price      float | None   most-expensive such band, live
     verified_candidates     list[float]    all available band prices, sorted
     verified_available      bool  | None   True / False / None(unknown)
     verified_price_source   str:
@@ -53,10 +54,17 @@ sold out" (→ show nothing) is distinguished from "couldn't check" (→ SSR
 fallback). Without that split, every genuinely-sold-out performance on every
 popular show would fall back to a stale cheap price — the very bug this avoids.
 
+Quantity awareness: a band is only counted toward the displayed "from" price
+if its maxContiguousSeats >= the booking link's quantity (MIN_CONTIGUOUS,
+which mirrors todaytix_scraper's qt=2 book_url). This drops lone single seats
+that the qt=2 seating-plan page cannot sell — e.g. a £23 restricted single
+sitting under a £39 pair floor — so the quoted price is one the click-through
+can actually honour.
+
 Residual gaps (not closeable from this endpoint, by design):
   * up to ~15 min between-run staleness (any snapshot system has this)
-  * held-in-cart seats counted as available; single-vs-pair; rush/lottery
-    tickets that live outside regularTickets
+  * held-in-cart seats counted as available
+  * rush/lottery tickets that live outside regularTickets
 These are documented, not silently ignored.
 
 Usage:
@@ -95,6 +103,15 @@ SHOWTIMES_URL = "https://api.todaytix.com/api/v2/shows/{show_id}/showtimes"
 REQUEST_TIMEOUT = 20.0
 DEFAULT_WORKERS = 10
 DEFAULT_WINDOW_DAYS = 0           # 0 / negative = re-price every date
+
+# A price band only counts toward the displayed "from" price if it can seat a
+# contiguous block of this size. It MUST match the quantity baked into
+# todaytix_scraper._build_booking_url (qt=2): the seating-plan page we link to
+# only sells seats in a contiguous run, so a band with seats but a smaller
+# maxContiguousSeats (a lone single, e.g. BoM's £23) is real but unbuyable
+# through our link, and quoting it advertises a floor the click-through can't
+# honour. Set to 1 to revert to "cheapest single seat" semantics.
+MIN_CONTIGUOUS = 2
 
 # verified_price_source values — MUST match dedupe.py's checks.
 SRC_LIVE = "chips"                # live prices available; trust verified_*
@@ -173,17 +190,30 @@ def evaluate_showtime(api_st: dict, now_utc: datetime) -> dict:
                 "candidates": [], "available": None, "seats": showtime_seats,
                 "note": "no per-band seat info in live API (schema fallback)"}
 
-    available = [b for b in bands_with_seat_info
-                 if (b.get("numAssignedSeatsAvailable") or 0) > 0
-                 and (b.get("price") or {}).get("value") is not None]
+    # Bands with at least one seat AND a price. Used only to distinguish a
+    # genuine sell-out from "sold out as a pair" below.
+    available_any = [b for b in bands_with_seat_info
+                     if (b.get("numAssignedSeatsAvailable") or 0) > 0
+                     and (b.get("price") or {}).get("value") is not None]
+
+    # Quantity-aware narrowing: keep only bands that can seat MIN_CONTIGUOUS
+    # together (the qt baked into the book_url we hand users). A band with
+    # seats but maxContiguousSeats < MIN_CONTIGUOUS is a lone single the qt=2
+    # seating-plan page cannot sell — quoting its price would advertise a floor
+    # the click-through can't honour (the £23-single-vs-£39-pair case).
+    # maxContiguousSeats absent => treat as passing (schema fallback), so a TT
+    # field rename can't silently zero out every showtime.
+    available = [b for b in available_any
+                 if b.get("maxContiguousSeats") is None
+                 or (b.get("maxContiguousSeats") or 0) >= MIN_CONTIGUOUS]
 
     closed = False
     cutoff = _parse_iso(regular.get("availableUntil"))
     if cutoff is not None and now_utc > cutoff:
         closed = True
 
-    if showtime_seats == 0 or not available or closed:
-        if closed and available:
+    if showtime_seats == 0 or not available_any or closed:
+        if closed and available_any:
             note = "booking closed (availableUntil passed)"
         elif showtime_seats == 0:
             note = "sold out (showtime seats = 0)"
@@ -193,10 +223,19 @@ def evaluate_showtime(api_st: dict, now_utc: datetime) -> dict:
                 "candidates": [], "available": False, "seats": showtime_seats,
                 "note": note}
 
+    if not available:
+        # Seats exist, but none as a contiguous block of MIN_CONTIGUOUS, so the
+        # qt=MIN_CONTIGUOUS link can't complete a purchase. Treat as sold out
+        # for display rather than advertising a single-only price nobody
+        # booking the default quantity can buy.
+        return {"source": SRC_SOLD_OUT, "min": None, "max": None,
+                "candidates": [], "available": False, "seats": showtime_seats,
+                "note": f"only single seats (no {MIN_CONTIGUOUS}-seat block)"}
+
     prices = sorted({float((b.get("price") or {}).get("value")) for b in available})
     return {"source": SRC_LIVE, "min": prices[0], "max": prices[-1],
             "candidates": prices, "available": True, "seats": showtime_seats,
-            "note": f"{len(available)} available band(s)"}
+            "note": f"{len(available)} band(s) seating >= {MIN_CONTIGUOUS}"}
 
 
 def fetch_show(session: requests.Session, show_id: int,
@@ -346,8 +385,10 @@ def verify(payload: dict, *, workers: int, window_days: int, cache_bust: bool,
 
 # --- offline selftest -------------------------------------------------------
 
-def _band(price, seats):
+def _band(price, seats, contig=None):
     b = {"numAssignedSeatsAvailable": seats}
+    if contig is not None:
+        b["maxContiguousSeats"] = contig
     if price is not None:
         b["price"] = {"value": price, "currency": "GBP", "display": f"£{price:g}"}
     return b
@@ -384,7 +425,31 @@ def selftest() -> int:
     # (e) empty regularTickets → schema fallback
     r = evaluate_showtime({}, now)
     assert r["source"] == SRC_FETCH_FAILED, r
-    print("  evaluate_showtime: chips / sold_out / closed / schema-fallback OK")
+
+    # (f) cheapest band is a lone single (maxContiguousSeats=1): excluded for a
+    #     qty>=2 booking, so the floor rises to the cheapest pair-able band.
+    #     This is the live BoM £23-single / £39-pair case.
+    r = evaluate_showtime({"regularTickets": {"numAssignedSeatsAvailable": 30,
+        "availableUntil": future, "priceBands": [
+            _band(23.0, 1, contig=1), _band(39.0, 28, contig=8),
+            _band(150.0, 14, contig=7)]}}, now)
+    assert r["source"] == SRC_LIVE and r["min"] == 39.0 and r["max"] == 150.0, r
+    assert 23.0 not in r["candidates"], r
+
+    # (g) every priced band is single-only → nothing sellable as a pair → sold_out
+    r = evaluate_showtime({"regularTickets": {"numAssignedSeatsAvailable": 3,
+        "availableUntil": future, "priceBands": [
+            _band(23.0, 1, contig=1), _band(30.0, 2, contig=1)]}}, now)
+    assert r["source"] == SRC_SOLD_OUT and "single" in r["note"].lower(), r
+
+    # (h) maxContiguousSeats absent on every band → schema fallback: don't
+    #     narrow (a TT field rename must not zero out the catalogue).
+    r = evaluate_showtime({"regularTickets": {"numAssignedSeatsAvailable": 9,
+        "availableUntil": future, "priceBands": [
+            _band(25.0, 3), _band(60.0, 6)]}}, now)
+    assert r["source"] == SRC_LIVE and r["min"] == 25.0, r
+    print("  evaluate_showtime: chips / sold_out / closed / schema-fallback / "
+          "qty-contiguous OK")
 
     # end-to-end: a payload + a fake fetcher (no network)
     payload = {"shows": [{"id": 302, "slug": "x", "showtimes": [
