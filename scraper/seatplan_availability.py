@@ -317,7 +317,12 @@ BROWSER_MAX_EVALS       = 60        # hard safety cap on evaluate() round-trips
 # never hits this because it fetches ONE URL at a time and re-solves on each
 # 202. We mirror that: serial fetches paced near the scraper's proven ~1 req/s,
 # re-solving the token on every challenge and retrying the same URL.
-BROWSER_REQUEST_INTERVAL_S = 0.9    # min gap between serial fetches (~1.1 req/s)
+BROWSER_REQUEST_INTERVAL_S = 0.2    # min gap between serial fetches. The WAF
+                                    # token's immunity is time-bound (~15s), not
+                                    # request-count-bound (the old pool cleared
+                                    # ~120 fetches in one window), so pacing slow
+                                    # just wastes the token's short life sleeping
+                                    # — faster fits more fetches per re-solve.
 BROWSER_REFUSAL_STREAK     = 12     # consecutive unrecoverable 202s => the WAF
                                     # refused this runner IP; stop and let the
                                     # price cache carry the remainder
