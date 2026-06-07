@@ -317,15 +317,28 @@ BROWSER_MAX_EVALS       = 60        # hard safety cap on evaluate() round-trips
 # never hits this because it fetches ONE URL at a time and re-solves on each
 # 202. We mirror that: serial fetches paced near the scraper's proven ~1 req/s,
 # re-solving the token on every challenge and retrying the same URL.
-BROWSER_REQUEST_INTERVAL_S = 0.2    # min gap between serial fetches. The WAF
-                                    # token's immunity is time-bound (~15s), not
-                                    # request-count-bound (the old pool cleared
-                                    # ~120 fetches in one window), so pacing slow
-                                    # just wastes the token's short life sleeping
-                                    # — faster fits more fetches per re-solve.
+BROWSER_REQUEST_INTERVAL_S = 0.9    # min gap between serial fetches. Tested 0.2s:
+                                    # total throughput rose (~479 vs ~440 fresh)
+                                    # but the 202 challenge rate TREBLED (the WAF
+                                    # has a request-RATE component, not just a time
+                                    # window), and the extra failures fell on the
+                                    # near-term performances that matter most
+                                    # (first-100 freshness 90% -> 81%). 0.9 keeps the
+                                    # soonest set freshest and is gentler on the WAF.
 BROWSER_REFUSAL_STREAK     = 12     # consecutive unrecoverable 202s => the WAF
                                     # refused this runner IP; stop and let the
                                     # price cache carry the remainder
+
+# Parallel WAF tokens. Each worker opens its OWN browser context (own cookie jar
+# => own aws-waf-token) and fetches at the gentle per-token rate above. The pool
+# model failed because it burst ONE token; this bursts N *independent* tokens, so
+# a single token never sees more than ~1 req/s. HYPOTHESIS: the WAF budget is per
+# token (the old pool cleared ~120 fetches on one token before the wall, which a
+# strict per-IP rate limit wouldn't allow) — if so, N tokens ~= N× throughput at
+# the same 4%-failure per-token rate, and the whole catalogue finishes inside the
+# budget. If the limit turns out to be per-IP instead, the 202 rate spikes like
+# the 0.2s test did — set BROWSER_WORKERS = 1 to revert to the proven serial pass.
+BROWSER_WORKERS            = 3      # independent WAF-solved contexts run in parallel
 
 # In-page fetch pool. Single arg [items, conc] where items = [{idx, url}].
 # Returns [{idx, status, fire, challenge}] — `fire` is the matched
@@ -858,10 +871,18 @@ async def _browser_fetch_async(
         _apply_skipped()
         return True
 
-    conc = min(max(int(concurrency), 1), BROWSER_MAX_CONC)
+    n_workers = max(1, min(BROWSER_WORKERS, len(usable)))
     warm_url = usable[0]["url"]
     loop = asyncio.get_running_loop()
     deadline = (loop.time() + max_seconds) if max_seconds and max_seconds > 0 else None
+
+    # Soonest-first: verify the nearest performances first (the cheapest-available
+    # floor is almost always near-term), so the user-visible price stays fresh
+    # every run even when the budget can't reach the whole catalogue.
+    def _perf_when(it: dict) -> tuple:
+        perf = payload["shows"][it["si"]]["performances"][it["pi"]]
+        return (perf.get("date") or "9999-12-31", perf.get("time") or "99:99")
+    usable.sort(key=_perf_when)
 
     async with async_playwright() as p:
         try:
@@ -876,32 +897,42 @@ async def _browser_fetch_async(
             log.error("  run: python -m playwright install chromium")
             return False
 
-        context = await browser.new_context(
-            viewport={"width": 1400, "height": 900},
-            user_agent=CHIP_UA, locale="en-GB", timezone_id="Europe/London",
-            extra_http_headers={"Accept-Language": "en-GB,en;q=0.9"},
-        )
-        await context.route("**/*", _chip_block_heavy)
-        await context.add_init_script(CHIP_STEALTH_JS)
-        page = await context.new_page()
+        async def _new_solved_page():
+            """Open a fresh context (its OWN cookie jar => its OWN aws-waf-token)
+            and a page, plus a solve() that navigates a ticketing page so Chromium
+            runs the WAF challenge JS and banks that context's token. Each worker
+            owns one of these, so the workers hold INDEPENDENT tokens — the whole
+            point of the pool."""
+            ctx = await browser.new_context(
+                viewport={"width": 1400, "height": 900},
+                user_agent=CHIP_UA, locale="en-GB", timezone_id="Europe/London",
+                extra_http_headers={"Accept-Language": "en-GB,en;q=0.9"},
+            )
+            await ctx.route("**/*", _chip_block_heavy)
+            await ctx.add_init_script(CHIP_STEALTH_JS)
+            pg = await ctx.new_page()
 
-        async def solve_token() -> None:
-            """Navigate to a ticketing page so Chromium runs the AWS WAF
-            challenge JS and (re)sets the aws-waf-token cookie on the context."""
-            try:
-                await page.goto(warm_url, wait_until="domcontentloaded",
-                                timeout=BROWSER_NAV_TIMEOUT_MS)
-            except Exception as e:
-                log.warning("browser pass: token nav error — %s", type(e).__name__)
-            await asyncio.sleep(BROWSER_RESOLVE_SLEEP_S)
+            async def solve() -> None:
+                try:
+                    await pg.goto(warm_url, wait_until="domcontentloaded",
+                                  timeout=BROWSER_NAV_TIMEOUT_MS)
+                except Exception as e:
+                    log.warning("browser pass: token nav error — %s",
+                                type(e).__name__)
+                await asyncio.sleep(BROWSER_RESOLVE_SLEEP_S)
 
-        async def probe_status() -> int:
-            """In-page fetch of the warm URL; return its HTTP status (or -1 on
-            throw). A 403 / -1 means this runner IP is hard-blocked at the WAF
-            edge — the browser can solve a *challenge* (202) but not an IP
-            block, so there's no point sweeping; signal a fallback instead."""
+            return ctx, pg, solve
+
+        # --- Viability probe (one throwaway context) -------------------------
+        # The browser can solve a *challenge* (202) but not an IP *block*. If the
+        # warm-up fetch is 403/-1 the runner IP is hard-blocked: write NOTHING and
+        # signal a requests-fallback so the caller handles the full task list.
+        probe_ctx, probe_pg, probe_solve = await _new_solved_page()
+        await probe_solve()
+
+        async def _probe_status() -> int:
             try:
-                return await page.evaluate(
+                return await probe_pg.evaluate(
                     """async (u) => { try {
                          const r = await fetch(u, {credentials:'include',
                                                    headers:{'Accept':'text/html'}});
@@ -912,16 +943,18 @@ async def _browser_fetch_async(
             except Exception:
                 return -1
 
-        await solve_token()
-        probe = await probe_status()
+        probe = await _probe_status()
         if probe in (403, -1):
-            # Re-solve once in case it was a transient hiccup, then re-probe.
-            await solve_token()
-            probe = await probe_status()
+            await probe_solve()
+            probe = await _probe_status()
         try:
-            names = sorted({c["name"] for c in await context.cookies()})
+            names = sorted({c["name"] for c in await probe_ctx.cookies()})
             log.info("browser pass: token primed; warm-up probe HTTP %s; "
                      "context cookies: %s", probe, names or "(none)")
+        except Exception:
+            pass
+        try:
+            await probe_ctx.close()
         except Exception:
             pass
         if probe in (403, -1):
@@ -934,103 +967,112 @@ async def _browser_fetch_async(
                 pass
             return False
 
-        # Browser is viable → apply the deferred SKIPPED rows, then verify
-        # SERIALLY. The pool model burst one WAF token across many concurrent
-        # in-page fetches; its short post-solve window then collapsed and every
-        # later request 202'd (observed: ~100-160 ok, then a wall). The scraper
-        # never hits this — it fetches one URL at a time and re-solves on each
-        # 202 — so we do the same: one fetch at a time, paced near the scraper's
-        # proven ~1 req/s, re-solving the token the instant a challenge appears
-        # and retrying the same URL. Soonest-first ordering puts the near-term
-        # performances (where the cheapest-available floor lives) at the front,
-        # so the user-visible price stays fresh every run even when the budget
-        # can't reach the whole catalogue (the tail rolls via the price cache).
-        # A run of consecutive unrecoverable 202s means the WAF refused this IP
-        # outright; we stop fast and let the cache carry the rest.
+        # Browser is viable → apply the deferred SKIPPED rows, then run the pool.
         _apply_skipped()
 
-        def _perf_when(it: dict) -> tuple:
-            perf = payload["shows"][it["si"]]["performances"][it["pi"]]
-            return (perf.get("date") or "9999-12-31", perf.get("time") or "99:99")
-        usable.sort(key=_perf_when)
+        # Shared soonest-first work queue + a couple of shared flags. Everything
+        # below runs in ONE event loop, so plain ints/bools are race-free across
+        # workers (there is no await between reading and writing a shared field).
+        queue: deque = deque(usable)
+        state = {"challenge_logged": False, "budget_hit": False}
+        log.info("browser pass: %d worker(s), each with its own WAF token, "
+                 "soonest-first over %d performance(s)", n_workers, len(usable))
 
-        challenge_logged = False
-        fail_streak = 0
-        i = 0
-        n_usable = len(usable)
-        while i < n_usable:
-            # Wall-clock budget: carry the remainder via the price cache.
-            if deadline is not None and loop.time() >= deadline:
-                for it in usable[i:]:
-                    with progress_lock:
-                        budget_skipped["n"] += 1
-                    _apply_result(payload, it["si"], it["pi"],
-                                  _empty_result(it["url"], SOURCE_SKIPPED,
-                                                status="budget"),
-                                  counts, counts_lock, progress, progress_lock, total)
-                log.info("browser pass: wall-clock budget reached — %d "
-                         "performance(s) carried from price cache", n_usable - i)
-                break
-
-            it = usable[i]
+        async def worker(wid: int) -> None:
             try:
-                out = await page.evaluate(_BROWSER_POOL_JS,
-                                          [[{"idx": 0, "url": it["url"]}], 1])
-                r = (out or [{}])[0] or {}
-            except Exception:
-                r = {"status": -1, "fire": "", "challenge": False}
-            status = r.get("status", -1)
-            fire = r.get("fire") or ""
-            is_challenge = bool(r.get("challenge")) or status == 202
-            is_transient = status == -1  # in-page fetch threw; not a WAF verdict
-
-            if is_challenge or is_transient:
-                if is_challenge and not challenge_logged:
-                    log.info("browser pass: WAF challenge seen (HTTP 202) — "
-                             "re-solving the token on each hit (serial mode)")
-                    challenge_logged = True
-                if it["attempt"] < BROWSER_MAX_ATTEMPTS:
-                    # Token died — re-solving navigates the challenge JS and re-
-                    # banks a fresh aws-waf-token, then we retry the SAME URL.
-                    it["attempt"] += 1
-                    await solve_token()
-                    await asyncio.sleep(BROWSER_REQUEST_INTERVAL_S)
-                    continue
-                # Retries exhausted even after a re-solve — carried by cache.
-                _tally_fail("HTTP 202" if is_challenge else "HTTP -1")
-                _apply_result(payload, it["si"], it["pi"],
-                              _empty_result(it["url"], SOURCE_FETCH_FAIL,
-                                            status=(202 if is_challenge else -1)),
-                              counts, counts_lock, progress, progress_lock, total)
-                i += 1
-                fail_streak += 1
-                if fail_streak >= BROWSER_REFUSAL_STREAK:
-                    # Re-solving isn't recovering — the WAF is refusing this IP
-                    # this run. No client-side strategy mints a token it won't
-                    # grant, so stop and let the cache carry the remainder.
-                    for it2 in usable[i:]:
-                        with progress_lock:
-                            budget_skipped["n"] += 1
-                        _apply_result(payload, it2["si"], it2["pi"],
-                                      _empty_result(it2["url"], SOURCE_SKIPPED,
-                                                    status="refused"),
+                ctx, pg, solve = await _new_solved_page()
+            except Exception as e:
+                log.warning("browser pass: worker %d could not start — %s",
+                            wid, type(e).__name__)
+                return
+            await solve()                       # mint this worker's own token
+            fail_streak = 0
+            try:
+                while queue:
+                    if deadline is not None and loop.time() >= deadline:
+                        state["budget_hit"] = True
+                        break
+                    try:
+                        it = queue.popleft()
+                    except IndexError:
+                        break
+                    # Per-item fetch with re-solve-on-202 + retry, on THIS worker's
+                    # own token/page — isolated from the other workers' tokens.
+                    while True:
+                        try:
+                            out = await pg.evaluate(
+                                _BROWSER_POOL_JS,
+                                [[{"idx": 0, "url": it["url"]}], 1])
+                            r = (out or [{}])[0] or {}
+                        except Exception:
+                            r = {"status": -1, "fire": "", "challenge": False}
+                        status = r.get("status", -1)
+                        fire = r.get("fire") or ""
+                        is_challenge = bool(r.get("challenge")) or status == 202
+                        is_transient = status == -1  # fetch threw; not a verdict
+                        if is_challenge or is_transient:
+                            if is_challenge and not state["challenge_logged"]:
+                                log.info("browser pass: WAF challenge seen (HTTP "
+                                         "202) — re-solving per worker on each hit")
+                                state["challenge_logged"] = True
+                            if it["attempt"] < BROWSER_MAX_ATTEMPTS:
+                                # Token died — re-solve THIS context and retry the
+                                # same URL on the fresh token.
+                                it["attempt"] += 1
+                                await solve()
+                                await asyncio.sleep(BROWSER_REQUEST_INTERVAL_S)
+                                continue
+                            _tally_fail("HTTP 202" if is_challenge else "HTTP -1")
+                            _apply_result(payload, it["si"], it["pi"],
+                                          _empty_result(it["url"], SOURCE_FETCH_FAIL,
+                                                        status=(202 if is_challenge
+                                                                else -1)),
+                                          counts, counts_lock, progress,
+                                          progress_lock, total)
+                            fail_streak += 1
+                            break
+                        # Clean response — build the result the shared way.
+                        _apply_result(payload, it["si"], it["pi"],
+                                      _result_from_html(it["url"], status, fire),
                                       counts, counts_lock, progress, progress_lock,
                                       total)
-                    log.warning("browser pass: %d consecutive challenges despite "
-                                "re-solving — runner IP refused this run; %d "
-                                "performance(s) carried from cache",
-                                fail_streak, n_usable - i)
-                    break
-                await asyncio.sleep(BROWSER_REQUEST_INTERVAL_S)
-                continue
+                        fail_streak = 0
+                        break
+                    if fail_streak >= BROWSER_REFUSAL_STREAK:
+                        log.warning("browser pass: worker %d hit %d consecutive "
+                                    "challenges despite re-solving — stopping it "
+                                    "(remaining work falls to other workers / "
+                                    "cache)", wid, fail_streak)
+                        break
+                    await asyncio.sleep(BROWSER_REQUEST_INTERVAL_S)
+            finally:
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
 
-            # Clean response — build the result the shared way; reset the streak.
+        await asyncio.gather(*(worker(w) for w in range(n_workers)))
+
+        # Anything still queued (budget reached, or every worker bailed on a
+        # refusal) carries forward from the price cache, exactly as before.
+        n_left = 0
+        while queue:
+            it = queue.popleft()
+            with progress_lock:
+                budget_skipped["n"] += 1
             _apply_result(payload, it["si"], it["pi"],
-                          _result_from_html(it["url"], status, fire),
+                          _empty_result(it["url"], SOURCE_SKIPPED,
+                                        status=("budget" if state["budget_hit"]
+                                                else "refused")),
                           counts, counts_lock, progress, progress_lock, total)
-            i += 1
-            fail_streak = 0
-            await asyncio.sleep(BROWSER_REQUEST_INTERVAL_S)
+            n_left += 1
+        if n_left:
+            if state["budget_hit"]:
+                log.info("browser pass: wall-clock budget reached — %d "
+                         "performance(s) carried from price cache", n_left)
+            else:
+                log.warning("browser pass: %d performance(s) carried from cache "
+                            "(workers stopped early)", n_left)
 
         try:
             await browser.close()
