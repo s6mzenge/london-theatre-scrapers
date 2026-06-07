@@ -1,7 +1,7 @@
 # Shared HTTP stack — all seven scrapers
 requests>=2.31
 
-# HTML parsing — lovetheatre, olt, seatplan, ttd
+# HTML parsing — lovetheatre, olt, ttd
 beautifulsoup4>=4.12
 
 # Faster HTTP + parser — ttd only
