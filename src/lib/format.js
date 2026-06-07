@@ -26,7 +26,6 @@ export function formatRange(min, max) {
 // data. We display them in small caps so even unpolished ids look fine,
 // but a few have established casings worth honouring.
 const SELLER_LABELS = {
-  seatplan: 'SeatPlan',
   todaytix: 'TodayTix',
   lovetheatre: 'LOVEtheatre',
   olt: 'Official London Theatre',
