@@ -482,7 +482,8 @@ jobs:
         run: |
           python scraper/analysis/coverage_gate.py \
             --new dedupe_output/unified.json \
-            --live public/data/unified.json
+            --live public/data/unified.json \
+            --retired-sources seatplan
 
       - name: Commit and push to main
         # Last-writer-wins with retry. unified.json is regenerated from
